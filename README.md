@@ -64,14 +64,15 @@ local E:A|B|nil
 ```
 
 
-## typelua grammar
+## typelua compared to lua
+```
+==================================================
 约定：{A} 表示 0 个或多个 A；[A] 表示可选 A。
 标记：  (=Lua)  与 Lua 原定义完全相同
         (~Lua)  在 Lua 基础上修改
         (+TLUA) TypeLua 新增
 
 --------------------------------------------------
-```
 chunk ::= block                                                        (=Lua)
 
 block ::= {stat} [retstat]                                             (=Lua)
@@ -143,11 +144,13 @@ decllist ::= Name [‘:’ type] {‘,’ Name [‘:’ type]}
      --           则每个 Name 都必须带 `: type`。
 
 -- ---- 类型系统 ----
-type      ::= Name
+type      ::= uniontype
+            | functype
+uniontype ::= basictype {‘|’ basictype}       -- 联合类型（左结合、扁平化）
+basictype ::= Name
             | nil                            -- nil 类型（用于可空/联合）
             | Name ‘<’ typeargs ‘>’          -- 泛型（支持任意嵌套）
-            | functype
-            | type ‘|’ type                   -- 联合类型 A|B|nil（左结合、扁平化）
+            | ‘(’ type ‘)’                   -- 括号分组，如 (function()->A)|B
 typeargs  ::= type {‘,’ type}
 functype  ::= function ‘(’ [parlist] ‘)’ [rettype]
 
@@ -164,9 +167,20 @@ classfield ::= Name ‘:’ type [‘=’ exp]        -- 属性：声明[+默认
              | methodsig [ block end | ‘=’ exp ]
                                                -- 方法：签名 / 内联定义 / 赋值默认
 methodsig  ::= Name ‘(’ [parlist] ‘)’ [rettype]
-```
 
-## flex
+-- ---- 新增词法记号 ----
+--   class     关键字
+--   extends   关键字
+--   ‘->’      返回类型箭头
+-- 词法说明：在泛型 ‘<...>’ 内（generic_depth > 0），贪婪匹配出的
+--           ‘>>’ 和 ‘>=’ 都会被拆回单个 ‘>’：
+--             ‘>>’ → ‘>’ ‘>’   嵌套泛型闭合，如 map<string, list<number>>
+--             ‘>=’ → ‘>’ ‘=’   闭合紧跟赋值，如 local t:table<string,any>=init()
+--           三连 ‘>>=’（如 local x:T<U<V>>=t）由两条规则接力拆成 ‘>’ ‘>’ ‘=’。
+--           拆分位置二选一：flex 版由 lexer 依 generic_depth 反馈拆分（见 ## lex）；
+--           Rust 版 lexer 保持纯函数、统一产出 SHR/GE，由 parser 驱动层拆分（当前采用）。
+```
+## lex
 ```flex
 [ \t\r]+            { /* whitespace */ }
 \n                  { /* newline; yylineno tracked by option */ }
@@ -226,9 +240,10 @@ methodsig  ::= Name ‘(’ [parlist] ‘)’ [rettype]
 "=="        { return EQ; }
 "~="        { return NE; }
 "<="        { return LE; }
-">="        { return GE; }
+">="        { if (generic_depth > 0) { yyless(1); return '>'; }   /* TLUA: split generic close before '=' */
+              return GE; }
 "<<"        { return SHL; }
-">>"        { if (SHL_depth > 0) { yyless(1); return '>'; }   /* TLUA: split nested generic close */
+">>"        { if (generic_depth > 0) { yyless(1); return '>'; }   /* TLUA: split nested generic close */
               return SHR; }
 "//"        { return IDIV; }
 
@@ -238,10 +253,11 @@ methodsig  ::= Name ‘(’ [parlist] ‘)’ [rettype]
               return 0; }
 ```
 
-## bison
+
+## grammar
 ```bison
 chunk
-    : block        
+    : block                 { ast_root = $1; }
     ;
 
 block
@@ -300,9 +316,19 @@ stat
                                        ast_add($$, $2); ast_add($$, $3); }
     | LOCAL FUNCTION NAME funcbody   { $$ = ast_own("LocalFunction", $3);
                                        ast_add($$, $4); }
-    | LOCAL namelist                 { $$ = ast_new("Local"); ast_add($$, $2); }
-    | LOCAL namelist '=' explist     { $$ = ast_new("Local");
+    | LOCAL decllist                 { if (!$2->aux) {
+                                           yyerror("local without initializer must declare a type for every name");
+                                           YYERROR;
+                                       }
+                                       $$ = ast_new("Local"); ast_add($$, $2); }
+    | LOCAL decllist '=' explist     { $$ = ast_new("Local");
                                        ast_add($$, $2); ast_add($$, $4); }
+    | CLASS NAME classbody           { $$ = ast_own("Class", $2);
+                                       ast_add($$, $3); }
+    | CLASS NAME EXTENDS NAME classbody
+                                     { $$ = ast_own("Class", $2);
+                                       ast_add($$, ast_own("Extends", $4));
+                                       ast_add($$, $5); }
     ;
 
 elseif_list
@@ -356,6 +382,114 @@ namelist
                                        ast_add($$, ast_own("Name", $1)); }
     | namelist ',' NAME              { $$ = $1;
                                        ast_add($$, ast_own("Name", $3)); }
+    ;
+
+decllist
+    : NAME optype                    { $$ = ast_new("NameList");
+                                       Node *nm = ast_own("Name", $1);
+                                       if ($2) ast_add(nm, $2);
+                                       ast_add($$, nm);
+                                       $$->aux = ($2 != NULL); }
+    | decllist ',' NAME optype       { $$ = $1;
+                                       Node *nm = ast_own("Name", $3);
+                                       if ($4) ast_add(nm, $4);
+                                       ast_add($$, nm);
+                                       if (!$4) $$->aux = 0; }
+    ;
+
+optype
+    : /* empty */                    { $$ = NULL; }
+    | ':' type                       { $$ = $2; }
+    ;
+
+type
+    : uniontype                      { $$ = $1; }
+    | functype                       { $$ = $1; }
+    ;
+
+uniontype
+    : basictype                      { $$ = $1; }
+    | uniontype '|' basictype        { /* TLUA: union type A|B|nil (flattened) */
+                                       if (strcmp($1->type, "TypeUnion") == 0) {
+                                           $$ = $1; ast_add($$, $3);
+                                       } else {
+                                           $$ = ast_new("TypeUnion");
+                                           ast_add($$, $1); ast_add($$, $3);
+                                       } }
+    ;
+
+basictype
+    : NAME                           { $$ = ast_own("Type", $1); }
+    | NIL                            { $$ = ast_dup("Type", "nil"); }  /* nil type */
+    | NAME '<' { generic_depth++; } typeargs '>'
+                                     { generic_depth--;            /* generic */
+                                       $$ = ast_own("Type", $1);
+                                       ast_merge($$, $4); }
+    | '(' type ')'                   { $$ = $2; }   /* grouping: (function()->A)|B */
+    ;
+
+typeargs
+    : type                           { $$ = ast_new("TypeArgs"); ast_add($$, $1); }
+    | typeargs ',' type              { $$ = $1; ast_add($$, $3); }
+    ;
+
+functype
+    : FUNCTION '(' ')'               { $$ = ast_new("FuncType"); }
+    | FUNCTION '(' ')' rettype       { $$ = ast_new("FuncType"); ast_add($$, $4); }
+    | FUNCTION '(' parlist ')'       { $$ = ast_new("FuncType"); ast_add($$, $3); }
+    | FUNCTION '(' parlist ')' rettype
+                                     { $$ = ast_new("FuncType");
+                                       ast_add($$, $3); ast_add($$, $5); }
+    ;
+
+
+rettype
+    : ARROW retspec                  { $$ = $2; }
+    ;
+
+retspec
+    : type                           { $$ = ast_new("Returns"); ast_add($$, $1); }
+    | '(' ')'                        { $$ = ast_new("Returns"); }  /* void */
+    | '(' typelist ')'               { $$ = $2; }
+    ;
+
+typelist
+    : rtype                          { $$ = ast_new("Returns"); ast_add($$, $1); }
+    | typelist ',' rtype             { $$ = $1; ast_add($$, $3); }
+    ;
+
+rtype
+    : type                           { $$ = $1; }
+    | ELLIPSIS type                  { $$ = ast_new("VarargType"); ast_add($$, $2); }
+    | ELLIPSIS                       { $$ = ast_new("Vararg"); }
+    ;
+
+classbody
+    : '{' '}'                        { $$ = ast_new("ClassBody"); }
+    | '{' classfields '}'            { $$ = $2; }
+    ;
+
+classfields
+    : classfield                     { $$ = ast_new("ClassBody"); ast_add($$, $1); }
+    | classfields ',' classfield     { $$ = $1; ast_add($$, $3); }
+    ;
+
+classfield
+    : NAME ':' type                  { $$ = ast_own("Field", $1); ast_add($$, $3); }
+    | NAME ':' type '=' exp          { $$ = ast_own("Field", $1);
+                                       ast_add($$, $3); ast_add($$, $5); }
+    | NAME '=' exp                   { $$ = ast_own("Field", $1); ast_add($$, $3); }
+    | methodsig                      { $$ = $1; }
+    | methodsig block END            { $$ = $1; ast_add($$, $2); }
+    | methodsig '=' exp              { $$ = $1; ast_add($$, $3); }
+    ;
+
+methodsig
+    : NAME '(' ')'                   { $$ = ast_own("Method", $1); }
+    | NAME '(' ')' rettype           { $$ = ast_own("Method", $1); ast_add($$, $4); }
+    | NAME '(' parlist ')'           { $$ = ast_own("Method", $1); ast_add($$, $3); }
+    | NAME '(' parlist ')' rettype   { $$ = ast_own("Method", $1);
+                                       ast_add($$, $3); ast_add($$, $5); }
     ;
 
 explist
@@ -431,17 +565,36 @@ functiondef
     ;
 
 funcbody
-    : '(' ')' block END              { $$ = ast_new("FuncBody"); ast_add($$, $3); }
-    | '(' parlist ')' block END      { $$ = ast_new("FuncBody");
-                                       ast_add($$, $2); ast_add($$, $4); }
+    : '(' ')' block END                      { $$ = ast_new("FuncBody");
+                                               ast_add($$, $3); }
+    | '(' ')' rettype block END              { $$ = ast_new("FuncBody");
+                                               ast_add($$, $3); ast_add($$, $4); }
+    | '(' parlist ')' block END              { $$ = ast_new("FuncBody");
+                                               ast_add($$, $2); ast_add($$, $4); }
+    | '(' parlist ')' rettype block END      { $$ = ast_new("FuncBody");
+                                               ast_add($$, $2); ast_add($$, $4);
+                                               ast_add($$, $5); }
     ;
 
 parlist
-    : namelist                       { $$ = ast_new("ParList"); ast_merge($$, $1); }
-    | namelist ',' ELLIPSIS          { $$ = ast_new("ParList"); ast_merge($$, $1);
-                                       ast_add($$, ast_new("Vararg")); }
-    | ELLIPSIS                       { $$ = ast_new("ParList");
-                                       ast_add($$, ast_new("Vararg")); }
+    : params                         { $$ = $1; }
+    | params ',' vararg              { $$ = $1; ast_add($$, $3); }
+    | vararg                         { $$ = ast_new("ParList"); ast_add($$, $1); }
+    ;
+
+params
+    : param                          { $$ = ast_new("ParList"); ast_add($$, $1); }
+    | params ',' param               { $$ = $1; ast_add($$, $3); }
+    ;
+
+param
+    : NAME optype                    { $$ = ast_own("Name", $1);
+                                       if ($2) ast_add($$, $2); }
+    ;
+
+vararg
+    : ELLIPSIS                       { $$ = ast_new("Vararg"); }
+    | ELLIPSIS type                  { $$ = ast_new("Vararg"); ast_add($$, $2); }
     ;
 
 tableconstructor

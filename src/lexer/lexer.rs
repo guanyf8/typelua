@@ -65,8 +65,8 @@ impl<'a> Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    //None=EOF
-    pub fn next_token(&mut self) -> Option<Result<Token<'a>, LexErr>> {
+    //None=EOF；token与错误共用span位：错误的span指向肇事区间（未闭合=自token起点）
+    pub fn next_token(&mut self) -> Option<(Result<Token<'a>, LexErr>, Span)> {
         let bytes = self.input.as_bytes();
         let mut current = self.position;
         let mut token_start = current;  
@@ -83,20 +83,25 @@ impl<'a> Lexer<'a> {
                 },
                 Step::ACCEPT(acc) => {
                     let end = current + 1 - hint as usize;  //token结束(不含回退字符)
-                    self.position = end;        
+                    self.position = end;
                     match acc {
                         AcceptType::COMMENT => {
                             //注释丢弃后继续扫描
                             current = end;
                             token_start = end;
                         },
-                        _ => return self.make_token(acc, token_start, end).map(Ok),
+                        _ => return self.make_token(acc, token_start, end)
+                                 .map(|t| (Ok(t), Span { start: token_start, end })),
                     }
                 },
                 Step::REJECT(e) => {
                     //越过reject字符，lexer永不卡死；调用方可选择继续收集后续错误或fail-fast
                     self.position = current + 1;
-                    return Some(Err(e));
+                    let span = match e {
+                        LexErr::UnexpectedChar(_) => Span { start: current, end: current + 1 },
+                        _ => Span { start: token_start, end: current },  //未闭合：指向起始定界符起的整段
+                    };
+                    return Some((Err(e), span));
                 },
             }
         }
@@ -111,12 +116,13 @@ impl<'a> Lexer<'a> {
                 self.position = end;
                 match acc {
                     AcceptType::COMMENT => None,    //末尾注释直接丢弃
-                    _ => self.make_token(acc, token_start, end).map(Ok),
+                    _ => self.make_token(acc, token_start, end)
+                             .map(|t| (Ok(t), Span { start: token_start, end })),
                 }
             },
             Finish::Error(e) => {
                 self.position = bytes.len();
-                Some(Err(e))
+                Some((Err(e), Span { start: token_start, end: bytes.len() }))
             },
         }
     }
@@ -126,9 +132,9 @@ impl<'a> Lexer<'a> {
 mod tests {
     use super::*;
 
-    //既有测试只关心token序列：unwrap掉Result，遇Err直接panic暴露
-    fn tok<'a>(r: Option<Result<Token<'a>, LexErr>>) -> Option<Token<'a>> {
-        r.map(|x| x.unwrap())
+    //既有测试只关心token序列：丢弃span并unwrap掉Result，遇Err直接panic暴露
+    fn tok<'a>(r: Option<(Result<Token<'a>, LexErr>, Span)>) -> Option<Token<'a>> {
+        r.map(|(x, _)| x.unwrap())
     }
 
     #[test]
@@ -241,35 +247,49 @@ mod tests {
     #[test]
     fn unexpected_char_reports_error_and_continues() {
         let mut lx = Lexer::new("a ? b");
-        assert_eq!(lx.next_token(), Some(Ok(Token::NAME("a"))));
-        assert_eq!(lx.next_token(), Some(Err(LexErr::UnexpectedChar('?'))));
-        assert_eq!(lx.next_token(), Some(Ok(Token::NAME("b"))));   //越过肇事字符后可继续
+        assert_eq!(lx.next_token(), Some((Ok(Token::NAME("a")), Span { start: 0, end: 1 })));
+        assert_eq!(lx.next_token(), Some((Err(LexErr::UnexpectedChar('?')), Span { start: 2, end: 3 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::NAME("b")), Span { start: 4, end: 5 })));   //越过肇事字符后可继续
         assert_eq!(lx.next_token(), None);
     }
 
     #[test]
     fn unclosed_string_newline_then_continue() {
         let mut lx = Lexer::new("\"abc\nx");
-        assert_eq!(lx.next_token(), Some(Err(LexErr::UnclosedString)));
-        assert_eq!(lx.next_token(), Some(Ok(Token::NAME("x"))));   //越过换行后从下一行继续
+        //span指向自起始引号的整段(不含换行)，报错可定位到未闭合的引号
+        assert_eq!(lx.next_token(), Some((Err(LexErr::UnclosedString), Span { start: 0, end: 4 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::NAME("x")), Span { start: 5, end: 6 })));
         assert_eq!(lx.next_token(), None);
     }
 
     #[test]
     fn unclosed_string_eof() {
         let mut lx = Lexer::new("'abc");
-        assert_eq!(lx.next_token(), Some(Err(LexErr::UnclosedString)));
+        assert_eq!(lx.next_token(), Some((Err(LexErr::UnclosedString), Span { start: 0, end: 4 })));
         assert_eq!(lx.next_token(), None);      //错误后position已到末尾，干净EOF
         //转义后截断同属未闭合
         let mut lx = Lexer::new("\"ab\\");
-        assert_eq!(lx.next_token(), Some(Err(LexErr::UnclosedString)));
+        assert_eq!(lx.next_token(), Some((Err(LexErr::UnclosedString), Span { start: 0, end: 4 })));
     }
 
     #[test]
     fn unclosed_long_bracket_distinguishes_string_and_comment() {
         let mut lx = Lexer::new("[[abc");
-        assert_eq!(lx.next_token(), Some(Err(LexErr::UnclosedLongStr)));
+        assert_eq!(lx.next_token(), Some((Err(LexErr::UnclosedLongStr), Span { start: 0, end: 5 })));
         let mut lx = Lexer::new("--[==[abc]=]");    //级别不匹配，未闭合
-        assert_eq!(lx.next_token(), Some(Err(LexErr::UnclosedLongComment)));
+        assert_eq!(lx.next_token(), Some((Err(LexErr::UnclosedLongComment), Span { start: 0, end: 12 })));
+    }
+
+    #[test]
+    fn spans_cover_exact_bytes() {
+        //覆盖：关键字/回退token(0x1f后靠空格收尾)/跳过注释后的起点/SHR两字节(供拆分算术)
+        let mut lx = Lexer::new("local ab = 0x1f --c\n>>=");
+        assert_eq!(lx.next_token(), Some((Ok(Token::RESERVED(Reserved::LOCAL)), Span { start: 0, end: 5 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::NAME("ab")), Span { start: 6, end: 8 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::OPERATOR(OpType::SIMPLE('='))), Span { start: 9, end: 10 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::NUMERAL("0x1f")), Span { start: 11, end: 15 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::OPERATOR(OpType::SHR)), Span { start: 20, end: 22 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::OPERATOR(OpType::SIMPLE('='))), Span { start: 22, end: 23 })));
+        assert_eq!(lx.next_token(), None);
     }
 }

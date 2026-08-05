@@ -112,6 +112,13 @@ pub enum LexErr {
     UnclosedLongComment,
 }
 
+//token/错误的字节区间[start,end)；行列号报错时由LineIndex惰性推导，不在此存储
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
 //输入耗尽时的收尾结果：区分"干净EOF"、"中间态补发token"与"未闭合错误"三态
 pub enum Finish {
     Done,                       //S0：无待产出token，干净结束
