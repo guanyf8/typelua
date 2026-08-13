@@ -11,6 +11,8 @@ pub struct Rule {
 pub struct Grammar {
     pub rules: Vec<Rule>,
     pub names: Vec<String>,
+    pub firsts: Vec<HashSet<i32>>,    //-1意味着为空 //todo 这个数据表示有点丑陋，后面再想想怎么优化
+    pub terminals: Vec<bool>,
 }
 
 
@@ -19,7 +21,155 @@ impl Grammar {
         Grammar {
             rules: vec![],
             names: vec![],
+            firsts: vec![],      
+            terminals: vec![],     
         }
+    }
+
+    pub fn build_grammar(input: TokenStream) -> Grammar {
+        let tokens: Vec<TokenTree> = input.into_iter().collect();
+        let mut grammar = Grammar::new();
+
+        let mut left_buffer: String = String::new();
+        let mut buffer: Vec<String> = vec![];
+
+        let mut i = 0;
+        while i < tokens.len() {
+            let token = &tokens[i];
+            match token {
+                TokenTree::Punct(punct) => {
+                    match punct.as_char() {
+                        ':' => {
+                            if buffer.len() != 1 {
+                                panic!(
+                                    "ambiguous ':' : expected exactly one nonterminal on the left-hand side, got {:?}",
+                                    buffer
+                                );
+                            }
+                            left_buffer = buffer.pop().unwrap();
+                        }
+                        '|' => {
+                            if left_buffer.is_empty() {
+                                panic!("ambiguous '|' : no left-hand side defined yet");
+                            }
+                            grammar.add_rule(&left_buffer, &buffer);
+                            buffer.clear();
+                        }
+                        ';' => {
+                            let next_is_alternative = matches!(
+                                tokens.get(i + 1),
+                                Some(TokenTree::Punct(p)) if p.as_char() == '|'
+                            );
+                            let next_is_semicolon = matches!(
+                                tokens.get(i + 1),
+                                Some(TokenTree::Punct(p)) if p.as_char() == ';'
+                            );
+
+                            if next_is_alternative || next_is_semicolon {
+                                // Still inside an alternative: ';' is a terminal token.
+                                buffer.push(";".to_string());
+                            } else {
+                                // Rule terminator.
+                                if left_buffer.is_empty() {
+                                    panic!("ambiguous ';' : no left-hand side defined yet");
+                                }
+                                grammar.add_rule(&left_buffer, &buffer);
+                                buffer.clear();
+                                left_buffer.clear();
+                            }
+                        }
+                        _ => {
+                            buffer.push(punct.as_char().to_string());
+                        }
+                    }
+                }
+                TokenTree::Group(group) => {
+                    panic!(
+                        "Group {:?} not allowed here, please use plain terminals/nonterminals",
+                        group
+                    );
+                }
+                TokenTree::Ident(ident) => {
+                    buffer.push(ident.to_string());
+                }
+                TokenTree::Literal(literal) => {
+                    buffer.push(literal.to_string());
+                }
+            }
+            i += 1;
+        }
+
+        // Flush the last alternative if the input did not end with a rule terminator.
+        if !left_buffer.is_empty() && !buffer.is_empty() {
+            grammar.add_rule(&left_buffer, &buffer);
+        }
+
+        grammar.terminals = vec![true; grammar.names.len()];
+        
+        // 标记终止符号
+        //todo 这里其实不完全对，需要识别只存在左边却从来没出现过在右边的死规则（有可能是typo）
+        grammar.rules.iter().for_each(|rule| {
+            grammar.terminals[rule.left as usize] = false;
+        });
+
+        grammar.build_first_set();
+        
+
+        grammar
+    }
+
+    fn build_first_set(&mut self){
+        // 协议first中含有-1意味着可为空
+        let len = self.names.len();
+        self.firsts = vec![HashSet::new(); len];
+
+        //terminal的first是它本身
+        for i in 0..len {
+            if self.terminals[i] {
+                self.firsts[i].insert(i as i32);
+            }
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for rule in &self.rules {
+                let mut all_nullable = true;
+                for symbol in &rule.right {
+                    let symbol_first: Vec<i32> = self.firsts[*symbol as usize].iter().copied().collect();
+                    for first in &symbol_first {
+                        if *first != -1 {     //todo 因为数据表示选型，非常容易写错，后面可以想想怎么优化
+                            changed |= self.firsts[rule.left as usize].insert(*first);
+                        }
+                    }
+                    if !symbol_first.contains(&-1) {
+                        all_nullable = false;
+                        break;
+                    }
+                }
+                if all_nullable {
+                    changed |= self.firsts[rule.left as usize].insert(-1);
+                }
+            }
+
+        }
+    }
+
+    pub fn get_seq_first(&self, seq: &[u32], lookahead: u32) -> HashSet<u32> {
+        let mut seq_first: HashSet<u32> = HashSet::new();
+        let mut nullable = true;
+        for symbol in seq {
+            let symbol_first = &self.firsts[*symbol as usize];
+            seq_first.extend(symbol_first.iter().filter_map(|&f| if f != -1 { Some(f as u32) } else { None }));
+            if !symbol_first.contains(&-1) {
+                nullable = false;
+                break;
+            }
+        }
+        if nullable {
+            seq_first.insert(lookahead);
+        }
+        seq_first
     }
 
     pub fn get_name(&self, index:u32) -> Option<&String> {
@@ -68,94 +218,13 @@ impl fmt::Display for Grammar {
     }
 }
 
-pub fn generate_grammar_tree(input: TokenStream) -> Grammar {
-    let tokens: Vec<TokenTree> = input.into_iter().collect();
-    let mut grammar = Grammar::new();
-
-    let mut left_buffer: String = String::new();
-    let mut buffer: Vec<String> = vec![];
-
-    let mut i = 0;
-    while i < tokens.len() {
-        let token = &tokens[i];
-        match token {
-            TokenTree::Punct(punct) => {
-                match punct.as_char() {
-                    ':' => {
-                        if buffer.len() != 1 {
-                            panic!(
-                                "ambiguous ':' : expected exactly one nonterminal on the left-hand side, got {:?}",
-                                buffer
-                            );
-                        }
-                        left_buffer = buffer.pop().unwrap();
-                    }
-                    '|' => {
-                        if left_buffer.is_empty() {
-                            panic!("ambiguous '|' : no left-hand side defined yet");
-                        }
-                        grammar.add_rule(&left_buffer, &buffer);
-                        buffer.clear();
-                    }
-                    ';' => {
-                        let next_is_alternative = matches!(
-                            tokens.get(i + 1),
-                            Some(TokenTree::Punct(p)) if p.as_char() == '|'
-                        );
-                        let next_is_semicolon = matches!(
-                            tokens.get(i + 1),
-                            Some(TokenTree::Punct(p)) if p.as_char() == ';'
-                        );
-
-                        if next_is_alternative || next_is_semicolon {
-                            // Still inside an alternative: ';' is a terminal token.
-                            buffer.push(";".to_string());
-                        } else {
-                            // Rule terminator.
-                            if left_buffer.is_empty() {
-                                panic!("ambiguous ';' : no left-hand side defined yet");
-                            }
-                            grammar.add_rule(&left_buffer, &buffer);
-                            buffer.clear();
-                            left_buffer.clear();
-                        }
-                    }
-                    _ => {
-                        buffer.push(punct.as_char().to_string());
-                    }
-                }
-            }
-            TokenTree::Group(group) => {
-                panic!(
-                    "Group {:?} not allowed here, please use plain terminals/nonterminals",
-                    group
-                );
-            }
-            TokenTree::Ident(ident) => {
-                buffer.push(ident.to_string());
-            }
-            TokenTree::Literal(literal) => {
-                buffer.push(literal.to_string());
-            }
-        }
-        i += 1;
-    }
-
-    // Flush the last alternative if the input did not end with a rule terminator.
-    if !left_buffer.is_empty() && !buffer.is_empty() {
-        grammar.add_rule(&left_buffer, &buffer);
-    }
-
-    grammar
-}
-
 #[derive(Debug, Clone,Copy, PartialEq, PartialOrd,Eq, Ord, Hash)]
 struct Item {
     rule_index: usize,
     position: usize,
 }
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 type Items = BTreeSet<Item>;
 
 trait WrapItem {
@@ -202,13 +271,11 @@ fn goto(items: &Items, symbol: u32, grammar: &Grammar) -> Items {
     let mut goto_items = BTreeSet::new();
     for item in items {
         let rule = &grammar.rules[item.rule_index];
-        if let Some(&follow) = rule.right.get(item.position){
-            if follow == symbol {
-                goto_items.insert(Item {      
-                    rule_index: item.rule_index,
-                    position: item.position + 1,
-                });
-            }
+        if let Some(&follow) = rule.right.get(item.position) && follow == symbol{
+            goto_items.insert(Item {      
+                rule_index: item.rule_index,
+                position: item.position + 1,
+            });
         }
     }
     goto_items       //只输出内核项，不需要闭包
@@ -255,7 +322,6 @@ fn kernel(grammar:&Grammar)->(ItemsCollection, Vec<(u32/*state */,u32 /* trans_s
     (kernel_collection, transitions)
 }
 
-// fn  
 
 // pub struct ParseTable {
 //     action:,
