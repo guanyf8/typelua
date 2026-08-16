@@ -1,6 +1,8 @@
 use proc_macro2::{TokenStream, TokenTree};
 use std::fmt;
 
+mod export;
+
 // 测试放在本模块的子模块里，这样它能直接看到私有项，不必为测试放宽可见性
 #[cfg(test)]
 mod tests;
@@ -109,6 +111,24 @@ impl Grammar {
         // Flush the last alternative if the input did not end with a rule terminator.
         if !left_buffer.is_empty() && !buffer.is_empty() {
             grammar.add_rule(&left_buffer, &buffer);
+        }
+
+        // 第一条产生式就是增广产生式。否则panic。
+        if grammar.rules.is_empty() {
+            panic!("empty grammar: at least one rule is required");
+        }
+        let start = grammar.rules[0].left;
+        let start_alternatives = grammar.rules.iter().filter(|rule| rule.left == start).count();
+        if start_alternatives != 1 {
+            panic!(
+                "start symbol `{}` has {} alternatives, expected exactly 1: \
+                 the first rule is taken as the augmented production, so write \
+                 `{}' : {} ;` explicitly and keep the real alternatives on another nonterminal",
+                grammar.names[start as usize],
+                start_alternatives,
+                grammar.names[start as usize],
+                grammar.names[start as usize],
+            );
         }
 
         //早期append一个 $end，不会出现在所有rule中
@@ -319,7 +339,6 @@ fn goto<T:Lookahead>(items: &Items<T>, symbol: u32, grammar: &Grammar) -> Items<
         let rule = &grammar.rules[item.rule_index];
         if let Some(&follow) = rule.right.get(item.position) && follow == symbol{
             goto_items.insert(Item {      
-                rule_index: item.rule_index,
                 position: item.position + 1,
                 ..*item
             });
@@ -464,6 +483,7 @@ fn build_lalr_kernels(kernels: &ItemsCollection<()>, lookaheads: &Lookaheads) ->
 }
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Shift(u32),
     Reduce(u32),
@@ -474,74 +494,90 @@ use std::collections::HashMap;
 pub struct ParseTable {
     action:HashMap<(u32/* state */,u32 /* symbol */),Action>,
     goto:HashMap<(u32/* state */,u32 /* symbol */),u32/*state */>,
+    state_count: usize,
+    end_symbol: u32,
+    symbol_names: Vec<String>,
+    is_terminal: Vec<bool>,
+    /// rule_index -> left。for GOTO
+    rule_lhs: Vec<u32>,
+    /// rule_index -> right.len。for reduce
+    rule_rhs_len: Vec<u32>,
 }
 
-pub fn generate_parse_table(grammar: &Grammar) -> ParseTable {
-    let (kernels_lr0, transitions) = build_kernels(grammar);
-    let (spontaneous, propagate) = build_lookaheads(&kernels_lr0, grammar, &transitions);
-    let lookaheads = resolve_lookaheads(spontaneous, &propagate);
-    let kernels_lalr = build_lalr_kernels(&kernels_lr0, &lookaheads);
-    let lalr_items = kernels_lalr.iter().map(|kernel|{
-        build_closure(kernel.clone(), grammar)
-    }).collect::<ItemsCollection<u32>>();
-    let mut parse_table = ParseTable {
-        action: HashMap::new(),
-        goto: HashMap::new(),
-    };
-    let set_action = |table: &mut HashMap<(u32, u32), Action>,
-                                                                state: u32, symbol: u32, action: Action| {
-        fn label(a: &Action) -> &'static str {
-            match a {
-                Action::Shift(_) => "shift",
-                Action::Reduce(_) => "reduce",
-                Action::Accept => "accept",
+impl ParseTable {
+    pub fn generate_parse_table(grammar: &Grammar) -> ParseTable {
+        let (kernels_lr0, transitions) = build_kernels(grammar);
+        let (spontaneous, propagate) = build_lookaheads(&kernels_lr0, grammar, &transitions);
+        let lookaheads = resolve_lookaheads(spontaneous, &propagate);
+        let kernels_lalr = build_lalr_kernels(&kernels_lr0, &lookaheads);
+        let lalr_items = kernels_lalr.iter().map(|kernel|{
+            build_closure(kernel.clone(), grammar)
+        }).collect::<ItemsCollection<u32>>();
+        let mut parse_table = ParseTable {
+            action: HashMap::new(),
+            goto: HashMap::new(),
+            state_count: kernels_lr0.len(),
+            end_symbol: grammar.end_symbol(),
+            symbol_names: grammar.names.clone(),
+            is_terminal: grammar.terminals.clone(),
+            rule_lhs: grammar.rules.iter().map(|rule| rule.left).collect(),
+            rule_rhs_len: grammar.rules.iter().map(|rule| rule.right.len() as u32).collect(),
+        };
+        let set_action = |table: &mut HashMap<(u32, u32), Action>,
+                                                                    state: u32, symbol: u32, action: Action| {
+            fn label(a: &Action) -> &'static str {
+                match a {
+                    Action::Shift(_) => "shift",
+                    Action::Reduce(_) => "reduce",
+                    Action::Accept => "accept",
+                }
             }
-        }
-        if let Some(a) = table.get(&(state, symbol)){
-            match (a, &action) {
-                //扔掉reduce就好了
-                (Action::Shift(_), Action::Reduce(_)) => {}
-                //reduce -reduce冲突不允许
-                (Action::Reduce(kept), Action::Reduce(dropped)) => panic!(
-                    "reduce-reduce conflicts：state {state} with lookahead `{}` 时，rule {kept} - rule {dropped} ",
-                    grammar.names[symbol as usize],
-                ),
-                (old, new) => unreachable!(
-                    "state {state} : `{}` illegal， given {} be covered by {}",
-                    grammar.names[symbol as usize], label(old), label(new),
-                ),
+            if let Some(a) = table.get(&(state, symbol)){
+                match (a, &action) {
+                    //扔掉reduce就好了
+                    (Action::Shift(_), Action::Reduce(_)) => {}
+                    //reduce -reduce冲突不允许
+                    (Action::Reduce(kept), Action::Reduce(dropped)) => panic!(
+                        "reduce-reduce conflicts：state {state} with lookahead `{}` 时，rule {kept} - rule {dropped} ",
+                        grammar.names[symbol as usize],
+                    ),
+                    (old, new) => unreachable!(
+                        "state {state} : `{}` illegal， given {} be covered by {}",
+                        grammar.names[symbol as usize], label(old), label(new),
+                    ),
+                }
+            }else {
+                table.insert((state, symbol), action);
             }
-        }else {
-            table.insert((state, symbol), action);
-        }
-    };
+        };
 
-    //贪婪，shift-reduce冲突时优先shift
-    for ((state,symbol),target) in transitions {
-        if grammar.terminals[symbol as usize] {
-            set_action(&mut parse_table.action, 
-                state, symbol, Action::Shift(target));
-        } else {
-            parse_table.goto.insert((state, symbol), target);
-        }
-    }
-
-    for (i,items) in lalr_items.iter().enumerate() {
-        for item in items {
-            //有后继
-            if item.position< grammar.rules[item.rule_index].right.len(){
-                continue;
-            }
-
-            if item.rule_index == 0 && item.lookahead == grammar.end_symbol(){
+        //贪婪，shift-reduce冲突时优先shift
+        for ((state,symbol),target) in transitions {
+            if grammar.terminals[symbol as usize] {
                 set_action(&mut parse_table.action, 
-                    i as u32, item.lookahead, Action::Accept);
-            }else{
-                set_action(&mut parse_table.action, 
-                    i as u32, item.lookahead, Action::Reduce(item.rule_index as u32));
+                    state, symbol, Action::Shift(target));
+            } else {
+                parse_table.goto.insert((state, symbol), target);
             }
         }
-    }
-    parse_table
 
+        for (i,items) in lalr_items.iter().enumerate() {
+            for item in items {
+                //有后继
+                if item.position< grammar.rules[item.rule_index].right.len(){
+                    continue;
+                }
+
+                if item.rule_index == 0 && item.lookahead == grammar.end_symbol(){
+                    set_action(&mut parse_table.action, 
+                        i as u32, item.lookahead, Action::Accept);
+                }else{
+                    set_action(&mut parse_table.action, 
+                        i as u32, item.lookahead, Action::Reduce(item.rule_index as u32));
+                }
+            }
+        }
+        parse_table
+    }
 }
+
