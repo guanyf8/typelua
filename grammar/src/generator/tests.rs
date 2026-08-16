@@ -130,7 +130,7 @@ fn catalogue() -> Vec<(&'static str, Grammar)> {
         ("merge", merge()),
         ("propagate", propagate()),
         ("dangling_else", dangling_else()),
-    ]
+    ] as Vec<(&'static str, Grammar)>
 }
 
 // ============ 辅助函数 ============
@@ -195,7 +195,7 @@ fn render_rule(grammar: &Grammar, rule_index: usize) -> String {
         return format!("{lhs} -> ε");
     }
     let rhs: Vec<&str> = rule.right.iter().map(|&s| grammar.names[s as usize].as_str()).collect();
-    format!("{lhs} -> {}", rhs.join(" "))
+    format!("{lhs} -> {}", rhs.join(" ")) as String
 }
 
 /// 跑完整条前看集链路：LR(0) 内核 -> 自发/传播 -> 不动点
