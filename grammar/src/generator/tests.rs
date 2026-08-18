@@ -286,6 +286,245 @@ fn shift_reduce_conflicts(grammar: &Grammar, table: &ParseTable) -> Vec<String> 
     conflicts
 }
 
+
+// ============ 产生式标签 ============
+
+/// 每条产生式渲染成 `标签: 左部 -> 右部`，没标签的写 `-`
+fn labeled_rules(grammar: &Grammar) -> Vec<String> {
+    (0..grammar.rules.len())
+        .map(|i| {
+            let label = match grammar.rules[i].label {
+                Some(index) => grammar.labels[index as usize].as_str(),
+                None => "-",
+            };
+            format!("{label}: {}", render_rule(grammar, i))
+        })
+        .collect()
+}
+
+#[test]
+fn labels_are_optional_and_only_the_tagged_ones_are_recorded() {
+    // 没贴标签 = 明确声明「这条没有语义动作」，不是遗漏
+    let grammar = Grammar::build_grammar(quote! {
+        start : s ;
+        s : A @Alpha
+          | B
+          | C @Gamma
+          ;
+    });
+    assert_eq!(
+        labeled_rules(&grammar),
+        ["-: start -> s", "Alpha: s -> A", "-: s -> B", "Gamma: s -> C"]
+    );
+    // labels 只装被贴过的，按首次出现顺序
+    assert_eq!(grammar.labels, ["Alpha", "Gamma"]);
+}
+
+#[test]
+fn label_can_be_attached_to_an_empty_alternative() {
+    let grammar = Grammar::build_grammar(quote! {
+        start : opt ;
+        opt : @Absent | C @Present ;
+    });
+    assert_eq!(
+        labeled_rules(&grammar),
+        ["-: start -> opt", "Absent: opt -> ε", "Present: opt -> C"]
+    );
+}
+
+#[test]
+fn a_label_may_sit_anywhere_inside_its_alternative() {
+    // `@` 只是给当前候选式打标记，位置不影响右部符号序列
+    let grammar = Grammar::build_grammar(quote! {
+        start : s ;
+        s : @Front A B | A @Middle B | A B @Back ;
+    });
+    assert_eq!(
+        labeled_rules(&grammar),
+        ["-: start -> s", "Front: s -> A B", "Middle: s -> A B", "Back: s -> A B"]
+    );
+}
+
+#[test]
+fn labels_survive_reordering_alternatives() {
+    // 这是标签存在的全部理由：换个书写顺序，规则下标全变，标签不变
+    let find = |g: &Grammar, name: &str| {
+        let index = g.labels.iter().position(|l| l == name).unwrap() as u32;
+        let rule = g.rules.iter().position(|r| r.label == Some(index)).unwrap();
+        (rule, render_rule(g, rule))
+    };
+    let before = Grammar::build_grammar(quote! { start : s ; s : A @Alpha | B @Beta ; });
+    let after = Grammar::build_grammar(quote! { start : s ; s : B @Beta | A @Alpha ; });
+
+    assert_eq!(find(&before, "Alpha").1, "s -> A");
+    assert_eq!(find(&after, "Alpha").1, "s -> A", "标签必须跟着候选式走");
+    // 下标确实变了 —— 所以按下标 dispatch 会静默错位，按标签不会
+    assert_ne!(find(&before, "Alpha").0, find(&after, "Alpha").0);
+}
+
+#[test]
+fn labels_do_not_affect_the_automaton() {
+    // 标签是纯元数据，不能改变文法本身
+    let plain = Grammar::build_grammar(quote! { start : a_b ; a_b : X n Y | Z n W ; n : N ; });
+    let tagged = Grammar::build_grammar(quote! {
+        start : a_b @Root ;
+        a_b : X n Y @Left | Z n W @Right ;
+        n : N @Leaf ;
+    });
+    assert_eq!(plain.names, tagged.names);
+    assert_eq!(plain.terminals, tagged.terminals);
+    assert_eq!(plain.firsts, tagged.firsts);
+    let (plain_states, plain_trans) = build_kernels(&plain);
+    let (tagged_states, tagged_trans) = build_kernels(&tagged);
+    assert_eq!(plain_states, tagged_states);
+    assert_eq!(plain_trans, tagged_trans);
+}
+
+#[test]
+fn unlabeled_grammars_record_no_labels_at_all() {
+    for (name, grammar) in catalogue() {
+        assert!(grammar.labels.is_empty(), "{name}: 目录里的文法都没贴标签");
+        assert!(
+            grammar.rules.iter().all(|rule| rule.label.is_none()),
+            "{name}: 不该凭空冒出标签"
+        );
+    }
+}
+
+#[test]
+fn label_indices_always_point_into_the_label_table() {
+    let grammar = Grammar::build_grammar(quote! {
+        start : s ;
+        s : A @One | B | C @Two | D @Three ;
+    });
+    for (i, rule) in grammar.rules.iter().enumerate() {
+        if let Some(index) = rule.label {
+            assert!(
+                (index as usize) < grammar.labels.len(),
+                "规则 {i} 的标签下标 {index} 越界（labels 长 {}）",
+                grammar.labels.len()
+            );
+        }
+    }
+    // 每个标签恰好被一条产生式引用 —— 标签是身份不是分类
+    for (index, name) in grammar.labels.iter().enumerate() {
+        let users = grammar.rules.iter().filter(|r| r.label == Some(index as u32)).count();
+        assert_eq!(users, 1, "标签 `{name}` 被 {users} 条产生式引用");
+    }
+}
+
+// ---------- 拒绝路径 ----------
+
+#[test]
+#[should_panic(expected = "duplicate production label `Dup`")]
+fn rejects_duplicate_labels_on_the_same_nonterminal() {
+    Grammar::build_grammar(quote! { start : s ; s : A @Dup | B @Dup ; });
+}
+
+#[test]
+#[should_panic(expected = "duplicate production label `Decl`")]
+fn rejects_duplicate_labels_across_nonterminals() {
+    // 跨左部重名几乎一定是笔误，而共享变体会让 dispatch 无法区分两条产生式
+    Grammar::build_grammar(quote! { start : s ; s : A @Decl ; t : B @Decl ; s : t ; });
+}
+
+#[test]
+#[should_panic(expected = "is a Rust keyword")]
+fn rejects_rust_keyword_as_a_label() {
+    // `@if` 会发射出 `pub enum Prod { if }`，消费方直接语法错误
+    Grammar::build_grammar(quote! { start : s ; s : IF A @if ; });
+}
+
+#[test]
+#[should_panic(expected = "is a Rust keyword")]
+fn rejects_capital_self_as_a_label() {
+    // Self 也是保留字，容易漏
+    Grammar::build_grammar(quote! { start : s ; s : A @Self ; });
+}
+
+#[test]
+fn accepts_a_lowercase_label_that_is_not_a_keyword() {
+    // 小写合法（发射时带 #[allow(non_camel_case_types)]），只有关键字才拦
+    let grammar = Grammar::build_grammar(quote! { start : s ; s : A @local_decl ; });
+    assert_eq!(grammar.labels, ["local_decl"]);
+}
+
+#[test]
+#[should_panic(expected = "multiple labels defined")]
+fn rejects_two_labels_on_one_alternative() {
+    Grammar::build_grammar(quote! { start : s ; s : A @One @Two ; });
+}
+
+#[test]
+#[should_panic(expected = "expected identifier after '@'")]
+fn rejects_at_followed_by_a_non_identifier() {
+    Grammar::build_grammar(quote! { start : s ; s : A @ 42 ; });
+}
+
+#[test]
+#[should_panic(expected = "expected identifier after '@'")]
+fn rejects_at_at_end_of_input() {
+    // 用 tokens.get 而不是 tokens[i+1]，否则报的是 index out of bounds
+    Grammar::build_grammar(quote! { start : A @ });
+}
+
+#[test]
+#[should_panic(expected = "`@Orphan` is not attached to any production")]
+fn rejects_label_after_the_last_terminator() {
+    Grammar::build_grammar(quote! { start : A ; @Orphan });
+}
+
+// ---------- 发射 ----------
+
+#[test]
+fn export_turns_labels_into_an_enum() {
+    let grammar = Grammar::build_grammar(quote! {
+        start : s ;
+        s : A @Alpha | B | C @Gamma ;
+    });
+    let emitted = ParseTable::generate_parse_table(&grammar).export().to_string();
+
+    assert!(emitted.contains("pub enum Prod { Alpha , Gamma }"), "{emitted}");
+    assert!(emitted.contains("# [allow (non_camel_case_types)]"), "缺 allow 属性");
+    // 数组要和规则一一对应，未标注的是 None。这里也顺带守住了
+    // 「不能直接发射 Option<u32>」那个坑 —— quote 对 None 发射空 token
+    assert!(
+        emitted.contains(
+            "RULE_PROD : [Option < Prod > ; NUM_RULES] = \
+             [None , Some (Prod :: Alpha) , None , Some (Prod :: Gamma)]"
+        ),
+        "{emitted}"
+    );
+    assert!(emitted.contains("pub fn prod (rule : u32) -> Option < Prod >"), "缺 prod()");
+}
+
+#[test]
+fn export_without_labels_yields_an_empty_enum() {
+    let emitted = ParseTable::generate_parse_table(&minimal()).export().to_string();
+    assert!(emitted.contains("pub enum Prod { }"), "{emitted}");
+    assert!(emitted.contains("RULE_PROD : [Option < Prod > ; NUM_RULES] = [None]"), "{emitted}");
+}
+
+#[test]
+fn exported_tokens_are_valid_rust() {
+    // 兜底：把发射结果丢给 syn 解析。这一条能一次性挡住关键字、非法标识符，
+    // 以及 Option/None 那类把 token 写坏的问题 —— 它们在 grammar crate 里
+    // 编译得过，只有消费方才会炸
+    let grammar = Grammar::build_grammar(quote! {
+        start : s ;
+        s : A @Alpha | B | C @local_decl ;
+    });
+    let tokens = ParseTable::generate_parse_table(&grammar).export();
+    syn::parse2::<syn::File>(tokens).expect("发射结果必须是合法 Rust");
+    // 目录里那些完全没标签的也要能过（空枚举 + 全 None）
+    for (name, grammar) in catalogue() {
+        let tokens = ParseTable::generate_parse_table(&grammar).export();
+        syn::parse2::<syn::File>(tokens)
+            .unwrap_or_else(|e| panic!("{name}: 发射结果不是合法 Rust: {e}"));
+    }
+}
+
+
 // ============ DSL 解析 ============
 
 #[test]

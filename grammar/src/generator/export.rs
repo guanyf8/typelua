@@ -70,6 +70,8 @@ impl ParseTable {
             const CELL_ACCEPT: i32 = i32::MAX;
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+            // 标签名由文法作者定，`@local_decl` 这种小写不该在消费方刷警告
+            #[allow(non_camel_case_types)]
             pub enum Prod { #(#prod_variants),* }
 
             /// 没贴标签的产生式是 None

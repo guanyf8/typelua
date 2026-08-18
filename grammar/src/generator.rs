@@ -10,6 +10,17 @@ mod tests;
 /// 输入结束符的名字。
 const END_SYMBOL: &str = "$end";
 
+/// Rust 保留字。
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+    "async", "await", "dyn",
+    "abstract", "become", "box", "do", "final", "macro", "override", "priv", "typeof",
+    "unsized", "virtual", "yield", "try", "gen",
+];
+
 #[derive(Eq, PartialEq, Ord, PartialOrd)]
 pub struct Rule {
     pub left: u32,
@@ -97,10 +108,10 @@ impl Grammar {
                             if !label_buffer.is_empty() {
                                 panic!("ambiguous '@' : multiple labels defined");
                             }
-                            let Some(TokenTree::Ident(ident)) = tokens.get(i + 1) else {
-                                panic!("expected identifier after '@'");
+                            label_buffer = match tokens.get(i + 1) {
+                                Some(TokenTree::Ident(ident)) => ident.to_string(),
+                                _ => panic!("expected identifier after '@'"),
                             };
-                            label_buffer = ident.to_string();
                             i += 1;
                         }
                         _ => {
@@ -127,6 +138,11 @@ impl Grammar {
         // Flush the last alternative if the input did not end with a rule terminator.
         if !left_buffer.is_empty() && !buffer.is_empty() {
             grammar.add_rule(&left_buffer, &buffer, if label_buffer.is_empty() { None } else { Some(label_buffer.clone()) });
+        }
+
+        // `start : A ; @Orphan` 里那个标签谁都没贴上，静默丢掉的话写错位置查不出来
+        if !label_buffer.is_empty() {
+            panic!("`@{label_buffer}` is not attached to any production");
         }
 
         // 第一条产生式就是增广产生式。否则panic。
@@ -246,21 +262,32 @@ impl Grammar {
                 })
             })
             .collect();
-        let label_index:Option<u32> = if let Some(l) = label {
-            let index = self.labels.iter().position(|x| {
-                x == &l
-            }).unwrap_or_else(|| {
-                self.labels.push(l);
-                self.labels.len() - 1
-            });
-            Some(index as u32)
-        }else{ None };
+        let label_index: Option<u32> = label.map(|l| self.push_label(l));
         self.rules.push(Rule {
             left: left_index,
             right: right_index,
             label: label_index,
         });
         self.rules.last().unwrap()
+    }
+
+    // 不管消费逻辑是什么，拒绝一切label重名
+    fn push_label(&mut self, label: String) -> u32 {
+        if RUST_KEYWORDS.contains(&label.as_str()) {
+            panic!(
+                "production label `{label}` is a Rust keyword: it becomes an enum variant \
+                 name, so pick something else"
+            );
+        }
+        if let Some(first) = self.labels.iter().position(|x| *x == label) {
+            panic!(
+                "duplicate production label `{label}`: already used by the rule labeled \
+                 at index {first}. Labels identify a single production; group several \
+                 productions with `Prod::A | Prod::B => ...` on the consumer side"
+            );
+        }
+        self.labels.push(label);
+        (self.labels.len() - 1) as u32
     }
 }
 
