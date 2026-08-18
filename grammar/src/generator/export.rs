@@ -1,4 +1,4 @@
-use proc_macro2::TokenStream;
+use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 
 use super::{Action, ParseTable};
@@ -38,6 +38,17 @@ impl ParseTable {
         let is_terminal = self.is_terminal.iter().copied();
         let rule_lhs = self.rule_lhs.iter().copied();
         let rule_rhs_len = self.rule_rhs_len.iter().copied();
+        // 标签名直接当枚举变体名
+        let prod_variants: Vec<Ident> = self.label_names.iter()
+            .map(|name| Ident::new(name, Span::call_site())).collect();
+        let rule_prod: Vec<TokenStream> = self.rule_label.iter()
+            .map(|slot| match slot {
+                Some(index) => {
+                    let variant = &prod_variants[*index as usize];
+                    quote! { Some(Prod::#variant) }
+                }
+                None => quote! { None },
+            }).collect();
 
         quote! {
             pub const NUM_STATES:  usize = #state_count;
@@ -57,6 +68,16 @@ impl ParseTable {
             static TABLE: [i32; NUM_STATES * NUM_SYMBOLS] = [#(#cells),*];
             const CELL_ERROR: i32 = 0;
             const CELL_ACCEPT: i32 = i32::MAX;
+
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+            pub enum Prod { #(#prod_variants),* }
+
+            /// 没贴标签的产生式是 None
+            pub static RULE_PROD: [Option<Prod>; NUM_RULES] = [#(#rule_prod),*];
+
+            #[inline]
+            pub fn prod(rule: u32) -> Option<Prod> { RULE_PROD[rule as usize] }
+            
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub enum Action {

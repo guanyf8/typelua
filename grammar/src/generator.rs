@@ -14,6 +14,7 @@ const END_SYMBOL: &str = "$end";
 pub struct Rule {
     pub left: u32,
     pub right: Vec<u32>,
+    pub label: Option<u32>,
 }
 
 
@@ -22,6 +23,7 @@ pub struct Grammar {
     pub names: Vec<String>,
     pub firsts: Vec<HashSet<i32>>,    //-1意味着为空 //todo 这个数据表示有点丑陋，后面再想想怎么优化
     pub terminals: Vec<bool>,
+    pub labels: Vec<String>,
 }
 
 
@@ -32,6 +34,7 @@ impl Grammar {
             names: vec![],
             firsts: vec![],      
             terminals: vec![],     
+            labels: vec![],
         }
     }
 
@@ -40,6 +43,7 @@ impl Grammar {
         let mut grammar = Grammar::new();
 
         let mut left_buffer: String = String::new();
+        let mut label_buffer: String = String::new();
         let mut buffer: Vec<String> = vec![];
 
         let mut i = 0;
@@ -61,8 +65,9 @@ impl Grammar {
                             if left_buffer.is_empty() {
                                 panic!("ambiguous '|' : no left-hand side defined yet");
                             }
-                            grammar.add_rule(&left_buffer, &buffer);
+                            grammar.add_rule(&left_buffer, &buffer, if label_buffer.is_empty() { None } else { Some(label_buffer.clone()) });
                             buffer.clear();
+                            label_buffer.clear();
                         }
                         ';' => {
                             let next_is_alternative = matches!(
@@ -82,10 +87,21 @@ impl Grammar {
                                 if left_buffer.is_empty() {
                                     panic!("ambiguous ';' : no left-hand side defined yet");
                                 }
-                                grammar.add_rule(&left_buffer, &buffer);
+                                grammar.add_rule(&left_buffer, &buffer, if label_buffer.is_empty() { None } else { Some(label_buffer.clone()) });
                                 buffer.clear();
                                 left_buffer.clear();
+                                label_buffer.clear();
                             }
+                        }
+                        '@' => {
+                            if !label_buffer.is_empty() {
+                                panic!("ambiguous '@' : multiple labels defined");
+                            }
+                            let Some(TokenTree::Ident(ident)) = tokens.get(i + 1) else {
+                                panic!("expected identifier after '@'");
+                            };
+                            label_buffer = ident.to_string();
+                            i += 1;
                         }
                         _ => {
                             buffer.push(punct.as_char().to_string());
@@ -110,7 +126,7 @@ impl Grammar {
 
         // Flush the last alternative if the input did not end with a rule terminator.
         if !left_buffer.is_empty() && !buffer.is_empty() {
-            grammar.add_rule(&left_buffer, &buffer);
+            grammar.add_rule(&left_buffer, &buffer, if label_buffer.is_empty() { None } else { Some(label_buffer.clone()) });
         }
 
         // 第一条产生式就是增广产生式。否则panic。
@@ -216,7 +232,7 @@ impl Grammar {
     }
 
 
-    pub fn add_rule(&mut self, left: &String, right: &Vec<String>) -> &Rule {
+    pub fn add_rule(&mut self, left: &String, right: &Vec<String>, label: Option<String>) -> &Rule {
         let left_index = self.get_index(left).unwrap_or_else(|| {
             self.names.push(left.clone());
             (self.names.len() as u32) - 1
@@ -230,9 +246,19 @@ impl Grammar {
                 })
             })
             .collect();
+        let label_index:Option<u32> = if let Some(l) = label {
+            let index = self.labels.iter().position(|x| {
+                x == &l
+            }).unwrap_or_else(|| {
+                self.labels.push(l);
+                self.labels.len() - 1
+            });
+            Some(index as u32)
+        }else{ None };
         self.rules.push(Rule {
             left: left_index,
             right: right_index,
+            label: label_index,
         });
         self.rules.last().unwrap()
     }
@@ -485,8 +511,8 @@ fn build_lalr_kernels(kernels: &ItemsCollection<()>, lookaheads: &Lookaheads) ->
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
-    Shift(u32),
-    Reduce(u32),
+    Shift(u32/* state */),
+    Reduce(u32/* rule_index */),
     Accept
 }
 
@@ -498,10 +524,13 @@ pub struct ParseTable {
     end_symbol: u32,
     symbol_names: Vec<String>,
     is_terminal: Vec<bool>,
-    /// rule_index -> left。for GOTO
+    /// rule_index -> symbolk_name。for GOTO
     rule_lhs: Vec<u32>,
     /// rule_index -> right.len。for reduce
     rule_rhs_len: Vec<u32>,
+    /// rule_index -> label。for GOTO
+    label_names: Vec<String>,
+    rule_label: Vec<Option<u32>>,
 }
 
 impl ParseTable {
@@ -519,9 +548,11 @@ impl ParseTable {
             state_count: kernels_lr0.len(),
             end_symbol: grammar.end_symbol(),
             symbol_names: grammar.names.clone(),
+            label_names: grammar.labels.clone(),
             is_terminal: grammar.terminals.clone(),
             rule_lhs: grammar.rules.iter().map(|rule| rule.left).collect(),
             rule_rhs_len: grammar.rules.iter().map(|rule| rule.right.len() as u32).collect(),
+            rule_label: grammar.rules.iter().map(|rule| rule.label).collect(),
         };
         let set_action = |table: &mut HashMap<(u32, u32), Action>,
                                                                     state: u32, symbol: u32, action: Action| {

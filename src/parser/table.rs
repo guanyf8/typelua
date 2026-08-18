@@ -37,6 +37,17 @@
 //! /// 该状态下所有合法的输入终结符，用于「期望以下之一」这类报错
 //! pub fn expected_terminals(state: u32) -> Vec<&'static str>;
 
+//! /// 文法里 `@Name` 贴的产生式标签。按它 dispatch，不要按规则下标
+//! pub enum Prod { … }
+//! pub static RULE_PROD: [Option<Prod>; NUM_RULES];
+//! pub fn prod(rule: u32) -> Option<Prod>;
+//!
+//! 贴标签 = 「这条产生式有语义动作」，没贴 = 「原样透传」。
+//! 目前只标了两类：类型标注的三个入口（擦除）和 class 全套（降级）。
+//! 类型语言本身（type / uniontype / functype / retspec / …）**只**从
+//! `@TypeAnnotation` / `@ReturnType` / `@VarargTyped` 这三处进入运行时代码，
+//! 所以擦除只需要认这三条，decllist / param / funcbody 都不用标。
+
 
 grammar::grammar! {
 
@@ -82,8 +93,8 @@ grammar::grammar! {
         | LOCAL FUNCTION NAME funcbody
         | LOCAL decllist
         | LOCAL decllist '=' explist
-        | CLASS NAME classbody
-        | CLASS NAME EXTENDS NAME classbody
+        | CLASS NAME classbody                @ClassDecl
+        | CLASS NAME EXTENDS NAME classbody   @ClassDeclExtends
     
         ;
     
@@ -134,8 +145,8 @@ grammar::grammar! {
         ;
     
     optype
-        : /* empty */
-        | ':' type
+        : /* empty */                    /* 无标注：什么都不用做 */
+        | ':' type                       @TypeAnnotation
         ;
     
     type
@@ -170,7 +181,7 @@ grammar::grammar! {
         ;
     
     rettype
-        : ARROW retspec
+        : ARROW retspec                  @ReturnType
         ;
     
     retspec
@@ -198,29 +209,29 @@ grammar::grammar! {
         ;
     
     classbody
-        : '{' '}'
-        | '{' classfields '}'
+        : '{' '}'                        @ClassBodyEmpty
+        | '{' classfields '}'            @ClassBodyFields
         ;
     
     classfields
-        : classfield
-        | classfields ',' classfield
+        : classfield                     @ClassFieldsFirst
+        | classfields ',' classfield     @ClassFieldsRest
         ;
     
     classfield
-        : NAME ':' type
-        | NAME ':' type '=' exp
-        | NAME '=' exp
-        | methodsig
-        | methodsig block END
-        | methodsig '=' exp
+        : NAME ':' type                  @FieldDecl
+        | NAME ':' type '=' exp          @FieldDeclInit
+        | NAME '=' exp                   @FieldInit
+        | methodsig                      @MethodDecl
+        | methodsig block END            @MethodDef
+        | methodsig '=' exp              @MethodExpr
         ;
     
     methodsig
-        : NAME '(' ')'
-        | NAME '(' ')' rettype
-        | NAME '(' parlist ')'
-        | NAME '(' parlist ')' rettype
+        : NAME '(' ')'                        @MethodSig
+        | NAME '(' ')' rettype                @MethodSigRet
+        | NAME '(' parlist ')'                @MethodSigParams
+        | NAME '(' parlist ')' rettype        @MethodSigParamsRet
         ;
     
     explist
@@ -366,7 +377,7 @@ grammar::grammar! {
     
     vararg
         : ELLIPSIS
-        | ELLIPSIS type
+        | ELLIPSIS type                  @VarargTyped
         ;
     
     tableconstructor
@@ -430,6 +441,94 @@ mod tests {
             }
         }
         (shift, reduce, accept, gotos)
+    }
+
+    /// 找出某个标签对应的产生式，顺便断言它恰好对应一条
+    fn rule_of(p: Prod) -> usize {
+        let hits: Vec<usize> = (0..NUM_RULES).filter(|&i| RULE_PROD[i] == Some(p)).collect();
+        assert_eq!(hits.len(), 1, "{p:?} 应当恰好对应一条产生式，实际 {hits:?}");
+        hits[0]
+    }
+
+    #[test]
+    fn every_label_is_pinned_to_the_intended_production() {
+        // (标签, 左部, 右部长度)。`@` 放错位置会让标签贴到相邻的候选式上，
+        // 而那多半还能编译 —— 只有把左部和长度一起钉住才拦得下来
+        let expected: &[(Prod, &str, u32)] = &[
+            // 擦除：类型语言进入运行时代码的全部入口
+            (Prod::TypeAnnotation,      "optype",      2),
+            (Prod::ReturnType,          "rettype",     2),
+            (Prod::VarargTyped,         "vararg",      2),
+            // 降级：class 是唯一需要真代码生成的构造
+            (Prod::ClassDecl,           "stat",        3),
+            (Prod::ClassDeclExtends,    "stat",        5),
+            (Prod::ClassBodyEmpty,      "classbody",   2),
+            (Prod::ClassBodyFields,     "classbody",   3),
+            (Prod::ClassFieldsFirst,    "classfields", 1),
+            (Prod::ClassFieldsRest,     "classfields", 3),
+            (Prod::FieldDecl,           "classfield",  3),
+            (Prod::FieldDeclInit,       "classfield",  5),
+            (Prod::FieldInit,           "classfield",  3),
+            (Prod::MethodDecl,          "classfield",  1),
+            (Prod::MethodDef,           "classfield",  3),
+            (Prod::MethodExpr,          "classfield",  3),
+            (Prod::MethodSig,           "methodsig",   3),
+            (Prod::MethodSigRet,        "methodsig",   4),
+            (Prod::MethodSigParams,     "methodsig",   4),
+            (Prod::MethodSigParamsRet,  "methodsig",   5),
+        ];
+        for &(prod, lhs, arity) in expected {
+            let rule = rule_of(prod);
+            assert_eq!(
+                SYMBOL_NAMES[RULE_LHS[rule] as usize], lhs,
+                "{prod:?} 贴到了 {} 上", SYMBOL_NAMES[RULE_LHS[rule] as usize]
+            );
+            assert_eq!(RULE_RHS_LEN[rule], arity, "{prod:?} 的右部长度不对");
+        }
+        // 标签总数也钉住：多贴少贴都要有人知道
+        let labeled = RULE_PROD.iter().filter(|slot| slot.is_some()).count();
+        assert_eq!(labeled, expected.len(), "带标签的产生式数量变了");
+
+        // 光靠 (左部, 长度) 分不开同一左部里长度相同的候选式 —— classfield 有四条长度 3 的，
+        // methodsig 有两条长度 4 的。完整判别依据是右部符号序列，但表里没发射 RULE_RHS，
+        // 所以再钉一层：全部标签按规则下标排出来的顺序 = 文法里的书写顺序。
+        // 这样任意两个标签互换都会被抓到
+        let order: Vec<Prod> = RULE_PROD.iter().filter_map(|slot| *slot).collect();
+        assert_eq!(
+            order,
+            [
+                // stat 的最后两条候选式
+                Prod::ClassDecl, Prod::ClassDeclExtends,
+                Prod::TypeAnnotation,
+                Prod::ReturnType,
+                Prod::ClassBodyEmpty, Prod::ClassBodyFields,
+                Prod::ClassFieldsFirst, Prod::ClassFieldsRest,
+                Prod::FieldDecl, Prod::FieldDeclInit, Prod::FieldInit,
+                Prod::MethodDecl, Prod::MethodDef, Prod::MethodExpr,
+                Prod::MethodSig, Prod::MethodSigRet,
+                Prod::MethodSigParams, Prod::MethodSigParamsRet,
+                // vararg 在 parlist 那一段，位置靠后
+                Prod::VarargTyped,
+            ],
+            "标签的相对顺序变了：要么 @ 贴错了候选式，要么文法重排了候选式"
+        );
+    }
+
+    #[test]
+    fn unlabeled_productions_mean_pass_through() {
+        // 绝大多数产生式没有语义动作 —— 这不是遗漏，是「原样透传」的声明。
+        // 数字钉住是为了：加了产生式却忘了考虑要不要贴标签时有人提醒
+        let plain = RULE_PROD.iter().filter(|slot| slot.is_none()).count();
+        assert_eq!(plain, 151);
+        assert_eq!(plain + 19, NUM_RULES);
+    }
+
+    #[test]
+    fn labels_do_not_disturb_the_automaton() {
+        // 标签是纯元数据。规模基线不变就说明它没碰到文法本身
+        // （具体数字由 table_dimensions_are_unchanged / action_counts_are_unchanged 守）
+        assert_eq!(NUM_RULES, 170);
+        assert_eq!(NUM_STATES, 307);
     }
 
     #[test]
