@@ -42,11 +42,16 @@
 //! pub static RULE_PROD: [Option<Prod>; NUM_RULES];
 //! pub fn prod(rule: u32) -> Option<Prod>;
 //!
-//! 贴标签 = 「这条产生式有语义动作」，没贴 = 「原样透传」。
-//! 目前只标了两类：类型标注的三个入口（擦除）和 class 全套（降级）。
-//! 类型语言本身（type / uniontype / functype / retspec / …）**只**从
-//! `@TypeAnnotation` / `@ReturnType` / `@VarargTyped` 这三处进入运行时代码，
-//! 所以擦除只需要认这三条，decllist / param / funcbody 都不用标。
+//! 贴标签 = 「这条产生式有语义动作」，没贴 = 「原样透传」。标签分两类：
+//!
+//! **擦除**：类型语言进入运行时代码的全部入口。原本只有三个
+//! （`@TypeAnnotation` / `@ReturnType` / `@VarargTyped`），随着 typedef、
+//! 泛型、强转、turbofish 的加入又多了四个（`@TypeDef` / `@Generics` /
+//! `@Cast` / `@TurboFish`）—— 每新增一个「只有类型、却出现在代码位置」的构造，
+//! 就要多一个擦除入口。类型语言内部（uniontype / functype / retspec / argtype / …）
+//! 仍然一个都不用标，因为它们只能从这七处进来。
+//!
+//! **降级**：class 全套。它是唯一需要真代码生成的构造。
 
 
 grammar::grammar! {
@@ -83,18 +88,19 @@ grammar::grammar! {
     
         | IF exp THEN block elseif_list ELSE block END
     
-        | FOR NAME '=' exp ',' exp DO block END
+        | FOR NAME optype '=' exp ',' exp DO block END
     
-        | FOR NAME '=' exp ',' exp ',' exp DO block END
+        | FOR NAME optype '=' exp ',' exp ',' exp DO block END
     
-        | FOR namelist IN explist DO block END
+        | FOR decllist IN explist DO block END
     
         | FUNCTION funcname funcbody
         | LOCAL FUNCTION NAME funcbody
         | LOCAL decllist
         | LOCAL decllist '=' explist
-        | CLASS NAME classbody                @ClassDecl
-        | CLASS NAME EXTENDS NAME classbody   @ClassDeclExtends
+        | CLASS NAME generics classbody                @ClassDecl
+        | CLASS NAME generics EXTENDS NAME classbody   @ClassDeclExtends
+        | TYPEDEF NAME generics '=' type               @TypeDef
     
         ;
     
@@ -131,12 +137,7 @@ grammar::grammar! {
         ;
     
     var
-        : prefixexp
-        ;
-    
-    namelist
-        : NAME
-        | namelist ',' NAME
+        : prefixexp optype               /* 标注只允许贴裸 NAME，由 checker 拦 */
         ;
     
     decllist
@@ -147,6 +148,16 @@ grammar::grammar! {
     optype
         : /* empty */                    /* 无标注：什么都不用做 */
         | ':' type                       @TypeAnnotation
+        ;
+    
+    generics                             /* 泛型形参表，class / typedef / funcbody 共用 */
+        : /* empty */
+        | '<' typeparams '>'             @Generics
+        ;
+    
+    typeparams
+        : NAME
+        | typeparams ',' NAME
         ;
     
     type
@@ -165,6 +176,8 @@ grammar::grammar! {
         | NAME '<' typeargs '>'
     
         | '(' type ')'                   /* grouping: (function()->A)|B */
+        | '{' '}'                        /* 匿名 record */
+        | '{' classfieldlist '}'         /* 复用 classfieldlist：类型位只许声明形式 */
         ;
     
     typeargs
@@ -172,12 +185,27 @@ grammar::grammar! {
         | typeargs ',' type
         ;
     
-    functype
+    functype                             /* 类型位的参数表：名字可省，故不能复用 parlist */
         : FUNCTION '(' ')'
         | FUNCTION '(' ')' rettype
-        | FUNCTION '(' parlist ')'
-        | FUNCTION '(' parlist ')' rettype
+        | FUNCTION '(' argtypes ')'
+        | FUNCTION '(' argtypes ')' rettype
+        ;
     
+    argtypes
+        : argtypelist
+        | argtypelist ',' vararg
+        | vararg
+        ;
+    
+    argtypelist
+        : argtype
+        | argtypelist ',' argtype
+        ;
+    
+    argtype
+        : NAME ':' type                  /* 带名，纯文档 */
+        | type                           /* 裸类型：function(string) -> number */
         ;
     
     rettype
@@ -190,27 +218,29 @@ grammar::grammar! {
         | '(' multilist ')'
         ;
 
-    multilist                            /* excludes the single non-vararg case:
-                                            that goes through basictype grouping */
-        : typelist ',' rtype             /* two or more */
-        | ELLIPSIS                       /* -> (...) */
-        | ELLIPSIS type                  /* -> (...any) */
+    multilist                            /* 单个定长走 basictype 分组，不在这里；
+                                            vararg 只许出现在末位，和 parlist 一致 */
+        : typelist ',' type              /* 两个或更多定长 */
+        | typelist ',' vararg            /* 定长 + 末位 vararg */
+        | vararg                         /* 只有 vararg */
         ;
     
     typelist
-        : rtype
-        | typelist ',' rtype
-        ;
-    
-    rtype
         : type
-        | ELLIPSIS type
-        | ELLIPSIS
+        | typelist ',' type
         ;
     
     classbody
         : '{' '}'                        @ClassBodyEmpty
-        | '{' classfields '}'            @ClassBodyFields
+        | '{' classfieldlist '}'         @ClassBodyFields
+        ;
+    
+    classfieldlist                       /* 允许尾随逗号；但分隔符只能是 ','：
+                                            用 fieldsep 会让 ';' 和 `stat : ';'` 打起来
+                                            —— 无函数体的 methodsig 后面那个 ';' 分不清
+                                            是分隔符还是方法体里的空语句 */
+        : classfields
+        | classfields ','
         ;
     
     classfields
@@ -224,7 +254,6 @@ grammar::grammar! {
         | NAME '=' exp                   @FieldInit
         | methodsig                      @MethodDecl
         | methodsig block END            @MethodDef
-        | methodsig '=' exp              @MethodExpr
         ;
     
     methodsig
@@ -244,7 +273,19 @@ grammar::grammar! {
        associativity, right recursion for right associativity. */
 
     exp
-        : or_exp
+        : cast_exp
+        ;
+
+    cast_exp                             /* 'as' 绑定最松。这样 `x as A|nil` 里的 '|' 只能
+                                            归入类型，无歧义、不必加括号 —— 而这是强转最
+                                            主要的用法。代价是算术中间的强转要写括号：
+                                            `a + b as T` 等于 `(a + b) as T`。
+                                            放在 Rust 那个位置（紧于二元、松于一元）的话，
+                                            '|' 和 '<' 在强转之后既能续类型也能续表达式，
+                                            阶梯里会各多出一个移进-归约冲突（实测 4 个）；
+                                            放最松就回到 2 个 */
+        : cast_exp AS type               @Cast
+        | or_exp
         ;
 
     or_exp
@@ -340,6 +381,7 @@ grammar::grammar! {
         | prefixexp '.' NAME
         | prefixexp args
         | prefixexp ':' NAME args
+        | prefixexp TURBOFISH typeargs '>'    @TurboFish
         ;
     
     args
@@ -354,10 +396,10 @@ grammar::grammar! {
         ;
     
     funcbody
-        : '(' ')' block END
-        | '(' ')' rettype block END
-        | '(' parlist ')' block END
-        | '(' parlist ')' rettype block END
+        : generics '(' ')' block END
+        | generics '(' ')' rettype block END
+        | generics '(' parlist ')' block END
+        | generics '(' parlist ')' rettype block END
         ;
     
     parlist
@@ -417,6 +459,24 @@ mod tests {
     //!
     //! 另外，这个文件能编译通过本身就是一条断言：归约-归约冲突在宏里是 panic，
     //! 所以编译成功等价于「typelua 文法是 LALR(1) 的」。
+    //!
+    //! 移进-归约冲突不会 panic，而是静默贪婪移进（见 generator.rs 的 set_action）。
+    //! 实测这份文法只有 **2** 个，都是 Lua 自带的那个歧义：
+    //!   `stat : prefixexp ·` 和 `atom : prefixexp ·` 遇 '(' —— 即
+    //!       local x = f
+    //!       (g).y = 1
+    //!   Lua 5.1 直接报 ambiguous syntax，5.2+ 规定一律按函数调用解释，移进正确。
+    //!
+    //! `as` 之所以绑定最松（见 cast_exp）就是为了不引入第三、第四个：放在 Rust 那个
+    //! 位置（紧于二元）会让 `x as A|B` 的 '|' 和 `x as T<U>` 的 '<' 各出一个冲突。
+    //!
+    //! README `## grammar` 那份 bison 等价物有 4 个冲突 —— 多的两个正是上面这两个，
+    //! 因为 bison 版的 `exp` 是扁平的（`exp : exp '|' exp`），强转之后 '|' / '<' 仍然
+    //! 是合法的表达式续接。但 bison 对两者都默认移进（冲突落在 `type : uniontype`
+    //! 和 `basictype : NAME` 上，这两条没有声明优先级，故优先级消解不介入），
+    //! 结果与本阶梯一致 —— 两份规格是同一门语言，只是编码方式不同。
+    //!
+    //! 表里没有导出冲突数，所以这一条守不住 —— 加了新语法要手动重量一遍。
 
     use super::*;
 
@@ -459,9 +519,13 @@ mod tests {
             (Prod::TypeAnnotation,      "optype",      2),
             (Prod::ReturnType,          "rettype",     2),
             (Prod::VarargTyped,         "vararg",      2),
+            (Prod::TypeDef,             "stat",        5),   // typedef NAME generics '=' type
+            (Prod::Generics,            "generics",    3),   // '<' typeparams '>'
+            (Prod::Cast,                "cast_exp",    3),   // cast_exp as type
+            (Prod::TurboFish,           "prefixexp",   4),   // prefixexp ::< typeargs '>'
             // 降级：class 是唯一需要真代码生成的构造
-            (Prod::ClassDecl,           "stat",        3),
-            (Prod::ClassDeclExtends,    "stat",        5),
+            (Prod::ClassDecl,           "stat",        4),   // + generics
+            (Prod::ClassDeclExtends,    "stat",        6),   // + generics
             (Prod::ClassBodyEmpty,      "classbody",   2),
             (Prod::ClassBodyFields,     "classbody",   3),
             (Prod::ClassFieldsFirst,    "classfields", 1),
@@ -471,7 +535,6 @@ mod tests {
             (Prod::FieldInit,           "classfield",  3),
             (Prod::MethodDecl,          "classfield",  1),
             (Prod::MethodDef,           "classfield",  3),
-            (Prod::MethodExpr,          "classfield",  3),
             (Prod::MethodSig,           "methodsig",   3),
             (Prod::MethodSigRet,        "methodsig",   4),
             (Prod::MethodSigParams,     "methodsig",   4),
@@ -489,7 +552,7 @@ mod tests {
         let labeled = RULE_PROD.iter().filter(|slot| slot.is_some()).count();
         assert_eq!(labeled, expected.len(), "带标签的产生式数量变了");
 
-        // 光靠 (左部, 长度) 分不开同一左部里长度相同的候选式 —— classfield 有四条长度 3 的，
+        // 光靠 (左部, 长度) 分不开同一左部里长度相同的候选式 —— classfield 有三条长度 3 的，
         // methodsig 有两条长度 4 的。完整判别依据是右部符号序列，但表里没发射 RULE_RHS，
         // 所以再钉一层：全部标签按规则下标排出来的顺序 = 文法里的书写顺序。
         // 这样任意两个标签互换都会被抓到
@@ -497,17 +560,22 @@ mod tests {
         assert_eq!(
             order,
             [
-                // stat 的最后两条候选式
-                Prod::ClassDecl, Prod::ClassDeclExtends,
+                // stat 的最后三条候选式
+                Prod::ClassDecl, Prod::ClassDeclExtends, Prod::TypeDef,
                 Prod::TypeAnnotation,
+                Prod::Generics,
                 Prod::ReturnType,
                 Prod::ClassBodyEmpty, Prod::ClassBodyFields,
                 Prod::ClassFieldsFirst, Prod::ClassFieldsRest,
                 Prod::FieldDecl, Prod::FieldDeclInit, Prod::FieldInit,
-                Prod::MethodDecl, Prod::MethodDef, Prod::MethodExpr,
+                Prod::MethodDecl, Prod::MethodDef,
                 Prod::MethodSig, Prod::MethodSigRet,
                 Prod::MethodSigParams, Prod::MethodSigParamsRet,
-                // vararg 在 parlist 那一段，位置靠后
+                // cast_exp 在表达式阶梯的最顶端（exp 之下、or_exp 之上）
+                Prod::Cast,
+                // turbofish 在 prefixexp 末尾
+                Prod::TurboFish,
+                // vararg 在 parlist 那一段，位置最靠后
                 Prod::VarargTyped,
             ],
             "标签的相对顺序变了：要么 @ 贴错了候选式，要么文法重排了候选式"
@@ -519,40 +587,40 @@ mod tests {
         // 绝大多数产生式没有语义动作 —— 这不是遗漏，是「原样透传」的声明。
         // 数字钉住是为了：加了产生式却忘了考虑要不要贴标签时有人提醒
         let plain = RULE_PROD.iter().filter(|slot| slot.is_none()).count();
-        assert_eq!(plain, 151);
-        assert_eq!(plain + 19, NUM_RULES);
+        assert_eq!(plain, 161);
+        assert_eq!(plain + 22, NUM_RULES);
     }
 
     #[test]
     fn labels_do_not_disturb_the_automaton() {
         // 标签是纯元数据。规模基线不变就说明它没碰到文法本身
         // （具体数字由 table_dimensions_are_unchanged / action_counts_are_unchanged 守）
-        assert_eq!(NUM_RULES, 170);
-        assert_eq!(NUM_STATES, 307);
+        assert_eq!(NUM_RULES, 183);
+        assert_eq!(NUM_STATES, 337);
     }
 
     #[test]
     fn table_dimensions_are_unchanged() {
-        assert_eq!(NUM_STATES, 307, "LR(0) 状态数");
-        assert_eq!(NUM_SYMBOLS, 118, "符号数（含 $end）");
-        assert_eq!(NUM_RULES, 170, "产生式数");
+        assert_eq!(NUM_STATES, 337, "LR(0) 状态数");
+        assert_eq!(NUM_SYMBOLS, 126, "符号数（含 $end）");
+        assert_eq!(NUM_RULES, 183, "产生式数");
         // $end 由 build_grammar 追加在最后
         assert_eq!(END_SYMBOL as usize, NUM_SYMBOLS - 1);
         assert_eq!(SYMBOL_NAMES[END_SYMBOL as usize], "$end");
-        // 62 个终结符 / 56 个非终结符
+        // 65 个终结符 / 61 个非终结符
         let terminals = IS_TERMINAL.iter().filter(|&&t| t).count();
-        assert_eq!(terminals, 62, "终结符数");
-        assert_eq!(NUM_SYMBOLS - terminals, 56, "非终结符数");
+        assert_eq!(terminals, 65, "终结符数");
+        assert_eq!(NUM_SYMBOLS - terminals, 61, "非终结符数");
     }
 
     #[test]
     fn action_counts_are_unchanged() {
         let (shift, reduce, accept, gotos) = tally();
-        assert_eq!(shift, 1148, "移进动作数");
-        assert_eq!(gotos, 861, "goto 条目数");
+        assert_eq!(shift, 1211, "移进动作数");
+        assert_eq!(gotos, 905, "goto 条目数");
         // 移进和 goto 恰好瓜分全部 LR(0) 转移
-        assert_eq!(shift + gotos, 2009, "移进 + goto = 转移总数");
-        assert_eq!(reduce, 4034, "归约动作数");
+        assert_eq!(shift + gotos, 2116, "移进 + goto = 转移总数");
+        assert_eq!(reduce, 4511, "归约动作数");
         assert_eq!(accept, 1, "接受动作数");
     }
 
@@ -575,24 +643,26 @@ mod tests {
             expected,
             [
                 "$end", "'('", "';'", "BREAK", "CLASS", "DBCOLON", "DO", "FOR", "FUNCTION",
-                "GOTO", "IF", "LOCAL", "NAME", "REPEAT", "RETURN", "WHILE",
+                "GOTO", "IF", "LOCAL", "NAME", "REPEAT", "RETURN", "TYPEDEF", "WHILE",
             ]
         );
     }
 
     #[test]
-    fn three_epsilon_productions() {
-        // block / elseif_list / optype 各写了一条空候选式
+    fn four_epsilon_productions() {
+        // block / elseif_list / optype / generics 各写了一条空候选式
         let epsilon: Vec<&str> = (0..NUM_RULES)
             .filter(|&i| RULE_RHS_LEN[i] == 0)
             .map(|i| SYMBOL_NAMES[RULE_LHS[i] as usize])
             .collect();
-        assert_eq!(epsilon, ["block", "elseif_list", "optype"]);
+        assert_eq!(epsilon, ["block", "elseif_list", "optype", "generics"]);
     }
 
     #[test]
     fn every_rule_can_be_reduced_somewhere() {
-        // 规则 0 走 Accept，其余每条都必须在表里至少有一处归约，否则是死规则
+        // 规则 0 走 Accept，其余每条都必须在表里至少有一处归约，否则是死规则。
+        // 这条同时守着「换掉某个非终结符之后旧的那个没删干净」：namelist 被 decllist
+        // 取代、rtype 被 typelist/vararg 取代，忘了删就会在这里现形
         let mut reduced = vec![false; NUM_RULES];
         for state in 0..NUM_STATES as u32 {
             for symbol in 0..NUM_SYMBOLS as u32 {
@@ -608,5 +678,23 @@ mod tests {
             .map(|i| SYMBOL_NAMES[RULE_LHS[i] as usize])
             .collect();
         assert!(dead.is_empty(), "这些规则永远不会被归约：{dead:?}");
+    }
+
+    #[test]
+    fn new_symbols_are_present_and_retired_ones_are_gone() {
+        // 新增的三个终结符
+        for t in ["TYPEDEF", "AS", "TURBOFISH"] {
+            let i = symbol_index(t).unwrap_or_else(|| panic!("{t} 不在符号表里"));
+            assert!(IS_TERMINAL[i as usize], "{t} 应当是终结符");
+        }
+        // 新增的非终结符
+        for nt in ["generics", "typeparams", "classfieldlist", "argtypes", "argtypelist",
+                   "argtype", "cast_exp"] {
+            let i = symbol_index(nt).unwrap_or_else(|| panic!("{nt} 不在符号表里"));
+            assert!(!IS_TERMINAL[i as usize], "{nt} 应当是非终结符");
+        }
+        // 被取代的两个必须彻底消失，不能留在符号表里
+        assert_eq!(symbol_index("namelist"), None, "namelist 已被 decllist 取代");
+        assert_eq!(symbol_index("rtype"), None, "rtype 已被 typelist / vararg 取代");
     }
 }

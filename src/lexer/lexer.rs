@@ -21,6 +21,8 @@ impl<'a> Lexer<'a> {
         match name {
             "class" => Some(Reserved::CLASS),
             "extends" => Some(Reserved::EXTENDS),
+            "typedef" => Some(Reserved::TYPEDEF),
+            "as" => Some(Reserved::AS),
             "and" => Some(Reserved::AND),
             "break" => Some(Reserved::BREAK),
             "do" => Some(Reserved::DO),
@@ -151,13 +153,14 @@ mod tests {
 
     #[test]
     fn multi_char_operators() {
-        let mut lx = Lexer::new("a->b ... .. :: == ~= <= >= << >> //");
+        let mut lx = Lexer::new("a->b ... .. :: ::< == ~= <= >= << >> //");
         assert_eq!(tok(lx.next_token()), Some(Token::NAME("a")));
         assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::ARROW)));
         assert_eq!(tok(lx.next_token()), Some(Token::NAME("b")));
         assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::ELLIPSIS)));
         assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::CONCAT)));
         assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::DBCOLON)));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::TURBOFISH)));
         assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::EQ)));
         assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::NE)));
         assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::LE)));
@@ -291,5 +294,119 @@ mod tests {
         assert_eq!(lx.next_token(), Some((Ok(Token::OPERATOR(OpType::SHR)), Span { start: 20, end: 22 })));
         assert_eq!(lx.next_token(), Some((Ok(Token::OPERATOR(OpType::SIMPLE('='))), Span { start: 22, end: 23 })));
         assert_eq!(lx.next_token(), None);
+    }
+
+    #[test]
+    fn typedef_and_as_are_keywords() {
+        let mut lx = Lexer::new("typedef Id = number  x as T");
+        assert_eq!(tok(lx.next_token()), Some(Token::RESERVED(Reserved::TYPEDEF)));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("Id")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE('='))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("number")));   //内建类型名只是普通NAME
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("x")));
+        assert_eq!(tok(lx.next_token()), Some(Token::RESERVED(Reserved::AS)));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("T")));
+        assert_eq!(tok(lx.next_token()), None);
+    }
+
+    #[test]
+    fn keyword_match_is_whole_ident_not_prefix() {
+        //关键字表在IDENT终结后整体查表，前缀不算命中：as/typedef尤其短，容易误判
+        let mut lx = Lexer::new("asa astute typedefs _as self init");
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("asa")));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("astute")));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("typedefs")));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("_as")));
+        //self是普通参数名、init是保留的方法名，都不是关键字
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("self")));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("init")));
+        assert_eq!(tok(lx.next_token()), None);
+    }
+
+    #[test]
+    fn turbofish_is_one_token() {
+        let mut lx = Lexer::new("map::<string,number>(xs)");
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("map")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::TURBOFISH)));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("string")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE(','))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("number")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE('>'))));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE('('))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("xs")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE(')'))));
+        assert_eq!(tok(lx.next_token()), None);
+    }
+
+    #[test]
+    fn turbofish_requires_three_chars_adjacent() {
+        //'::<'是最大匹配的整体token，中间有空白就退化成DBCOLON + '<'
+        let mut lx = Lexer::new("a:: <b");
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("a")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::DBCOLON)));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE('<'))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("b")));
+        assert_eq!(tok(lx.next_token()), None);
+    }
+
+    #[test]
+    fn goto_label_after_call_is_unaffected_by_turbofish() {
+        //回归：这是Lua里goto-continue的标准写法，'::'后面必然跟NAME，
+        //所以多看一个字符不会把它误吃成turbofish
+        let mut lx = Lexer::new("doit(i)\n::continue::");
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("doit")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE('('))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("i")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE(')'))));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::DBCOLON)));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("continue")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::DBCOLON)));
+        assert_eq!(tok(lx.next_token()), None);
+    }
+
+    #[test]
+    fn dbcolon_at_eof_still_finishes() {
+        //DCOLON是新增的中间态：输入在'::'后耗尽时必须补发DBCOLON，不能丢
+        let mut lx = Lexer::new("a::");
+        assert_eq!(lx.next_token(), Some((Ok(Token::NAME("a")), Span { start: 0, end: 1 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::OPERATOR(OpType::DBCOLON)), Span { start: 1, end: 3 })));
+        assert_eq!(lx.next_token(), None);
+        //单个':'在EOF的老行为不受影响
+        let mut lx = Lexer::new("a:");
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("a")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE(':'))));
+        assert_eq!(tok(lx.next_token()), None);
+    }
+
+    #[test]
+    fn turbofish_spans_three_bytes() {
+        //span要精确覆盖'::<'，因为报错定位和printer都依赖它
+        let mut lx = Lexer::new("map::<T>");
+        assert_eq!(lx.next_token(), Some((Ok(Token::NAME("map")), Span { start: 0, end: 3 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::OPERATOR(OpType::TURBOFISH)), Span { start: 3, end: 6 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::NAME("T")), Span { start: 6, end: 7 })));
+        assert_eq!(lx.next_token(), Some((Ok(Token::OPERATOR(OpType::SIMPLE('>'))), Span { start: 7, end: 8 })));
+        assert_eq!(lx.next_token(), None);
+    }
+
+    #[test]
+    fn turbofish_with_nested_generic_still_emits_shr() {
+        //turbofish让泛型进了表达式位置，闭合处照样产出SHR，交给parser驱动层按状态拆分
+        let mut lx = Lexer::new("local zs = map::<string,list<number>>(xs)");
+        assert_eq!(tok(lx.next_token()), Some(Token::RESERVED(Reserved::LOCAL)));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("zs")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE('='))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("map")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::TURBOFISH)));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("string")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE(','))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("list")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE('<'))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("number")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SHR)));    //不拆分
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE('('))));
+        assert_eq!(tok(lx.next_token()), Some(Token::NAME("xs")));
+        assert_eq!(tok(lx.next_token()), Some(Token::OPERATOR(OpType::SIMPLE(')'))));
+        assert_eq!(tok(lx.next_token()), None);
     }
 }

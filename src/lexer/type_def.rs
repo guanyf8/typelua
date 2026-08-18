@@ -5,6 +5,9 @@ pub enum OpType {
     CONCAT,     //..
     ARROW,      // ->   in typelua
     DBCOLON,    //::
+    TURBOFISH,  // ::<  in typelua：显式类型实参。'<'在表达式位置是比较运算，
+                //      所以泛型实参不能用裸'<>'；而'::' '<'分开产出会和'::label::'
+                //      在1个lookahead内分不开，故'::<'整体成token（要求三字符紧邻）
     EQ,         //==
     NE,         //~=
     LE,         //<=
@@ -19,6 +22,8 @@ pub enum OpType {
 pub enum Reserved {
     CLASS,    //class in typelua
     EXTENDS,  //extends in typelua
+    TYPEDEF,  //typedef in typelua：类型声明。不用type是因为type(x)是Lua标准库函数
+    AS,       //as in typelua：强转
     AND,      //and 
     BREAK,    //break
     DO,       //do
@@ -97,6 +102,7 @@ pub enum State {
     DOT2,
     IDENT,
     COLON,
+    DCOLON,
     EQ,
     TILDE,
     LT,

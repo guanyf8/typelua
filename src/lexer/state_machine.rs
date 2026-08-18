@@ -208,8 +208,16 @@ impl StateMachine {
             },
             State::COLON => {
                 match c {
-                    ':' => (Step::ACCEPT(AcceptType::OPERATOR(OpType::DBCOLON)), 0),
+                    //不能在此直接accept DBCOLON：还要再看一个字符才能分出'::<'
+                    ':' => (Step::CONTINUE(State::DCOLON), 0),
                     _ => (Step::ACCEPT(AcceptType::OPERATOR(OpType::SIMPLE(':'))), 1),
+                }
+            },
+            State::DCOLON => {
+                match c {
+                    //最大匹配：合法Lua里'::'后必然跟NAME，所以'::<'从不出现，可以整体吃掉
+                    '<' => (Step::ACCEPT(AcceptType::OPERATOR(OpType::TURBOFISH)), 0),
+                    _ => (Step::ACCEPT(AcceptType::OPERATOR(OpType::DBCOLON)), 1),
                 }
             },
             State::EQ => {
@@ -234,7 +242,8 @@ impl StateMachine {
             State::GT => {
                 match c {
                     //状态机为纯函数，不接收parser反馈：泛型闭合处的'>>'/'>='统一产出SHR/GE，
-                    //由parser驱动层在类型上下文拆为'>' '>'与'>' '='
+                    //由parser驱动层按LALR状态拆分——'>'有动作而SHR/GE是error时才拆。
+                    //判据必须是状态而不是"是否在类型里"：turbofish让泛型也出现在表达式位置
                     '=' => (Step::ACCEPT(AcceptType::OPERATOR(OpType::GE)), 0),
                     '>' => (Step::ACCEPT(AcceptType::OPERATOR(OpType::SHR)), 0),
                     _ => (Step::ACCEPT(AcceptType::OPERATOR(OpType::SIMPLE('>'))), 1),
@@ -274,6 +283,7 @@ impl StateMachine {
             State::DOT2 => Finish::Token(AcceptType::OPERATOR(OpType::CONCAT), 0),
             State::IDENT => Finish::Token(AcceptType::NAME, 0),
             State::COLON => Finish::Token(AcceptType::OPERATOR(OpType::SIMPLE(':')), 0),
+            State::DCOLON => Finish::Token(AcceptType::OPERATOR(OpType::DBCOLON), 0),
             State::EQ => Finish::Token(AcceptType::OPERATOR(OpType::SIMPLE('=')), 0),
             State::TILDE => Finish::Token(AcceptType::OPERATOR(OpType::SIMPLE('~')), 0),
             State::LT => Finish::Token(AcceptType::OPERATOR(OpType::SIMPLE('<')), 0),
