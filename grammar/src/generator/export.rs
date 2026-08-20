@@ -113,10 +113,64 @@ impl ParseTable {
                 }
             }
 
-            /// 按名字找符号下标。用来把词法器的 token 种类桥接到列下标，只在初始化时调用
+            /// 按名字找符号下标。运行时版本，给测试和报错路径用
             pub fn symbol_index(name: &str) -> Option<u32> {
                 SYMBOL_NAMES.iter().position(|&n| n == name).map(|i| i as u32)
             }
+
+            // ---- 以下三样把「符号名 -> 列下标」搬到编译期 ----
+            // 词法器的 token 种类和文法的终结符名是两套独立的词汇表，桥接它们的表
+            // 不该在运行时用字符串线性扫。消费方写
+            //     const COL_NAME: u32 = symbol_col("NAME");
+            // 就是一个编译期常量，而且名字写错是编译错误而不是运行时 None。
+
+            /// const fn 里比较 &str。名字带前缀是为了不和消费方的同名函数撞
+            const fn symbol_name_eq(a: &str, b: &str) -> bool {
+                let (a, b) = (a.as_bytes(), b.as_bytes());
+                if a.len() != b.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < a.len() {
+                    if a[i] != b[i] {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
+
+            /// `symbol_index` 的 const 版。找不到就 const panic，即编译错误
+            pub const fn symbol_col(name: &str) -> u32 {
+                let mut i = 0;
+                while i < NUM_SYMBOLS {
+                    if symbol_name_eq(SYMBOL_NAMES[i], name) {
+                        return i as u32;
+                    }
+                    i += 1;
+                }
+                panic!("unknown grammar symbol")
+            }
+
+            /// SIMPLE_COL 中该单字符不是文法的terminal
+            pub const NOT_EXIST: u32 = u32::MAX;
+
+            /// 单字符终结符的 ASCII 直查表。消费方对标点不需要写任何对应关系，
+            /// 字符本身就是索引。没有单字符终结符的文法会得到一张全是 NOT_EXIST
+            /// 的表，无害。
+            /// 多字节字符（`'中'`）名字更长，落不进这张 128 项的表，用 `symbol_col(&str)`。
+            pub static SIMPLE_COL: [u32; 128] = {
+                let mut t = [NOT_EXIST; 128];
+                let mut i = 0;
+                while i < NUM_SYMBOLS {
+                    let b = SYMBOL_NAMES[i].as_bytes();
+                    if IS_TERMINAL[i] && b.len() == 3 && b[0] == b'\'' && b[2] == b'\'' {
+                        t[b[1] as usize] = i as u32;
+                    }
+                    i += 1;
+                }
+                t
+            };
 
             /// 该状态下所有合法的输入终结符，用于「期望以下之一」这类报错
             pub fn expected_terminals(state: u32) -> Vec<&'static str> {

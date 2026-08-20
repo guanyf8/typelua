@@ -2,6 +2,8 @@ use proc_macro2::{TokenStream, TokenTree};
 use std::fmt;
 
 mod export;
+mod util;
+use util::char_literal_value;
 
 // 测试放在本模块的子模块里，这样它能直接看到私有项，不必为测试放宽可见性
 #[cfg(test)]
@@ -81,28 +83,13 @@ impl Grammar {
                             label_buffer.clear();
                         }
                         ';' => {
-                            let next_is_alternative = matches!(
-                                tokens.get(i + 1),
-                                Some(TokenTree::Punct(p)) if p.as_char() == '|'
-                            );
-                            let next_is_semicolon = matches!(
-                                tokens.get(i + 1),
-                                Some(TokenTree::Punct(p)) if p.as_char() == ';'
-                            );
-
-                            if next_is_alternative || next_is_semicolon {
-                                // Still inside an alternative: ';' is a terminal token.
-                                buffer.push(";".to_string());
-                            } else {
-                                // Rule terminator.
-                                if left_buffer.is_empty() {
-                                    panic!("ambiguous ';' : no left-hand side defined yet");
-                                }
-                                grammar.add_rule(&left_buffer, &buffer, if label_buffer.is_empty() { None } else { Some(label_buffer.clone()) });
-                                buffer.clear();
-                                left_buffer.clear();
-                                label_buffer.clear();
+                            if left_buffer.is_empty() {
+                                panic!("ambiguous ';' : no left-hand side defined yet");
                             }
+                            grammar.add_rule(&left_buffer, &buffer, if label_buffer.is_empty() { None } else { Some(label_buffer.clone()) });
+                            buffer.clear();
+                            left_buffer.clear();
+                            label_buffer.clear();
                         }
                         '@' => {
                             if !label_buffer.is_empty() {
@@ -114,9 +101,11 @@ impl Grammar {
                             };
                             i += 1;
                         }
-                        _ => {
-                            buffer.push(punct.as_char().to_string());
-                        }
+                        _ => panic!(
+                            "bare punctuation `{}` cannot be a terminal: write it as a \
+                             character literal `'{}'` instead",
+                            punct.as_char(), punct.as_char(),
+                        ),
                     }
                 }
                 TokenTree::Group(group) => {
@@ -129,7 +118,13 @@ impl Grammar {
                     buffer.push(ident.to_string());
                 }
                 TokenTree::Literal(literal) => {
-                    buffer.push(literal.to_string());
+                    let text = literal.to_string();
+                    //单字符终结符统一成 `'x'`：名字里直接装那个字符本身，而不是源码
+                    //非字符字面量（字符串、字节、数字）原样保留
+                    match char_literal_value(&text) {
+                        Some(c) => buffer.push(format!("'{c}'")),
+                        None => buffer.push(text),
+                    }
                 }
             }
             i += 1;

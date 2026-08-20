@@ -1,6 +1,7 @@
 use super::*;
 // 格子编码的哨兵住在兄弟模块 export 里，测试要用同一份定义而不是硬编码 0 / i32::MAX
 use super::export::{CELL_ACCEPT, CELL_ERROR};
+use super::util::char_literal_value;
 use quote::quote;
 use std::collections::HashSet;
 
@@ -548,46 +549,97 @@ fn char_literal_terminals_keep_their_quotes() {
 }
 
 #[test]
-fn bare_punct_terminals_have_no_quotes() {
-    // 裸标点走 TokenTree::Punct，名字是单个字符本身，和字符字面量的形式不同
-    let grammar = Grammar::build_grammar(quote! {
-        start : s ;
-        s : N + N ;
-    });
-    assert!(grammar.names.contains(&"+".to_string()), "names = {:?}", grammar.names);
-    assert!(!grammar.names.contains(&"'+'".to_string()));
+#[should_panic(expected = "write it as a character literal `'+'`")]
+fn bare_punct_cannot_be_a_terminal() {
+    // 裸标点走 TokenTree::Punct，如果也放行，`+` 和 `'+'` 会变成两个互不相干的
+    // 终结符 —— 而下游想认出「这是单字符终结符」只能嗅探名字形状，形状还随写法变。
+    // 所以只认字符字面量一种写法，报错里把正确写法直接给出来
+    Grammar::build_grammar(quote! { start : s ; s : N + N ; });
 }
 
 #[test]
-fn bare_semicolon_can_be_a_terminal() {
-    // `;` 在 DSL 里既是产生式终止符又可能是终结符，判据是看下一个 token：
-    // 后面紧跟 `|` 时，这个 `;` 属于候选式内容而不是终止符
+fn semicolon_terminal_must_be_a_char_literal() {
+    // `;` 当终结符只能写成 `';'`。裸 `;` 一律是产生式终止符 ——
+    // 所以不需要靠「下一个 token 是 '|' 还是 ';'」去猜它是哪一个
     let grammar = Grammar::build_grammar(quote! {
         start : s ;
-        s : ; | X ;
+        s : ';' | X ;
     });
-    assert!(grammar.names.contains(&";".to_string()), "names = {:?}", grammar.names);
+    assert!(grammar.names.contains(&"';'".to_string()), "names = {:?}", grammar.names);
     let s = sym(&grammar, "s");
     let alternatives: Vec<String> = (0..grammar.rules.len())
         .filter(|&i| grammar.rules[i].left == s)
         .map(|i| render_rule(&grammar, i))
         .collect();
-    assert_eq!(alternatives, ["s -> ;", "s -> X"]);
+    assert_eq!(alternatives, ["s -> ';'", "s -> X"]);
 }
 
 #[test]
-fn bare_semicolon_before_the_terminator_is_also_a_terminal() {
-    // 另一半判据：后面紧跟另一个 `;` 时，前一个是终结符、后一个才是终止符
-    let grammar = Grammar::build_grammar(quote! {
-        start : s ;
-        s : ; ;
-    });
+#[should_panic(expected = "ambiguous '|'")]
+fn bare_semicolon_always_terminates_the_rule() {
+    // `s : ; | X ;` 里第一个 `;` 直接收掉 `s -> ε` 并清空左部，
+    // 于是紧跟的 `|` 找不到左部 —— 报错，而不是像以前那样把 `;` 当成终结符
+    Grammar::build_grammar(quote! { start : s ; s : ; | X ; });
+}
+
+#[test]
+fn a_lone_semicolon_is_still_an_epsilon_production() {
+    // 删掉前瞻判断不能把 ε 产生式一起删掉
+    let grammar = Grammar::build_grammar(quote! { start : s ; s : ; });
     let s = sym(&grammar, "s");
     let alternatives: Vec<String> = (0..grammar.rules.len())
         .filter(|&i| grammar.rules[i].left == s)
         .map(|i| render_rule(&grammar, i))
         .collect();
-    assert_eq!(alternatives, ["s -> ;"]);
+    assert_eq!(alternatives, ["s -> ε"]);
+}
+
+#[test]
+fn single_char_terminal_names_carry_the_character_itself() {
+    // 写入 buffer 时统一成 `'` + 那个字符 + `'`，所以名字里装的是**字符本身**而不是
+    // 源码写法。两个后果：
+    //   1. 'A' / '\x41' / '\u{41}' 是同一个终结符，不再各成一个
+    //   2. 下游认单字符终结符只要看「首尾单引号、中间恰好一个字符」，
+    //      不必再解一遍转义 —— 这正是 SIMPLE_COL 依赖的不变量
+    let grammar = Grammar::build_grammar(quote! {
+        start : s ;
+        s : 'A' | '\x41' | '\u{41}' | '\'' | '\\' | '\n' | '(' | '中' ;
+    });
+    let mut names: Vec<&String> = grammar
+        .names
+        .iter()
+        .filter(|n| n.starts_with('\'') && n.ends_with('\'') && n.len() >= 3)
+        .collect();
+    names.sort();
+    // 'A' 的三种写法合成一个，所以是 6 个而不是 8 个
+    assert_eq!(names.len(), 6, "names = {:?}", grammar.names);
+    for name in &names {
+        let inner: Vec<char> = name[1..name.len() - 1].chars().collect();
+        assert_eq!(inner.len(), 1, "{name:?} 引号里不是恰好一个字符");
+    }
+    // ASCII 的名字恰好 3 字节 —— SIMPLE_COL 就是靠这个长度判据。
+    // 多字节字符名字更长，落不进 128 项的直查表（用 symbol_col 兜）
+    assert_eq!(names.iter().filter(|n| n.len() == 3).count(), 5);
+    assert_eq!(names.iter().filter(|n| n.len() > 3).count(), 1, "'中'");
+}
+
+#[test]
+fn only_single_char_terminals_look_like_quoted_chars() {
+    // SIMPLE_COL 用「3 字节 + 首尾单引号」当判据，所以别的名字绝不能长成这样，
+    // 否则会被错当成某个字符的列。字符串字面量首尾是双引号，标识符不含引号
+    let grammar = Grammar::build_grammar(quote! {
+        start : s ;
+        s : NAME "'" "x" 42 | '(' ;
+    });
+    let looks_like_char: Vec<&String> = grammar
+        .names
+        .iter()
+        .filter(|n| {
+            let b = n.as_bytes();
+            b.len() == 3 && b[0] == b'\'' && b[2] == b'\''
+        })
+        .collect();
+    assert_eq!(looks_like_char, [&"'('".to_string()], "names = {:?}", grammar.names);
 }
 
 #[test]
@@ -1296,4 +1348,77 @@ fn emitted_tokens_contain_the_expected_api() {
     // 发射的是 token 而不是字符串，所以名字必须是带引号的字面量
     assert!(emitted.contains(r#""$end""#), "SYMBOL_NAMES 里应有 \"$end\" 字面量");
     assert!(emitted.contains(r#""start""#));
+}
+
+
+// ============ 字符字面量解析 ============
+
+#[test]
+fn char_literal_value_agrees_with_syn() {
+    // 真值用 syn::Lit（dev-dependency，只在测试里）。这样测的是「手写解析和
+    // Rust 自己的词法一致」，而不是「和我以为的一致」—— 后者测不出认知错误
+    let source = r##"
+        'x' 'Z' '0' ' ' '中' '😀'
+        '\'' '\"' '\\' '\n' '\t' '\r' '\0'
+        '\x00' '\x41' '\x7f'
+        '\u{41}' '\u{4e2d}' '\u{1F600}' '\u{00_41}'
+    "##;
+    let tokens: TokenStream = source.parse().unwrap();
+    let mut checked = 0;
+    for token in tokens {
+        let TokenTree::Literal(literal) = token else { panic!("只该有字面量") };
+        let text = literal.to_string();
+        let expected = match syn::Lit::new(literal) {
+            syn::Lit::Char(c) => c.value(),
+            _ => panic!("{text} 不是字符字面量"),
+        };
+        assert_eq!(
+            char_literal_value(&text),
+            Some(expected),
+            "{text} 解析结果和 syn 不一致"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 20, "测例数量对不上，漏了几种写法");
+}
+
+#[test]
+fn char_literal_value_rejects_other_literal_kinds() {
+    // 字符串、字节、字节串、原始字符串、整数、浮点 —— 全都不是字符字面量。
+    // 靠的是 Rust 字面量语法的前缀可判定性，不是长度或形状
+    let source = r##" "x" "" "->" b'x' b"xy" r"x" r#"x"# 42 0x41 1.5 1e3 "##;
+    let tokens: TokenStream = source.parse().unwrap();
+    let mut checked = 0;
+    for token in tokens {
+        let TokenTree::Literal(literal) = token else { continue };
+        let text = literal.to_string();
+        assert_eq!(char_literal_value(&text), None, "{text} 不该被认成字符");
+        checked += 1;
+    }
+    assert_eq!(checked, 11);
+}
+
+#[test]
+fn char_literal_value_rejects_malformed_input() {
+    // 这些形状在合法 token 流里出现不了，但不能因为「上游保证」就崩掉或误判
+    let malformed = [
+        "",                 // 空
+        "'",                // 只有一个引号
+        "''",               // 空字符
+        "'ab'",             // 两个字符
+        "'\\'",             // 反斜杠没跟转义符
+        "'\\q'",            // 未知转义
+        "'\\nx'",           // 转义后还有别的字符
+        "'\\x'",            // \x 没有十六进制位
+        "'\\xZZ'",          // 非十六进制
+        "'\\u'",            // \u 没有花括号
+        "'\\u{}'",          // 花括号里是空的
+        "'\\u{110000}'",    // 超出 Unicode 上限
+        "'\\u{D800}'",      // 代理区码点
+        "'\\u{4e2d'",       // 花括号没闭合
+        "x",                // 没有引号
+    ];
+    for text in malformed {
+        assert_eq!(char_literal_value(text), None, "{text:?} 不该解析出字符");
+    }
 }

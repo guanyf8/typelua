@@ -7,6 +7,10 @@ edition = "2024"
 proc-macro = true
 
 [dependencies]
-syn = "2"          
-quote = "1"         
-proc-macro2 = "1"   
+quote = "1"
+proc-macro2 = "1"
+
+# 只有测试用得到：把 export() 的结果解析回 Rust，验证发射的是合法代码。
+# syn::File 需要 full feature；放 dev 里就不会拖慢 proc-macro 本体的编译
+[dev-dependencies]
+syn = { version = "2", features = ["full"] }   
