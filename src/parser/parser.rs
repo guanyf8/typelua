@@ -7,7 +7,7 @@ use crate::lexer::type_def::*;
 use super::adapter::{COL_GT, col};
 
 #[derive(Clone)]
-enum NodeSyntax<'a> {
+pub enum NodeSyntax<'a> {
     Prod(Option<Prod>),
     Token(Token<'a>),
 }
@@ -18,7 +18,7 @@ impl NodeData for NodeSyntax<'_> {
     }
 }
 
-struct parser<'a> {
+pub struct Parser<'a> {
     node_stack: Vec<usize>,  //指示node的指针
     ast: Tree<NodeSyntax<'a>>,
     input: &'a str,
@@ -26,9 +26,9 @@ struct parser<'a> {
     pending: Option<(Token<'a>, Span)>,
 }
 
-impl<'a> parser<'a> {
-    fn new(input: &'a str) -> Self {
-        parser {
+impl<'a> Parser<'a> {
+    pub fn new(input: &'a str) -> Self {
+        Parser {
             node_stack: vec![],
             ast: Tree::new(),
             input,
@@ -77,7 +77,7 @@ impl<'a> parser<'a> {
     }
 
     //build tree
-    pub fn parse(&mut self) {
+    pub fn parse(&mut self) -> (&Tree<NodeSyntax<'a>>, Vec<Span>) {
         let mut lexer = Lexer::new(self.input);
         let mut state_stack: Vec<u32> = vec![0];  // state 0 初始化
         
@@ -177,5 +177,6 @@ impl<'a> parser<'a> {
             self.ast.set_root(node);
         }
 
+        (&self.ast, lexer.comments().to_vec())
     }
 }

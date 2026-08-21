@@ -53,6 +53,24 @@
 //!
 //! **降级**：class 全套。它是唯一需要真代码生成的构造。
 //!
+//! class 的**初始化**反而一条产生式都不占。它照 Rust 的结构体字面量来 ——
+//!     local x = A{b = true, c = 1}
+//! 而 `A{…}` 落在 `prefixexp args` 里 `args : tableconstructor` 那条上（Lua 自带
+//! 的 `f{…}` 糖），归约成 `@Call(NAME, @Table)`，和函数调用**同形**。语法上分不开、
+//! 也不该分：checker 看 prefixexp 是不是类名就能区分「构造实例」和「拿表调函数」。
+//! 所以这里没有 `@ClassLit` 这种标签，emitter 也是按名字认出来再降级的。
+//!
+//! 连带两件事：`new` 和 `init` 都不是保留名（没有构造器，见 helper.md 12），
+//! 以及子类不需要构造链 —— `B{…}` 把父类的非空字段和自己的写在同一层。
+//!
+//! 父类同理不占关键字：`class B : A` 用的是单字符 `':'`（第四次复用 —— 另三处是
+//! 类型标注 `x:T`、方法调用 `a:f()`、funcname 的 `A:m`，四处上下文不相交）。
+//! 纯替换：状态 337、产生式 183 都不变，只是少了 `EXTENDS` 终结符（符号 126→125）。
+//! `extends` 因此被释放回普通标识符，**必须同时从 type_def.rs 的 reserved! 里删掉** ——
+//! adapter.rs 的 RESERVED_COL 会对它调 symbol_col()，终结符没了就 const panic。
+//! 标签仍叫 `@ClassDeclExtends`：它描述的是继承关系，不是那个已消失的关键字。
+//!
+//! 父类槽只收一个裸 NAME，即单实现继承 —— 继承图是一棵树，菱形不可能出现。
 //! ---
 //!
 //! 归约-归约冲突在宏里是 panic，所以这个文件能编译就等价于「typelua 文法是
@@ -71,7 +89,8 @@
 //! 它的 `exp` 是扁平的；但 bison 对两者都默认移进，结果与本文法一致。
 //!
 //! 表里没有导出冲突数，所以这条守不住 —— 加了新语法要手动重量一遍。
-//! 规模基线（337 状态 / 126 符号 / 183 产生式 / 22 标签）同理，见 helper.md。
+//! 规模基线（337 状态 / 126 符号（65 终结符）/ 183 产生式 / 80 标签，其中 117 条
+//! 产生式贴了标签、66 条透传）同理，见 helper.md。
 
 
 grammar::grammar! {
@@ -119,7 +138,7 @@ grammar::grammar! {
         | LOCAL decllist                 @LocalDecl
         | LOCAL decllist '=' explist     @LocalDeclInit
         | CLASS NAME generics classbody                @ClassDecl
-        | CLASS NAME generics EXTENDS NAME classbody   @ClassDeclExtends
+        | CLASS NAME generics ':' NAME classbody       @ClassDeclExtends
         | TYPEDEF NAME generics '=' type               @TypeDef
     
         ;
@@ -268,7 +287,10 @@ grammar::grammar! {
         | classfields ',' classfield     @ClassFieldsRest
         ;
     
-    classfield
+    classfield                           /* 第一条是「无默认值」：checker 要求每一处
+                                            `Name{…}` 都给出它，给不全就报错（helper.md 12）。
+                                            后两条带默认值，字面量里可省。
+                                            没有构造器，所以 init 在这里只是个普通方法名 */
         : NAME ':' type                  @FieldDecl
         | NAME ':' type '=' exp          @FieldDeclInit
         | NAME '=' exp                   @FieldInit
@@ -404,7 +426,9 @@ grammar::grammar! {
         | prefixexp TURBOFISH typeargs '>'    @TurboFish
         ;
     
-    args
+    args                                 /* tableconstructor 那条兼任 class 初始化：
+                                            `A{…}` 就是它，见文件头。`A"str"` 同理是
+                                            Lua 自带的糖，只是对 class 没有意义 */
         : '(' ')'                        @ArgsEmpty
         | '(' explist ')'                @Args
         | tableconstructor

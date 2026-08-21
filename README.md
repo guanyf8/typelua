@@ -18,21 +18,17 @@ typedef Logger  = {                                     -- 描述外部已存在
 -- ========================= Classes =========================
 class A{
     a:string = "hello",                                 -- 有默认值
-    b:boolean,                                          -- 无默认值 -> init 必须赋，否则报错
+    b:boolean,                                          -- 无默认值 -> 每处初始化都必须给
     c:number,
     greet:function(self:A, msg:string) -> string,       -- 成员函数【声明】：只给签名，没有函数体
     greet2(self, msg:string) -> number,                 -- 同上的简写；self 的类型自动是 A
-    init(self, b:boolean, c:number)                     -- 构造器，编译器据此生成 A.new
-        self.b = b
-        self.c = c
-    end,
     bye(self) -> string return "bye" end,               -- 成员函数【定义】：有 self -> 方法
     hello_again(self) -> (string, number) return "hello", 1 end,
-    make(n:number) -> A return A.new(true, n) end,      -- 无 self -> 静态方法
+    make(n:number) -> A return A{b = true, c = n} end,  -- 无 self -> 静态方法
     onclick:function(number) -> (),                     -- 无 self -> 普通函数字段（回调）
 }
 
-class B extends A{
+class B : A{
     d:number = 0                                        -- 继承 A 的字段和方法
 }
 
@@ -41,7 +37,13 @@ function A:greet(msg:string) -> string
     return msg
 end
 
-local x = A.new(true, 1)
+local x = A {
+    b = true,
+    c= 1
+}
+-- local bad = A { b = true }                           -- 不允许：c 无默认值，没给就拒绝
+-- local bad = A { b = true, c = 1, zz = 9 }            -- 不允许：zz 不是 A 的字段
+local y = B { b = false, c = 2 }                        -- 继承来的非空字段照样要给；d 有默认值
 x:bye()                                                 -- 方法
 x.onclick(42)                                           -- 回调字段：点号调用，不传 self
 A.make(3)                                               -- 静态方法
@@ -126,7 +128,7 @@ stat ::=  ‘;’ |                                                        (~Lua
      function funcname funcbody |
      local function Name funcbody |
      local decllist [‘=’ explist] |             -- (~Lua) namelist -> decllist
-     class Name [generics] [extends Name] classbody |
+     class Name [generics] [‘:’ Name] classbody |
                                                -- (+TLUA) 类声明
      typedef Name [generics] ‘=’ type           -- (+TLUA) 类型声明
 
@@ -247,12 +249,31 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
      -- 允许尾随逗号，但分隔符只能是 ‘,’ 而不是 fieldsep：‘;’ 既能当分隔符
      -- 又能当方法体里的空语句（`stat : ';'`），无函数体的 methodsig 后面
      -- 那个 ‘;’ 分不清是哪个。
-     -- 字段是非空的：每个字段要么有默认值，要么被构造器在所有路径上赋值，
-     -- 否则报错。构造器是保留的方法名 init，编译器据它生成 Name.new。
+     -- 字段是非空的：每个字段要么有默认值，要么在**每一处**初始化里给出，否则报错。
+     -- 没有构造器，也没有 Name.new：初始化照结构体字面量来 ——
+     --     local x = A{b = true, c = 1}
+     -- 这条不需要任何新语法。`A{…}` 就是 `prefixexp args` 里 `args ::= tableconstructor`
+     -- 那条（Lua 自带的 `f{…}` 糖），归约出来的节点和函数调用完全一样，由 checker
+     -- 看 prefixexp 是不是类名来区分「构造实例」和「拿一张表去调函数」。
+     -- 子类字面量直接把父类的非空字段一起写出来，没有构造链、不需要 super。
+     --
+     -- 【父类为什么用 ‘:’ 而不是 extends 关键字】‘:’ 已经在这门语言里表示「有此
+     -- 类型」（`x:T`），而 class 就是它的 record 形状，所以「B 是一个 A」是同一个
+     -- 关系，写 `class B : A` 自洽。实测是纯替换：状态 337 不变、产生式 183 不变，
+     -- 只少一个终结符，移进-归约冲突仍是 ‘(’ 上那两个（bison 版仍是 4 个）。
+     -- 换来的是 extends 被释放回普通标识符 —— `local extends = 1`、`t:extends()`
+     -- 都合法，这对一门要和现存 Lua 代码共处的语言是实收益。
+     -- 连带好处：将来加泛型约束就写 `<T : Cmp>`（实测同样零新冲突），不必为它
+     -- 单独留一个关键字；否则 extends 的唯一残留用途就只是那个。
+     -- 代价是 ‘:’ 第四次复用（类型标注 / 方法调用 / funcname / 继承），且
+     -- `class B : A{` 和类字面量 `A{…}` 形似 —— 建议写成 `class B : A {`。
+     --
+     -- 父类槽只收一个裸 Name：**单实现继承**，所以继承图是一棵树，菱形不可能出现。
+     -- 多重「符合某形状」不走这里 —— record 是结构类型，形状对得上就能赋值过去，
+     -- 本来就不需要声明。若将来要 `: A, IFoo` 的列表，实测再 +3 状态 +2 产生式。
 
 -- ---- 新增词法记号 ----
 --   class     关键字
---   extends   关键字
 --   typedef   关键字（不用 type：`type(x)` 是 Lua 标准库函数，不能被夺走）
 --   as        关键字
 --   ‘->’      返回类型箭头
@@ -295,7 +316,6 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
 \.[0-9]+([eE][+-]?[0-9]+)?                           { yylval.str = strdup(yytext); return NUMERAL; }
 
 "class"     { return CLASS; }      /* TLUA: class keyword                */
-"extends"   { return EXTENDS; }    /* TLUA: inheritance keyword          */
 "typedef"   { return TYPEDEF; }    /* TLUA: type declaration keyword     */
 "as"        { return AS; }         /* TLUA: cast keyword                 */
 "and"       { return AND; }
@@ -339,6 +359,9 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
 "//"        { return IDIV; }
 
 [-+*/%^#&~|<>=(){}\[\];:,.]   { return yytext[0]; }
+                                   /* ':' 兼四职：类型标注 `x:T`、方法调用 `a:f()`、
+                                      funcname 的 `A:m`、以及 TLUA 的继承 `class B : A`。
+                                      四处的上下文互不相交，LALR(1) 分得开（实测零新冲突） */
 
 .           { fprintf(stderr, "line %d: unexpected character '%s'\n", yylineno, yytext);
               return 0; }
@@ -435,11 +458,13 @@ stat
     | CLASS NAME generics classbody  { $$ = ast_own("Class", $2);
                                        if ($3) ast_add($$, $3);
                                        ast_add($$, $4); }
-    | CLASS NAME generics EXTENDS NAME classbody
+    | CLASS NAME generics ':' NAME classbody
                                      { $$ = ast_own("Class", $2);
                                        if ($3) ast_add($$, $3);
                                        ast_add($$, ast_own("Extends", $5));
                                        ast_add($$, $6); }
+      /* 父类槽目前只收一个裸 NAME —— 单实现继承，所以继承图是一棵树，
+         菱形不可能出现。将来若要 `: A, IFoo` 的列表，实测再 +3 状态 +2 产生式。 */
     | TYPEDEF NAME generics '=' type { $$ = ast_own("TypeDef", $2);
                                        if ($3) ast_add($$, $3);
                                        ast_add($$, $5); }
@@ -620,6 +645,9 @@ classfields
     ;
 
 classfield
+    /* 第一条是「无默认值」：checker 要求每一处 `Name{…}` 都给出它。
+       后两条带默认值。init 不再是保留的方法名 —— 没有构造器了，
+       初始化是字面量（见 prefixexp args），所以这里五条候选式一条没动。 */
     : NAME ':' type                  { $$ = ast_own("Field", $1); ast_add($$, $3); }
     | NAME ':' type '=' exp          { $$ = ast_own("Field", $1);
                                        ast_add($$, $3); ast_add($$, $5); }
@@ -692,6 +720,11 @@ prefixexp
     | prefixexp args                 { $$ = ast_new("Call");
                                        ast_add($$, $1); ast_add($$, $2);
                                        $$->aux = PK_CALL; }
+      /* (+TLUA) 类初始化 `A{…}` 也归到这条：args 的第三条候选式就是
+         tableconstructor（Lua 自带的 `f{…}` 糖），所以「构造实例」和「拿表调
+         函数」在语法上完全同形，这里分不开、也不该分 —— 交给 checker 看 $1
+         是不是类名。零新产生式、零新冲突，代价只是 AST 上没有专门的节点。
+         `Box::<string>{…}` 同样自然：TURBOFISH 那条之后再接这条即可。 */
     | prefixexp ':' NAME args        { $$ = ast_own("MethodCall", $3);
                                        ast_add($$, $1); ast_add($$, $4);
                                        $$->aux = PK_CALL; }

@@ -275,11 +275,10 @@ impl Grammar {
             );
         }
         //允许复用label
-        if let Some(existing) = self.labels.iter().position(|x| *x == label) {
-            return existing as u32;
-        }
-        self.labels.push(label);
-        (self.labels.len() - 1) as u32
+        self.labels.iter().position(|x| *x == label).unwrap_or_else(||{
+            self.labels.push(label);
+            (self.labels.len() - 1)
+        }) as u32
     }
 }
 

@@ -59,7 +59,6 @@ macro_rules! operators {
 
 reserved! {
     CLASS    => "class",        // +TLUA
-    EXTENDS  => "extends",      // +TLUA
     TYPEDEF  => "typedef",      // +TLUA：不用 type，`type(x)` 是 Lua 标准库函数
     AS       => "as",           // +TLUA
     AND      => "and",
