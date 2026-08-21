@@ -149,7 +149,7 @@ impl ParseTable {
                     }
                     i += 1;
                 }
-                panic!("unknown grammar symbol")
+                panic!("unknown grammar symbol") as u32
             }
 
             /// SIMPLE_COL 中该单字符不是文法的terminal

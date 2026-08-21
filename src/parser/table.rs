@@ -83,41 +83,41 @@ grammar::grammar! {
         ;
     
     block
-        : stat_list
-        | stat_list retstat
-        | retstat
-        | /* empty */
+        : stat_list                      @Block
+        | stat_list retstat              @Block
+        | retstat                        @Block
+        | /* empty */                    @Block
         ;
     
     stat_list
         : stat
-        | stat_list stat
+        | stat_list stat                 @ListTail
         ;
     
     stat
         : ';'                            /* empty stmt dropped */
-        | varlist '=' explist
-        | prefixexp
+        | varlist '=' explist            @Assign
+        | prefixexp                      @ExprStat
         | label
         | BREAK
-        | GOTO NAME
-        | DO block END
-        | WHILE exp DO block END
-        | REPEAT block UNTIL exp
-        | IF exp THEN block elseif_list END
+        | GOTO NAME                      @Goto
+        | DO block END                   @Do
+        | WHILE exp DO block END         @While
+        | REPEAT block UNTIL exp         @Repeat
+        | IF exp THEN block elseif_list END @If
     
-        | IF exp THEN block elseif_list ELSE block END
+        | IF exp THEN block elseif_list ELSE block END @IfElse
     
-        | FOR NAME optype '=' exp ',' exp DO block END
+        | FOR NAME optype '=' exp ',' exp DO block END @ForNum
     
-        | FOR NAME optype '=' exp ',' exp ',' exp DO block END
+        | FOR NAME optype '=' exp ',' exp ',' exp DO block END @ForNumStep
     
-        | FOR decllist IN explist DO block END
+        | FOR decllist IN explist DO block END @ForIn
     
-        | FUNCTION funcname funcbody
-        | LOCAL FUNCTION NAME funcbody
-        | LOCAL decllist
-        | LOCAL decllist '=' explist
+        | FUNCTION funcname funcbody     @FuncDecl
+        | LOCAL FUNCTION NAME funcbody   @LocalFuncDecl
+        | LOCAL decllist                 @LocalDecl
+        | LOCAL decllist '=' explist     @LocalDeclInit
         | CLASS NAME generics classbody                @ClassDecl
         | CLASS NAME generics EXTENDS NAME classbody   @ClassDeclExtends
         | TYPEDEF NAME generics '=' type               @TypeDef
@@ -126,24 +126,24 @@ grammar::grammar! {
     
     elseif_list
         : /* empty */
-        | elseif_list ELSEIF exp THEN block
+        | elseif_list ELSEIF exp THEN block @ElseIf
     
         ;
     
     retstat
-        : RETURN
-        | RETURN ';'
-        | RETURN explist
-        | RETURN explist ';'
+        : RETURN                         @ReturnVoid
+        | RETURN ';'                     @ReturnVoid
+        | RETURN explist                 @Return
+        | RETURN explist ';'             @Return
         ;
     
     label
-        : DBCOLON NAME DBCOLON
+        : DBCOLON NAME DBCOLON           @Label
         ;
     
     funcname
         : dotted_name
-        | dotted_name ':' NAME
+        | dotted_name ':' NAME           @MethodName
         ;
     
     dotted_name
@@ -153,16 +153,16 @@ grammar::grammar! {
     
     varlist
         : var
-        | varlist ',' var
+        | varlist ',' var                @ListTail
         ;
     
     var
-        : prefixexp optype               /* 标注只允许贴裸 NAME，由 checker 拦 */
+        : prefixexp optype               /* 标注只允许贴裸 NAME，由 checker 拦 */ @Var
         ;
     
     decllist
-        : NAME optype
-        | decllist ',' NAME optype
+        : NAME optype                    @DeclFirst
+        | decllist ',' NAME optype       @DeclRest
         ;
     
     optype
@@ -177,7 +177,7 @@ grammar::grammar! {
     
     typeparams
         : NAME
-        | typeparams ',' NAME
+        | typeparams ',' NAME            @ListTail
         ;
     
     type
@@ -187,44 +187,44 @@ grammar::grammar! {
     
     uniontype
         : basictype
-        | uniontype '|' basictype
+        | uniontype '|' basictype        @Union
         ;
     
     basictype
         : NAME
         | NIL                            /* nil type */
-        | NAME '<' typeargs '>'
+        | NAME '<' typeargs '>'          @GenericType
     
         | '(' type ')'                   /* grouping: (function()->A)|B */
-        | '{' '}'                        /* 匿名 record */
-        | '{' classfieldlist '}'         /* 复用 classfieldlist：类型位只许声明形式 */
+        | '{' '}'                        /* 匿名 record */ @RecordEmpty
+        | '{' classfieldlist '}'         /* 复用 classfieldlist：类型位只许声明形式 */ @Record
         ;
     
     typeargs
         : type
-        | typeargs ',' type
+        | typeargs ',' type              @ListTail
         ;
     
     functype                             /* 类型位的参数表：名字可省，故不能复用 parlist */
-        : FUNCTION '(' ')'
-        | FUNCTION '(' ')' rettype
-        | FUNCTION '(' argtypes ')'
-        | FUNCTION '(' argtypes ')' rettype
+        : FUNCTION '(' ')'               @FuncType
+        | FUNCTION '(' ')' rettype       @FuncTypeRet
+        | FUNCTION '(' argtypes ')'      @FuncTypeParams
+        | FUNCTION '(' argtypes ')' rettype @FuncTypeParamsRet
         ;
     
     argtypes
         : argtypelist
-        | argtypelist ',' vararg
+        | argtypelist ',' vararg         @ParamsVararg
         | vararg
         ;
     
     argtypelist
         : argtype
-        | argtypelist ',' argtype
+        | argtypelist ',' argtype        @ListTail
         ;
     
     argtype
-        : NAME ':' type                  /* 带名，纯文档 */
+        : NAME ':' type                  /* 带名，纯文档 */ @ArgTypeNamed
         | type                           /* 裸类型：function(string) -> number */
         ;
     
@@ -234,20 +234,20 @@ grammar::grammar! {
     
     retspec
         : type                           /* single return */
-        | '(' ')'                        /* void */
-        | '(' multilist ')'
+        | '(' ')'                        /* void */ @RetVoid
+        | '(' multilist ')'              @RetMulti
         ;
 
     multilist                            /* 单个定长走 basictype 分组，不在这里；
                                             vararg 只许出现在末位，和 parlist 一致 */
-        : typelist ',' type              /* 两个或更多定长 */
-        | typelist ',' vararg            /* 定长 + 末位 vararg */
+        : typelist ',' type              /* 两个或更多定长 */ @RetFixed
+        | typelist ',' vararg            /* 定长 + 末位 vararg */ @RetVararg
         | vararg                         /* 只有 vararg */
         ;
     
     typelist
         : type
-        | typelist ',' type
+        | typelist ',' type              @ListTail
         ;
     
     classbody
@@ -285,7 +285,7 @@ grammar::grammar! {
     
     explist
         : exp
-        | explist ',' exp
+        | explist ',' exp                @ListTail
         ;
     
     /* Precedence and associativity are encoded in the rules themselves:
@@ -309,76 +309,76 @@ grammar::grammar! {
         ;
 
     or_exp
-        : or_exp OR and_exp
+        : or_exp OR and_exp              @BinOp
         | and_exp
         ;
 
     and_exp
-        : and_exp AND cmp_exp
+        : and_exp AND cmp_exp            @BinOp
         | cmp_exp
         ;
 
     cmp_exp
-        : cmp_exp '<' bor_exp
-        | cmp_exp '>' bor_exp
-        | cmp_exp LE bor_exp
-        | cmp_exp GE bor_exp
-        | cmp_exp EQ bor_exp
-        | cmp_exp NE bor_exp
+        : cmp_exp '<' bor_exp            @BinOp
+        | cmp_exp '>' bor_exp            @BinOp
+        | cmp_exp LE bor_exp             @BinOp
+        | cmp_exp GE bor_exp             @BinOp
+        | cmp_exp EQ bor_exp             @BinOp
+        | cmp_exp NE bor_exp             @BinOp
         | bor_exp
         ;
 
     bor_exp
-        : bor_exp '|' bxor_exp
+        : bor_exp '|' bxor_exp           @BinOp
         | bxor_exp
         ;
 
     bxor_exp
-        : bxor_exp '~' band_exp
+        : bxor_exp '~' band_exp          @BinOp
         | band_exp
         ;
 
     band_exp
-        : band_exp '&' sh_exp
+        : band_exp '&' sh_exp            @BinOp
         | sh_exp
         ;
 
     sh_exp
-        : sh_exp SHL cat_exp
-        | sh_exp SHR cat_exp
+        : sh_exp SHL cat_exp             @BinOp
+        | sh_exp SHR cat_exp             @BinOp
         | cat_exp
         ;
 
     cat_exp                              /* '..' is right associative */
-        : add_exp CONCAT cat_exp
+        : add_exp CONCAT cat_exp         @BinOp
         | add_exp
         ;
 
     add_exp
-        : add_exp '+' mul_exp
-        | add_exp '-' mul_exp
+        : add_exp '+' mul_exp            @BinOp
+        | add_exp '-' mul_exp            @BinOp
         | mul_exp
         ;
 
     mul_exp
-        : mul_exp '*' un_exp
-        | mul_exp '/' un_exp
-        | mul_exp IDIV un_exp
-        | mul_exp '%' un_exp
+        : mul_exp '*' un_exp             @BinOp
+        | mul_exp '/' un_exp             @BinOp
+        | mul_exp IDIV un_exp            @BinOp
+        | mul_exp '%' un_exp             @BinOp
         | un_exp
         ;
 
     un_exp                               /* unary prefix operators */
-        : NOT un_exp
-        | '#' un_exp
-        | '-' un_exp
-        | '~' un_exp
+        : NOT un_exp                     @UnOp
+        | '#' un_exp                     @UnOp
+        | '-' un_exp                     @UnOp
+        | '~' un_exp                     @UnOp
         | pow_exp
         ;
 
     pow_exp                              /* '^' outranks unary, yet its right
                                             operand may be unary: 2^-3 */
-        : atom '^' un_exp
+        : atom '^' un_exp                @BinOp
         | atom
         ;
 
@@ -396,45 +396,45 @@ grammar::grammar! {
     
     prefixexp
         : NAME
-        | '(' exp ')'
-        | prefixexp '[' exp ']'
-        | prefixexp '.' NAME
-        | prefixexp args
-        | prefixexp ':' NAME args
+        | '(' exp ')'                    @Paren
+        | prefixexp '[' exp ']'          @Index
+        | prefixexp '.' NAME             @Dot
+        | prefixexp args                 @Call
+        | prefixexp ':' NAME args        @MethodCall
         | prefixexp TURBOFISH typeargs '>'    @TurboFish
         ;
     
     args
-        : '(' ')'
-        | '(' explist ')'
+        : '(' ')'                        @ArgsEmpty
+        | '(' explist ')'                @Args
         | tableconstructor
         | STRING
         ;
     
     functiondef
-        : FUNCTION funcbody
+        : FUNCTION funcbody              @FuncExpr
         ;
     
     funcbody
-        : generics '(' ')' block END
-        | generics '(' ')' rettype block END
-        | generics '(' parlist ')' block END
-        | generics '(' parlist ')' rettype block END
+        : generics '(' ')' block END     @FuncBody
+        | generics '(' ')' rettype block END @FuncBodyRet
+        | generics '(' parlist ')' block END @FuncBodyParams
+        | generics '(' parlist ')' rettype block END @FuncBodyParamsRet
         ;
     
     parlist
         : params
-        | params ',' vararg
+        | params ',' vararg              @ParamsVararg
         | vararg
         ;
     
     params
         : param
-        | params ',' param
+        | params ',' param               @ListTail
         ;
     
     param
-        : NAME optype
+        : NAME optype                    @Param
         ;
     
     vararg
@@ -443,8 +443,8 @@ grammar::grammar! {
         ;
     
     tableconstructor
-        : '{' '}'
-        | '{' fieldlist '}'
+        : '{' '}'                        @TableEmpty
+        | '{' fieldlist '}'              @Table
         ;
     
     fieldlist
@@ -454,12 +454,12 @@ grammar::grammar! {
     
     fields
         : field
-        | fields fieldsep field
+        | fields fieldsep field          @ListTail
         ;
     
     field
-        : '[' exp ']' '=' exp
-        | NAME '=' exp
+        : '[' exp ']' '=' exp            @FieldKV
+        | NAME '=' exp                   @FieldNamed
         | exp
         ;
     

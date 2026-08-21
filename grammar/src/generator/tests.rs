@@ -417,16 +417,33 @@ fn label_indices_always_point_into_the_label_table() {
 // ---------- 拒绝路径 ----------
 
 #[test]
-#[should_panic(expected = "duplicate production label `Dup`")]
-fn rejects_duplicate_labels_on_the_same_nonterminal() {
-    Grammar::build_grammar(quote! { start : s ; s : A @Dup | B @Dup ; });
+fn labels_are_interned_so_several_productions_can_share_one() {
+    // 同名标签复用同一个下标，和 names 的处理一致。这是刻意的：语义角色相同的
+    // 产生式本来就该同名 —— `L : L sep item` 那一族列表追加只需要一个 @Append，
+    // 消费方 `match prod(rule)` 的分支数按**角色**算而不是按产生式算
+    let grammar = Grammar::build_grammar(quote! { start : s ; s : A @Dup | B @Dup ; });
+    assert_eq!(grammar.labels, ["Dup"], "同名标签不该在表里出现两份");
+    let shared: Vec<usize> = (0..grammar.rules.len())
+        .filter(|&i| grammar.rules[i].label == Some(0))
+        .collect();
+    assert_eq!(shared.len(), 2, "两条产生式都该指向那个标签");
+    // 发射出来的 Prod 只有一个变体，RULE_PROD 里有两处指向它
+    let table = ParseTable::generate_parse_table(&grammar);
+    assert_eq!(table.label_names, ["Dup"]);
+    assert_eq!(table.rule_label.iter().filter(|l| **l == Some(0)).count(), 2);
 }
 
 #[test]
-#[should_panic(expected = "duplicate production label `Decl`")]
-fn rejects_duplicate_labels_across_nonterminals() {
-    // 跨左部重名几乎一定是笔误，而共享变体会让 dispatch 无法区分两条产生式
-    Grammar::build_grammar(quote! { start : s ; s : A @Decl ; t : B @Decl ; s : t ; });
+fn labels_are_shared_across_nonterminals_too() {
+    // 驻留不区分左部：`L : L sep item` 分散在 explist / varlist / params / typeargs …
+    // 十几个非终结符上，它们要能共用同一个 @Append
+    let grammar = Grammar::build_grammar(quote! { start : s ; s : A @Decl ; t : B @Decl ; s : t ; });
+    assert_eq!(grammar.labels, ["Decl"]);
+    assert_eq!(
+        grammar.rules.iter().filter(|r| r.label == Some(0)).count(),
+        2,
+        "跨左部的两条产生式都该指向同一个标签"
+    );
 }
 
 #[test]

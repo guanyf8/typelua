@@ -274,12 +274,9 @@ impl Grammar {
                  name, so pick something else"
             );
         }
-        if let Some(first) = self.labels.iter().position(|x| *x == label) {
-            panic!(
-                "duplicate production label `{label}`: already used by the rule labeled \
-                 at index {first}. Labels identify a single production; group several \
-                 productions with `Prod::A | Prod::B => ...` on the consumer side"
-            );
+        //允许复用label
+        if let Some(existing) = self.labels.iter().position(|x| *x == label) {
+            return existing as u32;
         }
         self.labels.push(label);
         (self.labels.len() - 1) as u32
