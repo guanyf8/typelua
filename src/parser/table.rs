@@ -77,8 +77,10 @@
 //! LALR(1) 的」。移进-归约冲突不会 panic，而是静默贪婪移进（见 generator.rs
 //! 的 set_action），实测只有 **2** 个，都是 Lua 自带的那个歧义：
 //!
-//!     stat : prefixexp ·      遇 '('
-//!     atom : prefixexp ·      遇 '('
+//! ```text
+//! stat : prefixexp ·      遇 '('
+//! atom : prefixexp ·      遇 '('
+//! ```
 //!
 //! 也就是 `local x = f` 换行接 `(g).y = 1`。Lua 5.1 直接报 ambiguous syntax，
 //! 5.2+ 规定一律按函数调用解释，所以移进是对的。
@@ -137,10 +139,31 @@ grammar::grammar! {
         | LOCAL FUNCTION NAME funcbody   @LocalFuncDecl
         | LOCAL decllist                 @LocalDecl
         | LOCAL decllist '=' explist     @LocalDeclInit
-        | CLASS NAME generics classbody                @ClassDecl
-        | CLASS NAME generics ':' NAME classbody       @ClassDeclExtends
-        | TYPEDEF NAME generics '=' type               @TypeDef
+        | optpub CLASS NAME generics classbody         @ClassDecl
+        | optpub CLASS NAME generics ':' NAME classbody @ClassDeclExtends
+        | optpub TYPEDEF NAME generics '=' type        @TypeDef
+        | IMPORT '{' importlist '}' IN STRING          @Import
     
+        ;
+    
+    optpub
+        : /* empty */
+        | PUB                            @Pub
+        ;
+    
+    importlist
+        : importitems
+        | importitems ','
+        ;
+    
+    importitems
+        : importitem
+        | importitems ',' importitem     @ListTail
+        ;
+    
+    importitem
+        : NAME
+        | NAME AS NAME                   @ImportAlias
         ;
     
     elseif_list

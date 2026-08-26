@@ -10,8 +10,8 @@ pub struct Node<T: NodeData> {
     //该节点覆盖的源码字节区间。叶子用词法器给的原样；内部节点是
     //[最左孩子.start, 最右孩子.end)；ε 节点是归约那一刻 lookahead 处的零长度区间
     span: Span,
-    children: Vec<usize>,
-    parent: Option<usize>,
+    pub children: Vec<usize>,
+    pub parent: Option<usize>,
 }
 
 impl<T: NodeData> Node<T> {
@@ -86,6 +86,9 @@ impl<T: NodeData> Tree<T> {
         self.nodes[parent].children.push(child);
     }
 
+    pub fn get_node(&self, node: usize) -> &Node<T> {
+        &self.nodes[node]
+    }
     pub fn append_child(&mut self, parent: Option<usize>, data: T, span: Span) -> usize {
         let (node,index) = self.alloc_node();
         node.data = data;

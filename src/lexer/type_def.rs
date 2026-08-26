@@ -60,7 +60,9 @@ macro_rules! operators {
 reserved! {
     CLASS    => "class",        // +TLUA
     TYPEDEF  => "typedef",      // +TLUA：不用 type，`type(x)` 是 Lua 标准库函数
-    AS       => "as",           // +TLUA
+    AS       => "as",           // +TLUA：强转 + import 改名，两处共用
+    PUB      => "pub",          // +TLUA：导出修饰，只贴在顶层 class / typedef 前
+    IMPORT   => "import",       // +TLUA：类型导入，`import {A as B} in "mod"`
     AND      => "and",
     BREAK    => "break",
     DO       => "do",

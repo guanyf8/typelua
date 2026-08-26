@@ -98,6 +98,55 @@ local raw  = require("cjson")                           -- 推断为 any
 local json = raw as {encode:function(any) -> string}    -- 用 as 落地
 ```
 
+跨文件/跨模块
+
+三条规则：
+  - **静态面**（`class` / `typedef`）由 `pub` 决定是否跨文件可见，`import` 引入；纯编译期，擦除后一个字都不剩
+  - **动态面**（实例变量）走 Lua 原本的 `require` / `return`，typelua 不插手
+  - 两者互不寄生：只用类型不必 `require`，只用值不必 `import`
+
+1. 文件 `mod_a.lua`
+```lua
+pub class A {                                           -- pub：类型名可被别的文件 import
+    a:string,
+    b:number,
+    f(self, s:string, n:number) -> boolean return false end,
+}
+
+pub typedef Shape = {                                   
+    g(s:string, n:number) -> number,
+}
+
+typedef Internal = number                             
+class Helper { v:number }                      
+
+local M = A { a = "hello", b = 1 }                      -- 类字面量：方法有内联定义就不必再给
+
+-- 支持类体外重定义，只要签名对得上
+function A:f(s:string, n:number) -> boolean
+    return true
+end
+
+return M                                                -- 动态面：只返回实例变量
+```
+
+2. 文件 `mod_b.lua`
+```lua
+import {A, Shape} in "mod_a"                            -- 只引入类型名
+import {Shape as S2, A as A2} in "mod_a"                -- 撞名时用 as 改名
+
+local m:A = require "mod_a"                            
+local ok:boolean = m:f("x", 1)
+
+local sh:S2 = {                                         
+    g = function(s:string, n:number) -> number return 1 end,
+}
+
+-- import {Internal} in "mod_a"                         -- 不允许：Internal 没有 pub
+-- local bad = A { a = "x", b = 1 }                     -- 不允许：import 只带类型不带值。
+--                                                         要构造就用 mod_a 导出的工厂函数
+-- class C : A2 { d:number = 0 }                        -- 同上：继承要父类的运行时值
+```
 
 ## typelua compared to lua
 ```
@@ -128,9 +177,10 @@ stat ::=  ‘;’ |                                                        (~Lua
      function funcname funcbody |
      local function Name funcbody |
      local decllist [‘=’ explist] |             -- (~Lua) namelist -> decllist
-     class Name [generics] [‘:’ Name] classbody |
-                                               -- (+TLUA) 类声明
-     typedef Name [generics] ‘=’ type           -- (+TLUA) 类型声明
+     [pub] class Name [generics] [‘:’ Name] classbody |
+                                               -- (+TLUA) 类声明；pub = 跨文件可见
+     [pub] typedef Name [generics] ‘=’ type |   -- (+TLUA) 类型声明；pub 同上
+     import ‘{’ importlist ‘}’ in LiteralString -- (+TLUA) 类型导入
 
 retstat ::= return [explist] [‘;’]                                     (=Lua)
 
@@ -152,10 +202,6 @@ exp ::=  nil | false | true | Numeral | LiteralString | ‘...’ |        (~Lua
      functiondef | prefixexp | tableconstructor |
      exp binop exp | unop exp |
      exp as type                                -- (+TLUA) 强转
-     -- ‘as’ 的优先级最松：`a + b as T` 等于 `(a + b) as T`。
-     -- 这样 `x as A|nil` 里的 ‘|’ 无歧义地归入类型，不必加括号 —— 而这是强转
-     -- 最主要的用法。代价是 `(x as T) < y` 的括号不能省（否则 ‘<’ 会被当成
-     -- 泛型的开启）。
 
 prefixexp ::= var | functioncall | ‘(’ exp ‘)’ |                      (~Lua)
      prefixexp ‘::<’ typeargs ‘>’               -- (+TLUA) turbofish
@@ -186,11 +232,11 @@ unop ::= ‘-’ | not | ‘#’ | ‘~’                                      
 
 ======================= 以下全部 (+TLUA) =======================
 
+-- ---- 跨文件 ----
+importlist ::= importitem {‘,’ importitem} [‘,’]
+importitem ::= Name | Name as Name            
+
 decllist ::= Name [‘:’ type] {‘,’ Name [‘:’ type]}
-     -- 语义约束：`local decllist` 若没有 `= explist`（无初始化），
-     --           则每个 Name 都必须带 `: type`；进一步地，该类型展开后必须是
-     --           record（视为「外部提供的东西的形状」，信任它）。标量和 class
-     --           会报错，因为它实际是 nil。判据是类型的形状，不是声明关键字。
 
 -- ---- 泛型形参 ----
 generics   ::= ‘<’ typeparams ‘>’
@@ -275,7 +321,10 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
 -- ---- 新增词法记号 ----
 --   class     关键字
 --   typedef   关键字（不用 type：`type(x)` 是 Lua 标准库函数，不能被夺走）
---   as        关键字
+--   as        关键字（强转 + import 改名，两处共用）
+--   pub       关键字（导出修饰；实测某 SDK 里仅 1 处 `params.pub` 字段位冲突）
+--   import    关键字（类型导入；该 SDK 里 71 处冲突全在 `t.import` 字段位，
+--             故建议一并放开「保留字可出现在 ‘.’ 后与表键位」，那条能一次救回全部）
 --   ‘->’      返回类型箭头
 --   ‘::<’     turbofish；三字符必须紧邻，`map:: <T>` 会被词法成 ‘::’ + ‘<’。
 --             合法 Lua 里 ‘::’ 后必然跟 Name，所以 ‘::<’ 从不出现，最大匹配安全
@@ -318,6 +367,8 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
 "class"     { return CLASS; }      /* TLUA: class keyword                */
 "typedef"   { return TYPEDEF; }    /* TLUA: type declaration keyword     */
 "as"        { return AS; }         /* TLUA: cast keyword                 */
+"pub"       { return PUB; }        /* TLUA: 导出修饰符                   */
+"import"    { return IMPORT; }     /* TLUA: 类型导入                     */
 "and"       { return AND; }
 "break"     { return BREAK; }
 "do"        { return DO; }
@@ -455,19 +506,48 @@ stat
                                        $$ = ast_new("Local"); ast_add($$, $2); }
     | LOCAL decllist '=' explist     { $$ = ast_new("Local");
                                        ast_add($$, $2); ast_add($$, $4); }
-    | CLASS NAME generics classbody  { $$ = ast_own("Class", $2);
+    | optpub CLASS NAME generics classbody
+                                     { $$ = ast_own("Class", $3);
                                        if ($3) ast_add($$, $3);
                                        ast_add($$, $4); }
-    | CLASS NAME generics ':' NAME classbody
-                                     { $$ = ast_own("Class", $2);
-                                       if ($3) ast_add($$, $3);
-                                       ast_add($$, ast_own("Extends", $5));
+    | optpub CLASS NAME generics ':' NAME classbody
+                                     { $$ = ast_own("Class", $3);
+                                       if ($4) ast_add($$, $4);
+                                       ast_add($$, ast_own("Extends", $6));
                                        ast_add($$, $6); }
       /* 父类槽目前只收一个裸 NAME —— 单实现继承，所以继承图是一棵树，
          菱形不可能出现。将来若要 `: A, IFoo` 的列表，实测再 +3 状态 +2 产生式。 */
-    | TYPEDEF NAME generics '=' type { $$ = ast_own("TypeDef", $2);
-                                       if ($3) ast_add($$, $3);
-                                       ast_add($$, $5); }
+    | optpub TYPEDEF NAME generics '=' type
+                                     { $$ = ast_own("TypeDef", $3);
+                                       if ($4) ast_add($$, $4);
+                                       ast_add($$, $6); }
+    | IMPORT '{' importlist '}' IN STRING
+                                     { $$ = ast_new("Import");
+                                       ast_add($$, $3); ast_add($$, ast_own("Module", $6)); }
+    ;
+
+/* pub 做成可空前缀而不是复制一份产生式：class/typedef 各只保留一个标签，
+   语义层看第 0 个孩子有没有 Pub 即可，decl / emitter 都不必分叉 */
+optpub
+    : /* empty */                    { $$ = NULL; }
+    | PUB                            { $$ = ast_new("Pub"); }
+    ;
+
+/* 分隔符用 IN（已是 Lua 关键字），不用 from —— 后者在现存 Lua 里当裸变量用得太多 */
+importlist
+    : importitems                    { $$ = $1; }
+    | importitems ','                { $$ = $1; }
+    ;
+
+importitems
+    : importitem                     { $$ = ast_new("ImportList"); ast_add($$, $1); }
+    | importitems ',' importitem     { $$ = $1; ast_add($$, $3); }
+    ;
+
+importitem
+    : NAME                           { $$ = ast_own("ImportName", $1); }
+    | NAME AS NAME                   { $$ = ast_own("ImportAlias", $1);
+                                       ast_add($$, ast_own("Name", $3)); }
     ;
 
 elseif_list
