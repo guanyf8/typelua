@@ -65,12 +65,23 @@
 //!
 //! 父类同理不占关键字：`class B : A` 用的是单字符 `':'`（第四次复用 —— 另三处是
 //! 类型标注 `x:T`、方法调用 `a:f()`、funcname 的 `A:m`，四处上下文不相交）。
+//! 第五次是 `typeparam` 的形参上界 `<T: number>`，它在 `'<' '>'` 内部，
+//! 和父类槽的 `':'` 分属两个不同状态，`class A<T: number> : B {}` 不歧义。
 //! 纯替换：状态 337、产生式 183 都不变，只是少了 `EXTENDS` 终结符（符号 126→125）。
 //! `extends` 因此被释放回普通标识符，**必须同时从 type_def.rs 的 reserved! 里删掉** ——
 //! adapter.rs 的 RESERVED_COL 会对它调 symbol_col()，终结符没了就 const panic。
 //! 标签仍叫 `@ClassDeclExtends`：它描述的是继承关系，不是那个已消失的关键字。
 //!
-//! 父类槽只收一个裸 NAME，即单实现继承 —— 继承图是一棵树，菱形不可能出现。
+//! 父类槽收的是 `extendtype`（`NAME` 或 `NAME '<' typeargs '>'`），仍是单实现
+//! 继承 —— 继承图是一棵树，菱形不可能出现。开泛型实参是为了让
+//!     class NamedBox<T> : Box<T>      -- 实参透传
+//!     class IntBox      : Box<number> -- 实参固定
+//!     class Flipped<A,B>: Pair<B, A>  -- 实参重排
+//! 三种形态都能写出来。不能直接拿 `basictype` 当父类槽：它的
+//! `'{' classfieldlist '}'` 会和紧跟在后面的 classbody 撞成移进冲突。
+//! `extendtype : NAME` 无标签单孩子，命中 parser.rs 的折叠，所以
+//! `class B : A` 的 AST 跟加这个非终结符之前逐节点相同（实测 16 节点 / 深 6）。
+//! `@GenericType` 直接复用类型位那个，标签数零新增。
 //! ---
 //!
 //! 归约-归约冲突在宏里是 panic，所以这个文件能编译就等价于「typelua 文法是
@@ -91,8 +102,20 @@
 //! 它的 `exp` 是扁平的；但 bison 对两者都默认移进，结果与本文法一致。
 //!
 //! 表里没有导出冲突数，所以这条守不住 —— 加了新语法要手动重量一遍。
-//! 规模基线（337 状态 / 126 符号（65 终结符）/ 183 产生式 / 80 标签，其中 117 条
-//! 产生式贴了标签、66 条透传）同理，见 helper.md。
+//! 规模基线由 `cargo test parser::tests::grammar_size_report -- --nocapture` 报数，
+//! 当前实测 **362 状态 / 134 符号（66 终结符）/ 198 产生式 / 72 标签**，其中 125 条
+//! 产生式贴了标签、73 条透传。helper.md 里那份 337/126/183/80 是更早的快照，已被
+//! 后续语法赶过，以测量值为准。extendtype 贡献：+4 状态 / +1 符号 / +2 产生式 /
+//! +0 标签；typeparam 贡献：+3 状态 / +1 符号 / +2 产生式 / +1 标签。
+//! classfields 那两条贡献：-0 状态 / -0 符号 / -0 产生式 / **-2 标签** —— 单元素那条
+//! 撤掉 `@ClassFieldsFirst` 恢复折叠，左递归那条并入 `@ListTail`。只改标签不改
+//! 产生式，所以只动 RULE_PROD，自动机一个字节都不变。
+//! intertype 贡献：+3 状态 / +1 符号 / +2 产生式 / +1 标签，**终结符 0 新增** ——
+//! `'&'` 本来就在（`band_exp` 的按位与），跟 `'|'` 一样是类型位与值位共用一个记号。
+//! 它的冲突数没重测（没工具），但 `as` 后的 '&' 不可能出冲突：阶梯里 cast_exp
+//! 在 band_exp 之上，强转结果当不了按位与的左操作数 —— 和 `x as A|nil` 同理。
+//! 两侧行为各有一条形状断言盯着（intersect_after_as_cast /
+//! band_in_value_position_still_parses）。
 
 
 grammar::grammar! {
@@ -136,11 +159,11 @@ grammar::grammar! {
         | FOR decllist IN explist DO block END @ForIn
     
         | FUNCTION funcname funcbody     @FuncDecl
-        | LOCAL FUNCTION NAME funcbody   @LocalFuncDecl
+        | LOCAL FUNCTION NAME funcbody   @FuncDecl
         | LOCAL decllist                 @LocalDecl
         | LOCAL decllist '=' explist     @LocalDeclInit
         | optpub CLASS NAME generics classbody         @ClassDecl
-        | optpub CLASS NAME generics ':' NAME classbody @ClassDeclExtends
+        | optpub CLASS NAME generics ':' extendtype classbody @ClassDeclExtends
         | optpub TYPEDEF NAME generics '=' type        @TypeDef
         | IMPORT '{' importlist '}' IN STRING          @Import
     
@@ -190,7 +213,7 @@ grammar::grammar! {
     
     dotted_name
         : NAME
-        | dotted_name '.' NAME
+        | dotted_name '.' NAME           @DottedName
         ;
     
     varlist
@@ -218,8 +241,18 @@ grammar::grammar! {
         ;
     
     typeparams
+        : typeparam
+        | typeparams ',' typeparam       @ListTail
+        ;
+    
+    typeparam                            
         : NAME
-        | typeparams ',' NAME            @ListTail
+        | NAME ':' type                  @TypeParamBound
+        ;
+    
+    extendtype                          
+        : NAME
+        | NAME '<' typeargs '>'          @GenericType
         ;
     
     type
@@ -228,8 +261,13 @@ grammar::grammar! {
         ;
     
     uniontype
+        : intertype
+        | uniontype '|' intertype        @Union
+        ;
+    
+    intertype                            /* 交类型：形状合并。比 '|' 紧，`A & B | C` = `(A&B) | C` */
         : basictype
-        | uniontype '|' basictype        @Union
+        | intertype '&' basictype        @Intersect
         ;
     
     basictype
@@ -237,7 +275,7 @@ grammar::grammar! {
         | NIL                            /* nil type */
         | NAME '<' typeargs '>'          @GenericType
     
-        | '(' type ')'                   /* grouping: (function()->A)|B */
+        | '(' type ')'                   /* grouping: (function()->A)|B */ @ParenType
         | '{' '}'                        /* 匿名 record */ @RecordEmpty
         | '{' classfieldlist '}'         /* 复用 classfieldlist：类型位只许声明形式 */ @Record
         ;
@@ -249,9 +287,9 @@ grammar::grammar! {
     
     functype                             /* 类型位的参数表：名字可省，故不能复用 parlist */
         : FUNCTION '(' ')'               @FuncType
-        | FUNCTION '(' ')' rettype       @FuncTypeRet
-        | FUNCTION '(' argtypes ')'      @FuncTypeParams
-        | FUNCTION '(' argtypes ')' rettype @FuncTypeParamsRet
+        | FUNCTION '(' ')' rettype       @FuncType
+        | FUNCTION '(' argtypes ')'      @FuncType
+        | FUNCTION '(' argtypes ')' rettype @FuncType
         ;
     
     argtypes
@@ -293,8 +331,8 @@ grammar::grammar! {
         ;
     
     classbody
-        : '{' '}'                        @ClassBodyEmpty
-        | '{' classfieldlist '}'         @ClassBodyFields
+        : '{' '}'                        @ClassBody
+        | '{' classfieldlist '}'         @ClassBody
         ;
     
     classfieldlist                       /* 允许尾随逗号；但分隔符只能是 ','：
@@ -305,9 +343,13 @@ grammar::grammar! {
         | classfields ','
         ;
     
-    classfields
-        : classfield                     @ClassFieldsFirst
-        | classfields ',' classfield     @ClassFieldsRest
+    classfields                          /* 单元素那条不贴标签：命中 parser.rs 的折叠，
+                                            脊底直接是 classfield 本身。贴了反而多一层壳，
+                                            还要 linter 的 spine() 专门剥它。
+                                            左递归那条就是 `list ',' elem`，和另外九条列表
+                                            逐字同形、处理也完全一样，所以共用 @ListTail */
+        : classfield
+        | classfields ',' classfield     @ListTail
         ;
     
     classfield                           /* 第一条是「无默认值」：checker 要求每一处
@@ -315,17 +357,17 @@ grammar::grammar! {
                                             后两条带默认值，字面量里可省。
                                             没有构造器，所以 init 在这里只是个普通方法名 */
         : NAME ':' type                  @FieldDecl
-        | NAME ':' type '=' exp          @FieldDeclInit
-        | NAME '=' exp                   @FieldInit
+        | NAME ':' type '=' exp          @FieldDecl
+        | NAME '=' exp                   @FieldDecl
         | methodsig                      @MethodDecl
         | methodsig block END            @MethodDef
         ;
     
     methodsig
         : NAME '(' ')'                        @MethodSig
-        | NAME '(' ')' rettype                @MethodSigRet
-        | NAME '(' parlist ')'                @MethodSigParams
-        | NAME '(' parlist ')' rettype        @MethodSigParamsRet
+        | NAME '(' ')' rettype                @MethodSig
+        | NAME '(' parlist ')'                @MethodSig
+        | NAME '(' parlist ')' rettype        @MethodSig
         ;
     
     explist
@@ -464,9 +506,9 @@ grammar::grammar! {
     
     funcbody
         : generics '(' ')' block END     @FuncBody
-        | generics '(' ')' rettype block END @FuncBodyRet
-        | generics '(' parlist ')' block END @FuncBodyParams
-        | generics '(' parlist ')' rettype block END @FuncBodyParamsRet
+        | generics '(' ')' rettype block END @FuncBody
+        | generics '(' parlist ')' block END @FuncBody
+        | generics '(' parlist ')' rettype block END @FuncBody
         ;
     
     parlist

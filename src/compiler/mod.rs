@@ -1,2 +1,2 @@
 mod linter;
-mod parser;
+mod emitter;
