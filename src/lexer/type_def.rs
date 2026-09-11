@@ -63,6 +63,7 @@ reserved! {
     AS       => "as",           // +TLUA：强转 + import 改名，两处共用
     PUB      => "pub",          // +TLUA：导出修饰，只贴在顶层 class / typedef 前
     IMPORT   => "import",       // +TLUA：类型导入，`import {A as B} in "mod"`
+    EXTERN   => "extern",       // +TLUA：宿主声明，`extern x: T`。只许顶层，由 checker 拦
     AND      => "and",
     BREAK    => "break",
     DO       => "do",

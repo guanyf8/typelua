@@ -1,5 +1,6 @@
 use super::types::*;
 use super::*;
+use crate::compiler::utils::string_literal;
 use crate::parser::ast::Tree;
 use crate::parser::parser::*;
 use crate::lexer::type_def::*;
@@ -22,6 +23,76 @@ impl Scope {
             type_names: HashMap::new(),
         }
     }
+}
+
+/// 表字面量里一个元素的三种去处。位置字段和动态键都成不了具名 `Field`
+/// （`Field.name` 要 `NameId`），但它们的键/值类型算得出来 —— 所以不能像
+/// 只能出 record 时那样一律丢掉，得分桶押给 `resolve_fields` 做聚合判定
+enum Elem {
+    /// 无键（`{1,2}`）或键是 number（`{[1]=v}` / `{[i]=v}`）—— 都是数组形态
+    Positional(TypeId),
+    /// 静态具名：NAME 键、字面量 string 键、类型位的 FieldDecl / 方法
+    Named(Field),
+    /// 动态键 `[k]=v`：k 既不是 number 也不是字面量 string
+    Dynamic { key: TypeId, val: TypeId },
+}
+
+/// 字段列表的两个来源。同一个 `resolve_fields` 服务两边，但重名的处理相反，
+/// 所以得把来源带下去：值位按 Lua 语义「后写覆盖先写」，类型位重名是笔误要报错
+#[derive(Clone, Copy, PartialEq)]
+enum FieldSite {
+    /// `'{' fieldlist '}'`，值位的表字面量
+    Literal,
+    /// `'{' classfieldlist '}'`，类型位的匿名 record
+    Record,
+}
+
+/// 元方法命中之后，结果类型怎么定
+#[derive(Clone, Copy)]
+enum MetaResult {
+    /// 算术、位运算、`..`：按「同类型运算」的约定返回操作数自己的类型
+    SameAsOperand,
+    /// 比较：`a < b` 无论走不走 `__lt` 结果都是 boolean，和操作数类型无关
+    Fixed,
+}
+
+/// 运算符 -> (元方法名, 结果怎么定)。`None` 表示这个运算符不查元表。
+///
+/// `-` 和 `~` 一元二元都有，而且元方法不同（`__sub`/`__unm`、`__bxor`/`__bnot`），
+/// 所以**必须**靠 arity 分开。原来那张一元二元合并的表两种都只出 NUMBER，掩盖了
+/// 这个区别，连注释都写着「一元和二元的 token 集不相交」—— 那句话对 `-` 和 `~` 不成立
+///
+/// 不查元表的几类：
+///   - `and`/`or`/`not`：Lua 没有对应元方法
+///   - `==`/`~=`：任意两个值都能比，`__eq` 只在两侧都是表且原始不等时才被咨询，
+///     结果照样是 boolean。要求它存在会把 `a == nil` 这种正常写法拦掉
+///   - `#`：Lua 里**任何表**都能取长度，不需要 `__len`（`__len` 只是用来改写默认行为）。
+///     要求它存在会把 `#arr` 判成错，是实打实的误报
+fn metamethod(op: &Token, unary: bool) -> Option<(&'static str, MetaResult)> {
+    use MetaResult::{Fixed, SameAsOperand};
+    let hit = match op {
+        // 一元的两个先拦，否则会被下面的二元同字符分支吃掉
+        Token::OPERATOR(OpType::SIMPLE('-')) if unary => ("__unm", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('~')) if unary => ("__bnot", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('+')) => ("__add", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('-')) => ("__sub", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('*')) => ("__mul", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('/')) => ("__div", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('%')) => ("__mod", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('^')) => ("__pow", SameAsOperand),
+        Token::OPERATOR(OpType::IDIV) => ("__idiv", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('&')) => ("__band", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('|')) => ("__bor", SameAsOperand),
+        Token::OPERATOR(OpType::SIMPLE('~')) => ("__bxor", SameAsOperand),
+        Token::OPERATOR(OpType::SHL) => ("__shl", SameAsOperand),
+        Token::OPERATOR(OpType::SHR) => ("__shr", SameAsOperand),
+        Token::OPERATOR(OpType::CONCAT) => ("__concat", SameAsOperand),
+        // `>` / `>=` 在 Lua 里是把操作数交换后走 `__lt` / `__le`，没有独立元方法
+        Token::OPERATOR(OpType::SIMPLE('<' | '>')) => ("__lt", Fixed),
+        Token::OPERATOR(OpType::LE | OpType::GE) => ("__le", Fixed),
+        _ => return None,
+    };
+    Some(hit)
 }
 
 pub struct TypeLinter<'a>{
@@ -143,8 +214,8 @@ impl<'a> TypeLinter<'a> {
     fn resolve_prod(&mut self, prod:&Prod, node_index:usize, log:&mut Vec<Logger>)->TypeId{
         match prod {
             // ---- 运算。参数是操作符 token 所在的孩子下标 ----
-            Prod::BinOp => self.resolve_operator(node_index, 1),
-            Prod::UnOp => self.resolve_operator(node_index, 0),
+            Prod::BinOp => self.resolve_operator(node_index, 1, log),
+            Prod::UnOp => self.resolve_operator(node_index, 0, log),
 
             // ARROW retspec
             // '(' multilist ')'
@@ -165,7 +236,8 @@ impl<'a> TypeLinter<'a> {
             // 表达式位的 `{}` 和类型位的 `{}` 是同一个东西，intern 后同一个 TypeId
             Prod::TableEmpty | Prod::RecordEmpty => self.session.type_arenas.record(vec![]),
             // 非空的那两个同理：`'{' fieldlist '}'` 与 `'{' classfieldlist '}'`
-            Prod::Table | Prod::Record => self.resolve_fields(node_index),
+            Prod::Table => self.resolve_fields(node_index, FieldSite::Literal, log),
+            Prod::Record => self.resolve_fields(node_index, FieldSite::Record, log),
 
             // ---- 类型位 ----
             Prod::FuncType => self.resolve_func_type(node_index),
@@ -214,6 +286,7 @@ impl<'a> TypeLinter<'a> {
             Prod::Return | Prod::ReturnVoid => { self.check_return(node_index, log); TypeId::UNKNOWN }
             Prod::LocalDecl => { self.check_local_decl(node_index, log); TypeId::UNKNOWN }
             Prod::LocalDeclInit => { self.check_local_decl_init(node_index, log); TypeId::UNKNOWN }
+            Prod::Extern => { self.check_extern(node_index, log); TypeId::UNKNOWN }
             Prod::ClassDecl => { self.check_class_decl(node_index, log); TypeId::UNKNOWN }
             Prod::ClassDeclExtends => { self.check_class_decl_extends(node_index, log); TypeId::UNKNOWN }
             Prod::TypeDef => { self.check_type_def(node_index, log); TypeId::UNKNOWN }
@@ -226,14 +299,19 @@ impl<'a> TypeLinter<'a> {
 
     // 表达式运算
     /// `op_child` 是操作符 token 所在的下标：BinOp 在中间（1）、UnOp 在最前（0）。
-    /// 一元和二元的 token 集不相交（`and`/`or`/`..` 不可能一元，`not`/`#` 不可能二元），
-    /// 所以两张表并成一张，prod 就不用传了
-    fn resolve_operator(&mut self, node_index: usize, op_child: usize) -> TypeId {
+    /// 它同时也是 arity —— `-` 和 `~` 一元二元同字符但元方法不同，得靠它分开。
+    ///
+    /// 两条路：操作数都是标量走内建结果（Lua 在 number/string 之间自动强转）；
+    /// 否则要求两侧**同类型**、且那个类型带对应元方法，然后返回同类型。
+    /// class 查 fields、table 查交进来的元表 record，两者是 `lookup_field` 的同一条路
+    fn resolve_operator(&mut self, node_index: usize, op_child: usize, log: &mut Vec<Logger>) -> TypeId {
         let op = self.ast.get_node(node_index).children[op_child];
+        let unary = op_child == 0;
         let NodeSyntax::Token(op_token) = self.ast.get_node(op).get_data() else {
             return TypeId::UNKNOWN;
         };
-        match op_token {
+        // 内建出口：操作数都是标量时的结果，也是不查元表那些运算符的唯一出口
+        let builtin = match op_token {
             Token::RESERVED(Reserved::AND | Reserved::OR | Reserved::NOT) => TypeId::BOOLEAN,
             Token::OPERATOR(OpType::EQ | OpType::NE | OpType::LE | OpType::GE) => TypeId::BOOLEAN,
             Token::OPERATOR(OpType::SIMPLE('<' | '>')) => TypeId::BOOLEAN,
@@ -243,7 +321,69 @@ impl<'a> TypeLinter<'a> {
             Token::OPERATOR(OpType::SHL | OpType::SHR) => TypeId::NUMBER,
             Token::OPERATOR(OpType::CONCAT) => TypeId::STRING,
             _ => TypeId::UNKNOWN,
+        };
+        let Some((mm, kind)) = metamethod(op_token, unary) else {
+            return builtin;
+        };
+        // 操作数位可能是多值（`f() + 1`），截到一个
+        let lhs = self.truncate_ret(self.pass_through(node_index, if unary { 1 } else { 0 }));
+        let span = self.ast.span_of(node_index);
+        let operand = if unary {
+            lhs
+        } else {
+            let rhs = self.truncate_ret(self.pass_through(node_index, 2));
+            // 两侧都是标量就不必同类型：`1 .. "a"`、`"2" * 3` 在 Lua 里都合法
+            if self.is_primitive_operand(lhs) && self.is_primitive_operand(rhs) {
+                return builtin;
+            }
+            if lhs != rhs {
+                log.push(Logger {
+                    span,
+                    msg: format!(
+                        "{} 运算要求两侧同类型，实际是 {} 和 {}",
+                        mm,
+                        self.session.show(lhs),
+                        self.session.show(rhs)
+                    ),
+                });
+                return TypeId::UNKNOWN;
+            }
+            lhs
+        };
+        if self.is_primitive_operand(operand) {
+            return builtin;
         }
+        // class 走 Ref 进 fields（带 extends 链）、`table<K,V> & {__add:...}` 走 Intersect
+        // 逐成员查 —— 用户要的「class 看 field」和「table 看元表」在 lookup_field 里是
+        // 同一条路，不用分开写
+        let name = self.session.names.intern(mm);
+        if self.lookup_field(operand, name).is_none() {
+            log.push(Logger {
+                span,
+                msg: format!(
+                    "{} 上没有 {} 元方法，不支持这个运算",
+                    self.session.show(operand),
+                    mm
+                ),
+            });
+            // 给 UNKNOWN 而不是 builtin：这里已经报过一次，回落成 number 会让后面
+            // 拿着一个假类型继续算，错报到别处去
+            return TypeId::UNKNOWN;
+        }
+        match kind {
+            MetaResult::SameAsOperand => operand,
+            MetaResult::Fixed => builtin,
+        }
+    }
+
+    /// 不查元表就能算的操作数。number/string 之间 Lua 的算术和 `..` 会自动强转；
+    /// any/unknown 是渐进类型的逃逸口；Generic 要等实例化才知道有没有元方法。
+    /// 和 `expect_key` 同一个尺度：宁可漏报，也不在类型信息还不全的阶段刷误报
+    fn is_primitive_operand(&self, ty: TypeId) -> bool {
+        matches!(
+            ty,
+            TypeId::NUMBER | TypeId::STRING | TypeId::ANY | TypeId::UNKNOWN
+        ) || matches!(self.session.type_arenas.get_type(ty), Types::Generic(_))
     }
 
     //todo Lua 的括号会把多值截成一个值（`(f())` 只留第一个），所以不能简单
@@ -391,22 +531,163 @@ impl<'a> TypeLinter<'a> {
 
     // 表构造
     /// `'{' fieldlist '}'`（表字面量）与 `'{' classfieldlist '}'`（类型位的匿名 record）。
-    /// 两边走的是不同的列表非终结符，但形状和终点一样 —— 摊脊取元素、逐个收成
-    /// 字段、intern 成 record。区别全在「元素怎么变成 Field」，交给 collect_field
-    fn resolve_fields(&mut self, node_index: usize) -> TypeId {
+    /// 两边走的是不同的列表非终结符，但形状和终点一样 —— 摊脊取元素、逐个分类。
+    ///
+    /// 出口不止 record 一种。三个桶各自成型、非空的交起来，塌不塌只看一条判据：
+    /// **键空间重不重叠**。
+    ///   - `array<T>` 的键是 number，`record` 的键是它列出的那几个字符串 —— 不重叠，
+    ///     所以 `{1, x=2}` 出 `array<number> & record{x:number}`，两条投影都通：
+    ///     `[i]` 走 as_array 扫交成员，`.x` 走 lookup_field
+    ///   - `array<T>` 和 `table<K,V>` 在 K 含 number 时重叠，两边都能被 number 索，
+    ///     交出来 as_array / as_map 都命中、`t[i]` 取谁没有说法 —— 所以这一对得合成
+    ///     一个 `table<number|K, V>`，位置元素的类型并进 V
+    ///   - record 一律**不**参与塌。塌下去就得往键里掺 `string`，那等于声称「任意
+    ///     string 键都给 V」，可 `{1, x=2}` 里 `t["y"]` 在 Lua 里是 nil 而不是 V ——
+    ///     那不只是变糊，是凭空发明一个不成立的许诺
+    ///
+    /// 于是七种组合都由这一条规则导出：单桶各出自己那种（类型位的匿名 record 永远
+    /// 走 record，因为 classfield 四种形式全是静态的）；`record & table`（动机 A）；
+    /// `array & record`；`table<number|K,V>`；`record & table<number|K,V>`
+    fn resolve_fields(&mut self, node_index: usize, site: FieldSite, log: &mut Vec<Logger>) -> TypeId {
         let list = self.ast.get_node(node_index).children[1];
-        let mut fields = Vec::new();
+        // 具名字段带上元素节点：重名诊断要报到出问题的那一项上，而不是整个表
+        let mut named: Vec<(Field, usize)> = Vec::new();
+        let mut positional = Vec::new();
+        let mut dyn_keys = Vec::new();
+        let mut dyn_vals = Vec::new();
         for item in self.spine(list) {
-            if let Some(f) = self.collect_field(item) {
-                fields.push(f);
-            }else {
-                let spine_node = self.ast.get_node(item);
+            match self.classify_field(item) {
+                Elem::Named(f) => named.push((f, item)),
+                Elem::Positional(ty) => positional.push(ty),
+                Elem::Dynamic { key, val } => {
+                    dyn_keys.push(key);
+                    dyn_vals.push(val);
+                }
             }
         }
-        self.session.type_arenas.record(fields)
+        let fields = self.dedup_named(named, site, log);
+        let mut parts = Vec::with_capacity(2);
+        if !fields.is_empty() {
+            parts.push(self.session.type_arenas.record(fields));
+        }
+        match (!positional.is_empty(), !dyn_keys.is_empty()) {
+            // 键空间重叠的那一对：number 进键，位置元素的类型并进值
+            (true, true) => {
+                let mut keys = vec![TypeId::NUMBER];
+                keys.extend(dyn_keys);
+                let mut vals = positional;
+                vals.extend(dyn_vals);
+                let k = self.session.type_arenas.union(keys);
+                let v = self.session.type_arenas.union(vals);
+                let tab = self.table_of(k, v);
+                parts.push(tab);
+            }
+            (true, false) => {
+                let elem = self.session.type_arenas.union(positional);
+                let arr = self.array_of(elem);
+                parts.push(arr);
+            }
+            (false, true) => {
+                let k = self.session.type_arenas.union(dyn_keys);
+                let v = self.session.type_arenas.union(dyn_vals);
+                let tab = self.table_of(k, v);
+                parts.push(tab);
+            }
+            (false, false) => {}
+        }
+        // 三桶全空由 @TableEmpty / @RecordEmpty 接走，正常到不了。真到了必须显式给空
+        // record：intersect(vec![]) 返回的是 ANY，会把「空表」悄悄放成「什么都行」
+        if parts.is_empty() {
+            return self.session.type_arenas.record(vec![]);
+        }
+        // intersect() 不展开 Ref，所以 record 和容器就地留成两个成员；单成员时它自己
+        // 折叠掉（`1 => rest[0]`），所以只有一个桶非空的情况不用特判
+        self.session.type_arenas.intersect(parts)
     }
 
-    /// 列表的一项 -> record 字段。进不了 record 的返回 None。
+    /// 重名字段归一。必须在 `record()` 之前做掉：`intern_fields` 的 dedup 是为哈希
+    /// 一致性服务的（`{a:number, a:number}` 得和 `{a:number}` 同一个 TypeId），它保留
+    /// 第一个，正好和 Lua 相反。所以语义这一层得自己定：
+    ///   - 值位（`{a=1, a=2}`）：Lua 是后写覆盖先写，取最后一个，不报错
+    ///   - 类型位（`{a:number, a:string}`）：没有「覆盖」这回事，重名就是笔误，报错。
+    ///     报完同样取最后一个继续往下跑 —— 不因为一个笔误连带出一串假错
+    fn dedup_named(
+        &self,
+        named: Vec<(Field, usize)>,
+        site: FieldSite,
+        log: &mut Vec<Logger>,
+    ) -> Vec<Field> {
+        let mut at: HashMap<NameId, usize> = HashMap::new();
+        let mut out: Vec<Field> = Vec::new();
+        for (f, item) in named {
+            match at.get(&f.name) {
+                Some(&i) => {
+                    if site == FieldSite::Record {
+                        log.push(Logger {
+                            span: self.ast.span_of(item),
+                            msg: format!(
+                                "字段 {} 重复声明",
+                                self.session.names.resolve(f.name)
+                            ),
+                        });
+                    }
+                    out[i] = f;
+                }
+                None => {
+                    at.insert(f.name, out.len());
+                    out.push(f);
+                }
+            }
+        }
+        out
+    }
+
+    /// 元素节点 -> 三种去处。`@FieldKV` 要按**键**再分一次：字面量 string 键算静态
+    /// 具名（交回 collect_field）、number 键算数组形态、其余才是动态键。
+    /// 按键的**类型**而不是字面量判 number，所以 `{[1]=v}` 和 `{[i]=v}`（i:number）同归一类。
+    ///
+    /// collect_field 给 None 的就当位置字段：文法上 fields 侧剩下的只有裸 exp（单元素
+    /// 那条被折叠所以没标签），classfields 侧四种形式 collect_field 全接得住
+    fn classify_field(&mut self, node: usize) -> Elem {
+        if let NodeSyntax::Prod(Some(Prod::FieldKV)) = self.ast.get_node(node).get_data() {
+            let key_node = self.ast.get_node(node).children[1];
+            let literal_name = matches!(
+                self.ast.get_node(key_node).get_data(),
+                NodeSyntax::Token(Token::STRING(_))
+            );
+            if !literal_name {
+                // '[' exp ']' '=' exp：键在 1、值在 4
+                let key = self.child_type(key_node);
+                let val = self.pass_through(node, 4);
+                if key == TypeId::NUMBER {
+                    return Elem::Positional(val);
+                }
+                return Elem::Dynamic { key, val };
+            }
+        }
+        match self.collect_field(node) {
+            Some(f) => Elem::Named(f),
+            None => Elem::Positional(self.child_type(node)),
+        }
+    }
+
+    /// `array<T>`。内建 decl 已在 register_builtins 里占了 DeclId::ARRAY，直接拿它造 Ref：
+    /// 不走 lookup_type —— 字面量推断不应该被用户自己声明的同名 `array` 遮蔽掉
+    fn array_of(&mut self, elem: TypeId) -> TypeId {
+        let args = self.session.type_arenas.intern_list(vec![elem], None);
+        self.session.type_arenas.reference(DeclId::ARRAY, args)
+    }
+
+    /// `table<K,V>`，同上
+    fn table_of(&mut self, key: TypeId, val: TypeId) -> TypeId {
+        let args = self.session.type_arenas.intern_list(vec![key, val], None);
+        self.session.type_arenas.reference(DeclId::TABLE, args)
+    }
+
+    /// 列表的一项 -> record 字段。返回 None **只**表示「这不是一个具名字段」（动态键，
+    /// 或无标签的裸 exp 位置字段），classify_field 靠这个约定把 None 归给位置桶。
+    /// 所以名字取不到一律 panic 而不是返回 None —— 文法保证那几处就是 NAME，
+    /// 静静返回 None 会把一个畸形的具名字段误标成数组元素，比当场炸难查得多
     ///
     /// 按**元素**标签 dispatch 而不是按父产生式，因为两侧的元素标签集不相交：
     /// fields 只出 @FieldNamed / @FieldKV / 裸 exp，classfields 只出 @FieldDecl /
@@ -415,13 +696,13 @@ impl<'a> TypeLinter<'a> {
     /// match 没有死分支，也不会让类型位放进本该被文法拦掉的形式
     fn collect_field(&mut self, node: usize) -> Option<Field> {
         match self.ast.get_node(node).get_data() {
-            // NAME '=' exp：类型从 exp 推（@FieldNamed 已经把 children[2] 透上来）
+            // NAME '=' exp：类型从 exp 推（@FieldNamed 已经把 children[2] 透上来了）
             NodeSyntax::Prod(Some(Prod::FieldNamed)) => {
                 let name_node = self.ast.get_node(node).children[0];
                 let ty = self.child_type(node);
                 let NodeSyntax::Token(Token::NAME(n)) = self.ast.get_node(name_node).get_data()
                 else {
-                    return None;
+                    panic!("field name must be identifier");
                 };
                 let name = self.session.names.intern(n);
                 // default 说的是**声明**有没有默认值，字面量里没这个概念。必须填 false：
@@ -431,17 +712,17 @@ impl<'a> TypeLinter<'a> {
             }
             NodeSyntax::Prod(Some(Prod::FieldDecl)) => Some(self.collect_field_decl(node)),
             NodeSyntax::Prod(Some(Prod::FieldKV)) => {
-                let children = self.ast.get_node(node).children[1];
-                let node = self.ast.get_node(children);
-                match node.get_data() {
-                    NodeSyntax::Token(Token::STRING(s)) => {
-                        // s strip掉前后引号
-                        let s_content = &s[1..s.len() - 1];
-                        Some(Field {
-                        name: self.session.names.intern(s_content),
-                        ty: self.child_type(children),
+                // '[' exp ']' '=' exp：键在 children[1]、值在 children[4]
+                let key_node = self.ast.get_node(node).children[1];
+                match self.ast.get_node(key_node).get_data() {
+                    // 字面量 string 键就是个静态字段名，和 `NAME = exp` 等价
+                    NodeSyntax::Token(Token::STRING(s)) => Some(Field {
+                        name: self.session.names.intern(&string_literal(s)),
+                        // 字段类型取**值**。取键节点的类型是错的 —— 字面量 string 键
+                        // 的类型恒为 string，`{["a"] = 5}` 会推成 `a: string`
+                        ty: self.pass_through(node, 4),
                         default: false,
-                    })},
+                    }),
                     //动态字段：键不是字面量（`[k] = v`），没有静态名字就成不了具名
                     // Field，所以不给 record 贡献字段、直接跳过。检测是上层的事
                     _ => None,
@@ -452,7 +733,7 @@ impl<'a> TypeLinter<'a> {
                 let name_node = self.ast.get_node(sig).children[0];
                 let NodeSyntax::Token(Token::NAME(n)) = self.ast.get_node(name_node).get_data()
                 else {
-                    return None;
+                    panic!("method name must be identifier");
                 };
                 let name = self.session.names.intern(n);
                 let ty = self.pass_through(node, 0);
@@ -613,7 +894,9 @@ impl<'a> TypeLinter<'a> {
         let children = self.ast.get_node(node_index).children.clone();
         let name = match self.ast.get_node(children[0]).get_data() {
             NodeSyntax::Token(Token::NAME(n)) => self.session.names.intern(n),
-            _ => self.session.names.intern(""),
+            // 文法保证是 NAME。原来回退成 intern("") 会让多个畸形字段 dedup 成一个，
+            // 比直接炸难查；和 resolve_generic_type / resolve_method_call 对齐
+            _ => panic!("field name must be identifier"),
         };
         // 三条产生式共用 @FieldDecl，孩子数分不开（第一、三条都是 3 个），
         // 得看 children[1] 是 ':' 还是 '='：
@@ -734,6 +1017,8 @@ impl<'a> TypeLinter<'a> {
     fn check_local_decl(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
     }
     fn check_local_decl_init(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
+    }
+    fn check_extern(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
     }
     fn check_class_decl(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
     }

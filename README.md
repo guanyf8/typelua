@@ -9,6 +9,8 @@ typedef Result  = A|B|nil                               -- 联合类型
 typedef Config  = {host:string, port:number}            -- record
 typedef Node    = {value:number, next:Node|nil}         -- 允许递归
 typedef Pair<A, B> = {first:A, second:B}                -- 泛型
+typedef Bounded<T:number> = {v:T}                       -- 形参上界
+typedef Meta = {VERSION:number} & table<string, any>    -- 交类型：形状合并
 typedef Logger  = {                                     -- 描述外部已存在的表的形状
     log(...string),
     system_os() -> number,
@@ -56,13 +58,25 @@ local a = "hello"                                       -- 能推断的不必标
 -- local n:number                                       -- 不允许：它实际是 nil，要写 number|nil
 local p:{x:number, y:number} = {x = 1, y = 2}           -- 匿名 record
 local pr:Pair<string, number> = {first = "a", second = 1}
-local xs:array<string> = {}
-local t:table<string, any> = {}                         -- 无初始化只对 record 型开放，这里给个初值
 local h:Handler = function(evt:string) end
-local E:Result
-local _mytype:Logger                                    -- C 层注册的：record 类型可以只声明不赋值
+local E:Result                                          -- OK：Result 含 nil，无初值就是 nil
+
+-- 空表 {} 推不出形状，所以必须标注，且标注得是「能空着的类型」
+local xs:array<string> = {}                             -- 集合：元素后加
+local t:table<string, any> = {}                         -- 映射：键后加
+-- local m = {}                                         -- 不允许：{} 推不出形状
+-- local r:Config = {}                                  -- 不允许：host/port 是非空字段，没给
+-- local _mytype:Logger                                 -- 不允许：record 也不许只声明不赋值
+local _mytype = _G.logger as Logger                     -- 已有表达式来源时用 as 落地
+
+-- 宿主（C 层）注入的全局用 extern 声明：只说形状，不核实存在性，零代码生成
+extern my_global:Logger                                 -- 之后 my_global.log(...) 照常查类型
+extern c_alloc:function(number) -> any
+my_global = _G.other as Logger                          -- 可以赋值，但类型不能背叛声明
 
 G_config:Config = {host = "127.0.0.1", port = 80}       -- 全局变量也能标注
+-- G_cache = {}                                         -- 不允许：全局裸赋值同一条规则
+G_cache:table<string, Config> = {}
 
 -- ========================= Functions =========================
 -- 具名局部函数，参数带类型、含函数类型参数（可写裸类型），单返回值
@@ -97,6 +111,40 @@ if s ~= nil then print(#s) end                          -- nil 收窄，这里 s
 local raw  = require("cjson")                           -- 推断为 any
 local json = raw as {encode:function(any) -> string}    -- 用 as 落地
 ```
+
+表的形状一次定死
+
+四条规则（推翻了早期「先声明再逐项注入」那一版）：
+  - `{}` 推不出形状，所以**空表字面量必须有标注**：`local a = {}` 和全局裸 `a = {}`
+    都拒。非空字面量不受此限，它自己能定形。
+  - 标注得是「能空着的类型」：`array<T>` / `table<K,V>`（元素、键后加）或空 record `{}`
+    （终态，永远没有字段）。带非空字段的 record / class 拿 `{}` 初始化是错的 ——
+    字段没给，和 `A{}` 少字段是同一条诊断。
+  - **不存在「先声明再逐项注入字段」**：record 一旦定形就长不出新成员，
+    `local M:{} = {}` 之后 `M.VERSION = 1` 报「`{}` 上没有字段 VERSION」。模块表要么一次
+    写全成一个完整字面量，要么用 `table<K,V>`，要么两者交起来：
+    `typedef Mod = {VERSION:number} & table<string, function() -> ()>`。
+  - 同理，无初值的 `local x:T` 要求 T 容得下 nil（`local E:Result` 行，`local n:number`
+    不行）—— record 不再是例外。描述外部已存在的东西有两条路：手里已经有表达式来源时
+    用 `as`（`_G.logger as Logger`）；宿主注入的全局用 `extern`（见下节）。
+
+不管辖的：`a.b = {}` / `a[1] = {}`。它们的类型由所属 record / 集合定，而且文法本来就
+只许把标注贴在裸 Name 上。
+
+宿主声明 extern
+
+FFI 是 Lua 的本职，所以宿主（C 层）注入的全局得能在 TypeLua 里声明出来，而不是只能靠
+`_G.x as T` 绕。形态就一条语句：`extern Name ‘:’ type`。五条规则：
+  - **只能在顶层**。和普通全局变量一样由 checker 拦 —— 文法层做不到：把带标注的赋值拆出
+    一份顶层专用版会和 `var ::= prefixexp [optype]` 撞出 reduce/reduce（`optype` 可空，
+    两条路推出同一个串），实测过。
+  - **不核实存在性**。编译器不去证明这个全局真的被注入了，那是宿主的责任，和 `as` 同一个
+    信任模型。但类型名本身要能解析：`extern x:NoSuchType` 是笔误，报错。
+  - **不 pub**。它声明的是变量本身而不是类型，动态对象不参与导出；`pub extern` 是语法错
+    （产生式里没给 optpub 槽）。这一条不靠检查，靠文法保证。
+  - **零代码生成**。它只往类型环境里写一条，抹除后一个字不剩 —— 这是它和
+    `local x = _G.x as T`（生成一行真赋值）的本质区别。
+  - **可以赋值**，覆盖那个全局；但类型不能背叛声明，赋值走和带标注全局同一条兼容性检查。
 
 跨文件/跨模块
 
@@ -177,10 +225,11 @@ stat ::=  ‘;’ |                                                        (~Lua
      function funcname funcbody |
      local function Name funcbody |
      local decllist [‘=’ explist] |             -- (~Lua) namelist -> decllist
-     [pub] class Name [generics] [‘:’ Name] classbody |
+     [pub] class Name [generics] [‘:’ extendtype] classbody |
                                                -- (+TLUA) 类声明；pub = 跨文件可见
      [pub] typedef Name [generics] ‘=’ type |   -- (+TLUA) 类型声明；pub 同上
-     import ‘{’ importlist ‘}’ in LiteralString -- (+TLUA) 类型导入
+     import ‘{’ importlist ‘}’ in LiteralString | -- (+TLUA) 类型导入
+     extern Name ‘:’ type                       -- (+TLUA) 宿主声明；只顶层，checker 拦
 
 retstat ::= return [explist] [‘;’]                                     (=Lua)
 
@@ -240,15 +289,25 @@ decllist ::= Name [‘:’ type] {‘,’ Name [‘:’ type]}
 
 -- ---- 泛型形参 ----
 generics   ::= ‘<’ typeparams ‘>’
-typeparams ::= Name {‘,’ Name}
+typeparams ::= typeparam {‘,’ typeparam}
+typeparam  ::= Name | Name ‘:’ type          -- 上界；与 `class B : A` 同一个符号
+     -- 上界里的 ‘:’ 是 ‘:’ 的第五次复用，它在 ‘<’ ‘>’ 内部，和父类槽那个
+     -- 分属两个状态，`class A<T: number> : B {}` 不歧义（实测零新冲突）。
      -- 泛型是真检查、不是只擦除。显式类型实参只能用 turbofish `::<>`，
      -- 不能用裸 `<>` —— 后者在表达式位置和比较运算真冲突，LALR(1) 分不开
      -- （TS 是靠手写 parser 回溯才勉强做到的）。
 
+extendtype ::= Name | Name ‘<’ typeargs ‘>’   -- 父类槽：可开泛型实参
+
 -- ---- 类型系统 ----
 type      ::= uniontype
             | functype
-uniontype ::= basictype {‘|’ basictype}       -- 联合类型（左结合、扁平化）
+uniontype ::= intertype {‘|’ intertype}       -- 联合类型（左结合、扁平化）
+intertype ::= basictype {‘&’ basictype}       -- 交类型：形状合并，比 ‘|’ 紧
+     -- `A & B | C` 就是 `(A&B) | C`。‘&’ 不新增词法记号 —— 它本来就是 Lua 的按位与，
+     -- 和 ‘|’ 一样是类型位与值位共用一个记号（两边分得开：`as` 绑最松）。
+     -- 主用途是「带具名字段的集合」：`{VERSION:number} & table<string, any>`，
+     -- 以及给集合接元表：`table<K,V> & {__add:function(T, T) -> T}`。
 basictype ::= Name
             | nil                            -- nil 类型（用于可空/联合）
             | Name ‘<’ typeargs ‘>’          -- 泛型（支持任意嵌套）
@@ -302,29 +361,40 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
      -- 那条（Lua 自带的 `f{…}` 糖），归约出来的节点和函数调用完全一样，由 checker
      -- 看 prefixexp 是不是类名来区分「构造实例」和「拿一张表去调函数」。
      -- 子类字面量直接把父类的非空字段一起写出来，没有构造链、不需要 super。
+     -- 同一条原则往下推到普通表：`{}` 推不出形状，所以空表字面量必须带标注，
+     -- 而且 record 一旦定形就长不出新成员（详见上面「表的形状一次定死」）。
      --
      -- 【父类为什么用 ‘:’ 而不是 extends 关键字】‘:’ 已经在这门语言里表示「有此
      -- 类型」（`x:T`），而 class 就是它的 record 形状，所以「B 是一个 A」是同一个
-     -- 关系，写 `class B : A` 自洽。实测是纯替换：状态 337 不变、产生式 183 不变，
-     -- 只少一个终结符，移进-归约冲突仍是 ‘(’ 上那两个（bison 版仍是 4 个）。
+     -- 关系，写 `class B : A` 自洽。当时实测是纯替换：状态数、产生式数不变，
+     -- 只少一个终结符，移进-归约冲突仍是 ‘(’ 上那两个。
      -- 换来的是 extends 被释放回普通标识符 —— `local extends = 1`、`t:extends()`
      -- 都合法，这对一门要和现存 Lua 代码共处的语言是实收益。
-     -- 连带好处：将来加泛型约束就写 `<T : Cmp>`（实测同样零新冲突），不必为它
+     -- 连带好处：泛型形参上界直接写 `<T : Cmp>`（已落地，实测零新冲突），不必为它
      -- 单独留一个关键字；否则 extends 的唯一残留用途就只是那个。
-     -- 代价是 ‘:’ 第四次复用（类型标注 / 方法调用 / funcname / 继承），且
+     -- 代价是 ‘:’ 反复复用（类型标注 / 方法调用 / funcname / 继承 / 形参上界，共五处），且
      -- `class B : A{` 和类字面量 `A{…}` 形似 —— 建议写成 `class B : A {`。
      --
-     -- 父类槽只收一个裸 Name：**单实现继承**，所以继承图是一棵树，菱形不可能出现。
-     -- 多重「符合某形状」不走这里 —— record 是结构类型，形状对得上就能赋值过去，
-     -- 本来就不需要声明。若将来要 `: A, IFoo` 的列表，实测再 +3 状态 +2 产生式。
+     -- 父类槽只收一个 extendtype（`A` 或 `A<…>`）：**单实现继承**，所以继承图是一棵树，
+     -- 菱形不可能出现。开泛型实参是为了让三种形态都能写：
+     --     class NamedBox<T> : Box<T>      -- 实参透传
+     --     class IntBox      : Box<number> -- 实参固定
+     --     class Flipped<A,B>: Pair<B, A>  -- 实参重排
+     -- 不能直接拿 basictype 当父类槽：它的 ‘{’ classfieldlist ‘}’ 会和紧跟在后面的
+     -- classbody 撞成移进冲突。多重「符合某形状」也不走这里 —— record 是结构类型，
+     -- 形状对得上就能赋值过去，本来就不需要声明。若将来要 `: A, IFoo` 的列表，
+     -- 实测再 +3 状态 +2 产生式。
 
 -- ---- 新增词法记号 ----
+--   六个关键字（class / typedef / as / pub / import / extern）+ 两个符号（‘->’ / ‘::<’）。
+--   交类型的 ‘&’ 、联合的 ‘|’ 、上界与继承的 ‘:’ 全是复用，零新增记号。
 --   class     关键字
 --   typedef   关键字（不用 type：`type(x)` 是 Lua 标准库函数，不能被夺走）
 --   as        关键字（强转 + import 改名，两处共用）
 --   pub       关键字（导出修饰；实测某 SDK 里仅 1 处 `params.pub` 字段位冲突）
 --   import    关键字（类型导入；该 SDK 里 71 处冲突全在 `t.import` 字段位，
 --             故建议一并放开「保留字可出现在 ‘.’ 后与表键位」，那条能一次救回全部）
+--   extern    关键字（宿主声明；只能在顶层，由 checker 拦。见上面「宿主声明 extern」一节）
 --   ‘->’      返回类型箭头
 --   ‘::<’     turbofish；三字符必须紧邻，`map:: <T>` 会被词法成 ‘::’ + ‘<’。
 --             合法 Lua 里 ‘::’ 后必然跟 Name，所以 ‘::<’ 从不出现，最大匹配安全
@@ -332,7 +402,9 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
 --           贪婪匹配出的 ‘>>’ 和 ‘>=’ 都会被拆回单个 ‘>’：
 --             ‘>>’ → ‘>’ ‘>’   嵌套泛型闭合，如 map<string, list<number>>
 --             ‘>=’ → ‘>’ ‘=’   闭合紧跟赋值，如 local t:table<string,any>=init()
---           三连 ‘>>=’（如 local x:T<U<V>>=t）由两条规则接力拆成 ‘>’ ‘>’ ‘=’。
+--           拆分是逐个记号做的，所以连着多层也成：‘>>=’（`local x:T<U<V>>=t`）拆成
+--           ‘>’ ‘>’ ‘=’；四层嵌套 `Pair<array<number>, table<string, array<Pair<number,
+--           string>>>>` 的尾巴同理。两份实现都实测过。
 --           拆分位置二选一：flex 版由 lexer 依 generic_depth 反馈拆分（见 ## lex）；
 --           Rust 版 lexer 保持纯函数、统一产出 SHR/GE，由 parser 驱动层按 LALR
 --           状态拆分 —— 判据是「‘>’ 有动作而 SHR/GE 是 error」，不能用「是否在
@@ -369,6 +441,7 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
 "as"        { return AS; }         /* TLUA: cast keyword                 */
 "pub"       { return PUB; }        /* TLUA: 导出修饰符                   */
 "import"    { return IMPORT; }     /* TLUA: 类型导入                     */
+"extern"    { return EXTERN; }     /* TLUA: 宿主声明                     */
 "and"       { return AND; }
 "break"     { return BREAK; }
 "do"        { return DO; }
@@ -410,9 +483,12 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
 "//"        { return IDIV; }
 
 [-+*/%^#&~|<>=(){}\[\];:,.]   { return yytext[0]; }
-                                   /* ':' 兼四职：类型标注 `x:T`、方法调用 `a:f()`、
-                                      funcname 的 `A:m`、以及 TLUA 的继承 `class B : A`。
-                                      四处的上下文互不相交，LALR(1) 分得开（实测零新冲突） */
+                                   /* ':' 兼五职：类型标注 `x:T`、方法调用 `a:f()`、
+                                      funcname 的 `A:m`、TLUA 的继承 `class B : A`、
+                                      TLUA 的形参上界 `<T : Cmp>`。五处的上下文互不相交，
+                                      LALR(1) 分得开（实测零新冲突）。
+                                      '|' 和 '&' 同样两职：值位是按位或/与，类型位是联合/交。
+                                      词法不区分，交由文法分 —— 这也是 `as` 必须绑最松的原因 */
 
 .           { fprintf(stderr, "line %d: unexpected character '%s'\n", yylineno, yytext);
               return 0; }
@@ -421,6 +497,20 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
 
 ## grammar
 ```bison
+/* 这份是另一种编码：exp 扁平、靠 %left/%right 消解，而 src/parser/table.rs 里那份
+   是阶梯式的（cast_exp / or_exp / … / pow_exp）。同一门语言，两种写法。
+   实测（bison 2.3）：本扁平版 5 个 shift/reduce、0 个 reduce/reduce；
+   阶梯版 2 个 shift/reduce、0 个 reduce/reduce。多出来的三个全是 `as` 带的：
+     两个 Lua 自带的（两版共有）：`stat : prefixexp ·` / `exp : prefixexp ·` 遇 ‘(’
+     `basictype : NAME ·`      遇 ‘<’ —— `x as T<U>` 的 ‘<’ 也可以是比较
+     `type : uniontype ·`     遇 ‘|’ —— `x as A|B` 的 ‘|’ 也可以是按位或
+     `uniontype : intertype ·` 遇 ‘&’ —— `x as A&B` 的 ‘&’ 也可以是按位与
+   三者都落在没声明优先级的产生式上，优先级消解不介入，bison 一律默认移进，
+   结果与阶梯版一致（阶梯里 cast_exp 在最外层，强转结果当不了二元运算的左操作数，
+   那三个根本不存在）。两份都实测能解析 README 全部 sample 与 examples/*.tlua。
+   `extern`（宿主声明）已落地到 src/parser/table.rs；加上它两版冲突数均不变，
+   已实测（阶梯 2、扁平 5）。它只能出现在顶层这条靠 checker，不在本文法里。 */
+
 /* 运算符优先级：越靠后越紧。'as' 最松 —— `a + b as T` 是 `(a + b) as T`，
    这样 `x as A|nil` 里的 '|' 无歧义地归入类型，不必加括号 */
 %left AS
@@ -510,13 +600,15 @@ stat
                                      { $$ = ast_own("Class", $3);
                                        if ($3) ast_add($$, $3);
                                        ast_add($$, $4); }
-    | optpub CLASS NAME generics ':' NAME classbody
+    | optpub CLASS NAME generics ':' extendtype classbody
                                      { $$ = ast_own("Class", $3);
                                        if ($4) ast_add($$, $4);
                                        ast_add($$, ast_own("Extends", $6));
                                        ast_add($$, $6); }
-      /* 父类槽目前只收一个裸 NAME —— 单实现继承，所以继承图是一棵树，
-         菱形不可能出现。将来若要 `: A, IFoo` 的列表，实测再 +3 状态 +2 产生式。 */
+      /* 父类槽收 extendtype（`A` 或 `A<…>`）—— 单实现继承，所以继承图是一棵树，
+         菱形不可能出现。不能直接拿 basictype：它的 '{' classfieldlist '}' 会和紧跟在
+         后面的 classbody 撞成移进冲突。将来若要 `: A, IFoo` 的列表，实测再 +3 状态
+         +2 产生式。 */
     | optpub TYPEDEF NAME generics '=' type
                                      { $$ = ast_own("TypeDef", $3);
                                        if ($4) ast_add($$, $4);
@@ -524,6 +616,8 @@ stat
     | IMPORT '{' importlist '}' IN STRING
                                      { $$ = ast_new("Import");
                                        ast_add($$, $3); ast_add($$, ast_own("Module", $6)); }
+    | EXTERN NAME ':' type           /* 见上面「宿主声明 extern」一节 */
+                                     { $$ = ast_own("Extern", $2); ast_add($$, $4); }
     ;
 
 /* pub 做成可空前缀而不是复制一份产生式：class/typedef 各只保留一个标签，
@@ -625,10 +719,23 @@ generics
     ;
 
 typeparams
-    : NAME                           { $$ = ast_new("TypeParams");
-                                       ast_add($$, ast_own("TypeParam", $1)); }
-    | typeparams ',' NAME            { $$ = $1;
-                                       ast_add($$, ast_own("TypeParam", $3)); }
+    : typeparam                      { $$ = ast_new("TypeParams"); ast_add($$, $1); }
+    | typeparams ',' typeparam       { $$ = $1; ast_add($$, $3); }
+    ;
+
+typeparam
+    : NAME                           { $$ = ast_own("TypeParam", $1); }
+    | NAME ':' type                  { $$ = ast_own("TypeParamBound", $1);
+                                       ast_add($$, $3); }
+    ;
+
+/* 父类槽专用：只许 `A` / `A<…>`，不走 basictype（见上面 ClassDeclExtends 那条） */
+extendtype
+    : NAME                           { $$ = ast_own("Type", $1); }
+    | NAME '<' { generic_depth++; } typeargs '>'
+                                     { generic_depth--;
+                                       $$ = ast_own("Type", $1);
+                                       ast_merge($$, $4); }
     ;
 
 type
@@ -637,11 +744,22 @@ type
     ;
 
 uniontype
-    : basictype                      { $$ = $1; }
-    | uniontype '|' basictype        { if (strcmp($1->type, "TypeUnion") == 0) {
+    : intertype                      { $$ = $1; }
+    | uniontype '|' intertype        { if (strcmp($1->type, "TypeUnion") == 0) {
                                            $$ = $1; ast_add($$, $3);
                                        } else {
                                            $$ = ast_new("TypeUnion");
+                                           ast_add($$, $1); ast_add($$, $3);
+                                       } }
+    ;
+
+/* 交类型比 '|' 紧：`A & B | C` = `(A&B) | C` */
+intertype
+    : basictype                      { $$ = $1; }
+    | intertype '&' basictype        { if (strcmp($1->type, "TypeIntersect") == 0) {
+                                           $$ = $1; ast_add($$, $3);
+                                       } else {
+                                           $$ = ast_new("TypeIntersect");
                                            ast_add($$, $1); ast_add($$, $3);
                                        } }
     ;
@@ -870,6 +988,9 @@ tableconstructor
     : '{' '}'                        { $$ = ast_new("Table"); }
     | '{' fieldlist '}'              { $$ = $2; }
     ;
+      /* 空表那条语法上永远合法，拦它的是 checker：`{}` 推不出形状，所以
+         `local a = {}` / 全局裸 `a = {}` 要求必须有标注，且标注得能空着
+         （array<T> / table<K,V> / 空 record `{}`）。详见「表的形状一次定死」。 */
 
 fieldlist
     : fields                         { $$ = $1; }

@@ -98,26 +98,11 @@
 //!
 //! `as` 绑定最松（见 cast_exp）就是为了不引入第三、第四个：放在 Rust 那个位置
 //! （紧于二元）会让 `x as A|B` 的 '|' 和 `x as T<U>` 的 '<' 各出一个冲突。
-//! README `## grammar` 那份 bison 等价物有 4 个 —— 多的两个正是这两个，因为
-//! 它的 `exp` 是扁平的；但 bison 对两者都默认移进，结果与本文法一致。
-//!
+
 //! 表里没有导出冲突数，所以这条守不住 —— 加了新语法要手动重量一遍。
 //! 规模基线由 `cargo test parser::tests::grammar_size_report -- --nocapture` 报数，
-//! 当前实测 **362 状态 / 134 符号（66 终结符）/ 198 产生式 / 72 标签**，其中 125 条
-//! 产生式贴了标签、73 条透传。helper.md 里那份 337/126/183/80 是更早的快照，已被
-//! 后续语法赶过，以测量值为准。extendtype 贡献：+4 状态 / +1 符号 / +2 产生式 /
-//! +0 标签；typeparam 贡献：+3 状态 / +1 符号 / +2 产生式 / +1 标签。
-//! classfields 那两条贡献：-0 状态 / -0 符号 / -0 产生式 / **-2 标签** —— 单元素那条
-//! 撤掉 `@ClassFieldsFirst` 恢复折叠，左递归那条并入 `@ListTail`。只改标签不改
-//! 产生式，所以只动 RULE_PROD，自动机一个字节都不变。
-//! intertype 贡献：+3 状态 / +1 符号 / +2 产生式 / +1 标签，**终结符 0 新增** ——
-//! `'&'` 本来就在（`band_exp` 的按位与），跟 `'|'` 一样是类型位与值位共用一个记号。
-//! 它的冲突数没重测（没工具），但 `as` 后的 '&' 不可能出冲突：阶梯里 cast_exp
-//! 在 band_exp 之上，强转结果当不了按位与的左操作数 —— 和 `x as A|nil` 同理。
-//! 两侧行为各有一条形状断言盯着（intersect_after_as_cast /
-//! band_in_value_position_still_parses）。
-
-
+//! 当前实测 **366 状态 / 135 符号（67 终结符）/ 199 产生式 / 73 标签**，其中 126 条
+//! 产生式贴了标签、73 条透传。
 grammar::grammar! {
 
 
@@ -166,6 +151,10 @@ grammar::grammar! {
         | optpub CLASS NAME generics ':' extendtype classbody @ClassDeclExtends
         | optpub TYPEDEF NAME generics '=' type        @TypeDef
         | IMPORT '{' importlist '}' IN STRING          @Import
+        /* 宿主声明。不能写 optype：它可空，`extern x` 得是语法错。
+           「只许顶层」不在文法里，和带标注的全局赋值一样由 checker 拦；
+           不给 optpub 槽，于是 `pub extern` 天然是语法错 */
+        | EXTERN NAME ':' type                         @Extern
     
         ;
     
