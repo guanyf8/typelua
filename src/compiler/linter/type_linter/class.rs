@@ -45,7 +45,7 @@ impl TypeLinter {
     }
 
     /// class / typedef 三条声明填体前共用的前导：拿到 P0a 给这个名字的 DeclId，
-    /// 顺手把重复声明挡掉。`None` = 这条不该填体（没抬升过，或它是重复的那条）。
+    /// 顺手把重复声明挡掉。`None` = 这条不该填体（非顶层、没抬升过，或它是重复的那条）。
     /// 名字一并带回来 —— 后面的诊断消息都要用
     pub(super) fn decl_to_fill<'t>(
         &self,
@@ -56,6 +56,18 @@ impl TypeLinter {
         log: &mut Vec<Logger>,
     ) -> Option<(DeclId, &'t str)> {
         let name = self.name_or_panic(ast, name_node, what);
+        // 嵌在 do / if / 函数体里的 class/typedef 不是声明点：P0a 没抬升它，名义类型
+        // 只认顶层（和 extern / import / pub 同理，文法表达不了、都在 checker 拦）。
+        // 从前这里跟着 hoisted_decl 一起静默跳过，引用处只会撞上「未声明的类型」，
+        // 错得不知所以 —— 现在就地报一条明确诊断。注意别下沉到 hoisted_decl：它还被
+        // scope_decl_generics 复用，那条路径对非顶层就该静默，报在这里才不会重出
+        if !self.is_chunk_top(ast, node_index) {
+            log.push(Logger {
+                span: ast.span_of(name_node),
+                msg: "class / typedef 只能写在文件顶层".to_string(),
+            });
+            return None;
+        }
         let decl = self.hoisted_decl(ast, node_index, name)?;
         if self.is_dup_decl(decl, ast.span_of(name_node)) {
             log.push(Logger {
