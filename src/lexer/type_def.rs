@@ -1,11 +1,11 @@
 use std::fmt;
-// 宏 for 保留字，主要重建 string <-> Reserved 
+// 宏 for 保留字，主要重建 string <-> Reserved
 macro_rules! reserved {
     ($($key_word:ident => $origin_str:literal),+ $(,)?) =>{
         #[derive(Debug,PartialEq,Eq,Clone,Copy)]
         pub enum Reserved { $($key_word),+ }
 
-        impl Reserved { 
+        impl Reserved {
             pub const LEN: usize = [$(Reserved::$key_word),+].len();
             pub const RESERVERD_NAMES: [&'static str; Reserved::LEN] = [$(stringify!($key_word)),+];
 
@@ -24,8 +24,8 @@ macro_rules! reserved {
 macro_rules! operators {
     ($($op:ident => $origin_str:literal),+ $(,)?) => {
         #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-        pub enum OpType { 
-            $($op,)+ 
+        pub enum OpType {
+            $($op,)+
             // 单字符可以直接拿出来
             SIMPLE(char),
         }
@@ -45,7 +45,7 @@ macro_rules! operators {
             }
 
             pub fn resolve(self) -> &'static str {
-                match self { 
+                match self {
                     $(
                         OpType::$op => $origin_str,
                     )+
@@ -128,19 +128,18 @@ impl fmt::Display for Token<'_> {
 }
 
 #[derive(Debug)]
-pub enum AcceptType{
+pub enum AcceptType {
     OPERATOR(OpType),
     STRING,
-    COMMENT,    //lexer直接丢弃
+    COMMENT, //lexer直接丢弃
     NUMERAL,
     NAME,
 }
 
-
 pub enum Step {
-    CONTINUE(State),          //转移到下一状态，继续吃字符
-    ACCEPT(AcceptType),     //产出token，状态机已自动复位到S0
-    REJECT(LexErr),               //词法错误，状态机已自动复位到S0
+    CONTINUE(State),    //转移到下一状态，继续吃字符
+    ACCEPT(AcceptType), //产出token，状态机已自动复位到S0
+    REJECT(LexErr),     //词法错误，状态机已自动复位到S0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -149,9 +148,9 @@ pub enum State {
     MINUS,
     CMT,
     SCMT,
-    LBKT(u32,bool),         //bool: 是否长注释模式
-    LSTR(u32,bool),
-    LCLOSE(u32,u32,bool),
+    LBKT(u32, bool), //bool: 是否长注释模式
+    LSTR(u32, bool),
+    LCLOSE(u32, u32, bool),
     DQ,
     SQ,
     DQESC,
@@ -199,7 +198,7 @@ impl fmt::Display for LexErr {
 }
 
 //token/错误的字节区间[start,end)；行列号报错时由LineIndex惰性推导，不在此存储
-#[derive(Debug, PartialEq, Clone, Copy, Default )]
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -207,7 +206,7 @@ pub struct Span {
 
 //输入耗尽时的收尾结果：区分"干净EOF"、"中间态补发token"与"未闭合错误"三态
 pub enum Finish {
-    Done,                       //S0：无待产出token，干净结束
-    Token(AcceptType, u32),     //可接受中间态补发token，u32为回退字节数
-    Error(LexErr),              //未闭合的字符串/长括号
+    Done,                   //S0：无待产出token，干净结束
+    Token(AcceptType, u32), //可接受中间态补发token，u32为回退字节数
+    Error(LexErr),          //未闭合的字符串/长括号
 }

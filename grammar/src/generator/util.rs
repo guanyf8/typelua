@@ -1,7 +1,4 @@
-
-
-
-/// 输入是 `Literal::to_string()` 
+/// 输入是 `Literal::to_string()`
 /// 不是字符字面量（字符串 / 字节 / 数字 / 原始字符串）一律返回 `None`。
 pub(super) fn char_literal_value(text: &str) -> Option<char> {
     let body = text.strip_prefix('\'')?.strip_suffix('\'')?;

@@ -84,7 +84,6 @@ impl FieldsId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclId(u32);
 impl DeclId {
-  
     pub const ARRAY: DeclId = DeclId(0);
     /// 内建容器 `table<K,V>`
     pub const TABLE: DeclId = DeclId(1);
@@ -97,7 +96,7 @@ impl DeclId {
     }
 
     #[inline]
-    fn at(raw: usize) -> Self {                                                                                                                    
+    fn at(raw: usize) -> Self {
         DeclId(raw as u32)
     }
     #[inline]
@@ -150,7 +149,7 @@ impl SubstId {
 
 // ============================ 类型层 ============================
 
-/// 标量与两个伪类型。**没有 void**：`-> ()` 是空 Pack，见 `TypeId::VOID`
+/// 标量与三个伪类型。**没有 void**：`-> ()` 是空 Pack，见 `TypeId::VOID`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Trival {
     /// 还没解析出来 / 这个节点不产出类型。它**不是** `-> ()`，别拿它当 void 用
@@ -161,6 +160,18 @@ pub enum Trival {
     Boolean,
     Number,
     String,
+    /// 底类型：永远求不出值。写在返回位就是「调了回不来」：prelude 里的
+    /// `error` / `os.exit`，以及用户自己写的 `function fail(m:string):never`。
+    /// 定值分析靠它认出 guard 写法（`if c then n=1 else error("bad") end`）
+    /// 里走不出来的那一支。
+    ///
+    /// 它绑在**类型**上而不是变量上，所以 `os.exit()`（字段读）和
+    /// `local e = error` 之后的 `e("x")` 都自动成立：类型会跟着值跑。
+    ///
+    /// 欠的一笔：声明了 `-> never` 的函数得真的走不出去，否则谁调它谁就被骗。
+    /// 那是一条函数体末尾的可达性检查（TS 的 "cannot have a reachable
+    /// end point"），靠定值分析那套区域机制在 funcbody 收口处问一句 terminated
+    Never,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -172,7 +183,10 @@ pub enum Types {
     /// **不展开**：递归 typedef 靠它终止，泛型实例化推迟到真要查字段时才做。
     /// 「是 class 还是 typedef」是声明的属性，问 `DeclTable` 即可，不占类型变体。
     /// 内建的 array<T> / table<K,V> 也走这条
-    Ref { decl: DeclId, args: ListId },
+    Ref {
+        decl: DeclId,
+        args: ListId,
+    },
     /// 联合类型。variants 已扁平化、排序、去重，且长度必 >= 2
     Union(ListId),
     /// 交类型（形状合并）。和 Union 同构且共用 ListId，但必须是两个变体：
@@ -183,7 +197,15 @@ pub enum Types {
     Intersect(ListId),
     /// 匿名 record / class 的结构形状。字段已按 NameId 排序
     Record(FieldsId),
-    Func { params: ListId, ret: ListId },
+    /// `generics` 是这个函数自己声明的泛型形参（按声明序，每项是 `Types::Generic`，
+    /// 非泛型时 `ListId::EMPTY`）。形参身份存在**类型**上而不是只留在声明里，是因为
+    /// turbofish `map::<string, number>` 在使用点只拿得到一个函数值的类型，得从它
+    /// 身上问出形参的顺序，才知道实参该往哪儿代
+    Func {
+        generics: ListId,
+        params: ListId,
+        ret: ListId,
+    },
     /// 值列表：retspec / typeargs / argtypes。长度 1 且无 vararg 的 Pack 不存在
     /// （被折叠成元素本身，所以 `-> (T)` 天然等于 `-> T`）
     Pack(ListId),
@@ -223,10 +245,13 @@ impl TypeId {
     pub const BOOLEAN: TypeId = TypeId(3);
     pub const NUMBER: TypeId = TypeId(4);
     pub const STRING: TypeId = TypeId(5);
+    /// 底类型。`basictype` 里没有它的关键字 —— `never` 是普通 NAME，
+    /// 靠 `builtin_types` 落地，所以用户自己定义同名类型能遮蔽它
+    pub const NEVER: TypeId = TypeId(6);
     /// `-> ()`：零返回值，也就是空 Pack。
     /// README 里「`()` 永远不是 type」说的是**语法层**（不进 basictype，否则
     /// `-> ()` 歧义）；语义层的空值列表只能由 retspec / argtypes 产出，不歧义
-    pub const VOID: TypeId = TypeId(6);
+    pub const VOID: TypeId = TypeId(7);
 
     pub const fn of_trival(p: Trival) -> TypeId {
         match p {
@@ -236,6 +261,7 @@ impl TypeId {
             Trival::Boolean => TypeId::BOOLEAN,
             Trival::Number => TypeId::NUMBER,
             Trival::String => TypeId::STRING,
+            Trival::Never => TypeId::NEVER,
         }
     }
 }
@@ -318,11 +344,20 @@ pub enum DeclBody {
     Typedef(TypedefInfo),
 }
 
-/// 声明层的字段：类型层那份 + 源码位置
+/// 声明层的字段：类型层那份 + 源码位置 + 「是不是方法」
 #[derive(Debug, Clone, Copy)]
 pub struct ClassField {
     pub field: Field,
     pub span: Span,
+    /// methodsig 形式（`m(self) -> T … end`）声明的**方法**。`m : function(…)`
+    /// 写出来的是普通函数变量字段，这一位是 false。两者语义**不互为糖**：
+    /// 方法不参与 `A{…}` 构造，也只有方法能被类体外的 `function A:m` /
+    /// `function A.m` 重定义；函数变量字段反过来 —— 没默认值就得在每一处构造里给，
+    /// 而且只能整体赋值，不能用 `function` 语句去定义。
+    ///
+    /// 不放进 `Field`：那是类型层、要参与 `intern_fields` 的哈希去重，多带这一位
+    /// 会让形状相同的 record 裂成两个 TypeId
+    pub method: bool,
 }
 
 pub struct Decl {
@@ -526,6 +561,7 @@ impl TypeArena {
             Trival::Boolean,
             Trival::Number,
             Trival::String,
+            Trival::Never,
         ] {
             a.intern(Types::Trival(p));
         }
@@ -535,6 +571,7 @@ impl TypeArena {
         debug_assert_eq!(empty_fields, FieldsId::EMPTY);
         debug_assert_eq!(a.intern(Types::Trival(Trival::Unknown)), TypeId::UNKNOWN);
         debug_assert_eq!(a.intern(Types::Trival(Trival::String)), TypeId::STRING);
+        debug_assert_eq!(a.intern(Types::Trival(Trival::Never)), TypeId::NEVER);
         debug_assert_eq!(void, TypeId::VOID);
         a
     }
@@ -567,8 +604,17 @@ impl TypeArena {
             Types::Ref { args, .. } => self.list_generic[args.idx()],
             Types::Union(l) | Types::Intersect(l) | Types::Pack(l) => self.list_generic[l.idx()],
             Types::Record(f) => self.fields_generic[f.idx()],
-            Types::Func { params, ret } => {
-                self.list_generic[params.idx()] || self.list_generic[ret.idx()]
+            // generics 那格也得算进来：`function<T>() -> number` 的形参一次没用上，
+            // 可 subst 开头那道 contains_generic 快路要是把它判成「不含泛型」，
+            // 整条替换就被跳过、generics 永远摘不空
+            Types::Func {
+                generics,
+                params,
+                ret,
+            } => {
+                self.list_generic[generics.idx()]
+                    || self.list_generic[params.idx()]
+                    || self.list_generic[ret.idx()]
             }
         };
         let id = TypeId::at(self.types.len());
@@ -738,9 +784,10 @@ impl TypeArena {
                 .iter()
                 .find_map(|fld| self.intersection_conflict(fld.ty)),
             Types::Union(l) | Types::Pack(l) => self.list_conflict(l),
-            Types::Func { params, ret } => {
-                self.list_conflict(params).or_else(|| self.list_conflict(ret))
-            }
+            // generics 只是形参的身份表，不谈居民，不进这一问
+            Types::Func { params, ret, .. } => self
+                .list_conflict(params)
+                .or_else(|| self.list_conflict(ret)),
             // Ref 的实参也要看：`array<number & string>` 同样无居民
             Types::Ref { args, .. } => self.list_conflict(args),
             Types::Trival(_) | Types::Generic(_) => None,
@@ -760,8 +807,12 @@ impl TypeArena {
         self.intern(Types::Record(f))
     }
 
-    pub fn func(&mut self, params: ListId, ret: ListId) -> TypeId {
-        self.intern(Types::Func { params, ret })
+    pub fn func(&mut self, generics: ListId, params: ListId, ret: ListId) -> TypeId {
+        self.intern(Types::Func {
+            generics,
+            params,
+            ret,
+        })
     }
 
     /// 长度 1 且无 vararg 时折叠成元素本身 —— `-> (T)` 等于 `-> T` 这条语义
@@ -883,10 +934,23 @@ impl TypeArena {
                 }
                 self.record(fields)
             }
-            Types::Func { params, ret } => {
+            Types::Func {
+                generics,
+                params,
+                ret,
+            } => {
+                // 被这次替换代掉的形参不再是形参：generics 逐个试代，只留下没换走的
+                // （部分代入会剩几个）。turbofish 全代完就摘空，于是
+                // `f::<number>::<string>` 第二次自然会被认成「不是泛型函数」
+                let declared = self.list(generics).fixed.clone();
+                let kept: Vec<TypeId> = declared
+                    .into_iter()
+                    .filter(|&g| self.subst(g, s) == g)
+                    .collect();
+                let generics = self.intern_list(kept, None);
                 let params = self.subst_list(params, s);
                 let ret = self.subst_list(ret, s);
-                self.func(params, ret)
+                self.func(generics, params, ret)
             }
             Types::Pack(l) => {
                 let l = self.subst_list(l, s);
@@ -913,6 +977,35 @@ impl TypeArena {
 
 // ============================ 会话 ============================
 
+/// 变量的一格。比裸 `TypeId` 多出来的几样都是「先声明后使用」要用的：
+/// `inited` 做定值分析，`decl_span` 让「后续赋值背叛声明」的诊断能指回声明点，
+/// `kind` 定后续赋值该报哪种诊断、以及要不要生代码
+#[derive(Debug, Clone, Copy)]
+pub struct VarInfo {
+    pub ty: TypeId,
+    /// 已确定赋过值。声明时的初值 = 「声明处就给了值」或「ty 容得下 nil」——
+    /// 老规则「无初值的 `local x:T` 要求 T 容得下 nil」由此从合法性闸门
+    /// 降级成这一位的初值：容得下 nil 的类型，声明出来的那个 nil 就是它的合法值
+    pub inited: bool,
+    pub decl_span: Span,
+    pub kind: VarScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VarScope {
+    /// `local` / 形参 / for 变量
+    Local,
+    /// 顶层第一次出现的全局
+    Global,
+    /// `extern`：宿主注入。声明处就算已赋值（和「不核实存在性」同一个
+    /// 信任模型），且零代码生成
+    Extern,
+    /// 顶层 `function Name funcbody` 抬升上来的名字。没执行到它的声明语句之前
+    /// `inited` 是 false，于是顶层立即位置读它会报「尚未赋值」而函数体内不查 ——
+    /// 抬升那条「只在延迟求值位置生效」和定值分析共用同一位
+    HoistedFn,
+}
+
 /// 全工程共享的编译期状态。
 /// 类型表与声明表都在这一层，不再按文件切分：
 ///   - intern 表共享才有最大收益（各文件里的 `array<string>` 是同一个 TypeId）
@@ -925,6 +1018,10 @@ pub struct Session {
     pub decls: DeclTable,
     /// pub 出去的类型：(模块名, 类型名) -> 声明
     exports: HashMap<(NameId, NameId), DeclId>,
+    /// 模块里**所有**顶层类型（pub 与否都算）：(模块名, 类型名) -> 声明。
+    /// import 查不到时靠它分辨「模块压根没这个类型」与「有、但没 pub」：
+    /// `exports` 里的都是 pub 过的，单靠它俩这两种误差拆不开
+    module_types: HashMap<(NameId, NameId), DeclId>,
     /// 全局变量表。全局是 `_ENV` 的字段、整个工程同一份，所以它跟着
     /// Session 攒，不进 per-file 重置的 scope_stack（README §15：全局变量
     /// 的标注得收进工程级命名空间，否则别的文件看不到 `G_config` 的类型）。
@@ -933,7 +1030,7 @@ pub struct Session {
     ///
     /// 键用 String 而不是 NameId：消费者是 linter 那边 String 键的作用域表，
     /// 而且 `&self` 的查表位拿不到 `&mut names`，没法顺手 intern
-    globals: HashMap<String, TypeId>,
+    globals: HashMap<String, VarInfo>,
     /// 内建类型名：`array` / `table` 以及四个标量名。它们是 prelude 级的，
     /// 对所有文件可见，所以不能待在 per-file 的 scope_stack 里 —— linter 查
     /// 类型名时栈内全落空才问到这里，于是用户自己声明的同名类型自然遮蔽内建
@@ -947,10 +1044,12 @@ impl Session {
             type_arenas: TypeArena::new(),
             decls: DeclTable::new(),
             exports: HashMap::new(),
+            module_types: HashMap::new(),
             globals: HashMap::new(),
             builtin_types: HashMap::new(),
         };
         session.register_builtins();
+        session.register_prelude();
         session
     }
 
@@ -973,6 +1072,10 @@ impl Session {
             ("boolean", Trival::Boolean),
             ("number", Trival::Number),
             ("string", Trival::String),
+            // never 在这里，`unknown` 不在：前者是 prelude 和用户都要写的返回位
+            // 标注（`extern error:function(any)->never`），后者是「还没算出来」这个
+            // 内部状态，一旦能写就给了用户一个关闭检查的后门
+            ("never", Trival::Never),
         ] {
             self.builtin_types
                 .insert(name.to_string(), TypeRef::Prim(prim));
@@ -1001,13 +1104,212 @@ impl Session {
         decl
     }
 
-    /// 登记一个 pub 类型。同模块同名重复导出返回 false
-    pub fn export(&mut self, module: NameId, name: NameId, decl: DeclId) -> bool {
-        if self.exports.contains_key(&(module, name)) {
-            return false;
+    /// 标准库的全局。README「声明点」：这一份形态上等价于一串 `extern`，
+    /// 没它的话「先声明后使用」会让每个文件都报一屏未声明。
+    ///
+    /// 口径跟 `extern` 一模一样：`VarScope::Extern`、声明处就算已赋值、
+    /// 只声明存在性而不核实存在性。又因为 `declare_global` 遇重名返回 false
+    /// 而不覆写，用户自己的 `extern print:…` 会报「已经声明过了」—— 这是对的：
+    /// 标准库的名字就是已经占住的。
+    ///
+    /// 类型尽量宽：这些签名是给用户代码兼容的，宁可漏报不误报。
+    /// 真正只能写死的是两处：`error` / `os.exit` 的 `-> never`（可达性
+    /// 分析的 guard 写法就靠它），以及 `os.getenv` 的 `-> string|nil`（nil 收窄）
+    fn register_prelude(&mut self) {
+        let (any, s, n, b, nil) = (
+            TypeId::ANY,
+            TypeId::STRING,
+            TypeId::NUMBER,
+            TypeId::BOOLEAN,
+            TypeId::NIL,
+        );
+        let str_or_nil = self.type_arenas.union(vec![s, nil]);
+        let num_or_nil = self.type_arenas.union(vec![n, nil]);
+        let void: Vec<TypeId> = vec![];
+
+        // ---- 基础库函数 ----
+        for (name, params, vararg, ret) in [
+            ("print", void.clone(), Some(any), void.clone()),
+            ("require", vec![s], None, vec![any]),
+            ("tostring", vec![any], None, vec![s]),
+            // 第二个实参是进制，可省；推不出数时返 nil
+            ("tonumber", vec![any], Some(any), vec![num_or_nil]),
+            ("type", vec![any], None, vec![s]),
+            // 条件为真时原样返回第一个实参，所以**不能**声明成 `-> never`
+            ("assert", vec![any], Some(any), vec![any]),
+            // pcall 第一位是成败位，后面跟着被调者的返回值
+            ("pcall", vec![any], Some(any), vec![b]),
+            ("xpcall", vec![any, any], Some(any), vec![b]),
+            ("select", vec![any], Some(any), vec![any]),
+            ("rawget", vec![any, any], None, vec![any]),
+            ("rawset", vec![any, any, any], None, vec![any]),
+            ("rawequal", vec![any, any], None, vec![b]),
+            ("rawlen", vec![any], None, vec![n]),
+            ("setmetatable", vec![any, any], None, vec![any]),
+            ("getmetatable", vec![any], None, vec![any]),
+            // 迭代器三件套。for-in 的控制变量现在不从返回类型里抽，
+            // 所以这里只需要名字存在、实参个数对得上
+            ("ipairs", vec![any], None, vec![any, any, n]),
+            ("pairs", vec![any], None, vec![any, any, nil]),
+            ("next", vec![any], Some(any), vec![any, any]),
+            ("unpack", vec![any], Some(any), vec![any]),
+            ("collectgarbage", void.clone(), Some(any), vec![any]),
+            ("load", vec![any], Some(any), vec![any]),
+            ("dofile", void.clone(), Some(any), vec![any]),
+        ] {
+            let ty = self.prelude_func(params, vararg, ret);
+            self.prelude_global(name, ty);
         }
-        self.exports.insert((module, name), decl);
-        true
+
+        // `error` 回不来：`if c then n=1 else error("bad") end` 能过就靠这一行
+        let never = self.prelude_func(vec![any], Some(any), vec![TypeId::NEVER]);
+        self.prelude_global("error", never);
+
+        // ---- 库表 ----
+        let string_lib = self.prelude_lib(&[
+            ("len", vec![s], None, vec![n]),
+            ("sub", vec![s, n], Some(n), vec![s]),
+            ("upper", vec![s], None, vec![s]),
+            ("lower", vec![s], None, vec![s]),
+            ("rep", vec![s, n], Some(s), vec![s]),
+            ("reverse", vec![s], None, vec![s]),
+            ("byte", vec![s], Some(n), vec![n]),
+            ("char", vec![], Some(n), vec![s]),
+            ("format", vec![s], Some(any), vec![s]),
+            ("find", vec![s, s], Some(any), vec![any]),
+            ("match", vec![s, s], Some(any), vec![any]),
+            ("gmatch", vec![s, s], None, vec![any]),
+            ("gsub", vec![s, s, any], Some(any), vec![s, n]),
+        ]);
+        self.prelude_global("string", string_lib);
+
+        // 库表叫 `table`，内建**类型**也叫 `table` —— 不碰：一个在 globals、
+        // 一个在 builtin_types，查表的位置分得开（值位 / 类型位）
+        let table_lib = self.prelude_lib(&[
+            ("insert", vec![any, any], Some(any), vec![]),
+            ("remove", vec![any], Some(n), vec![any]),
+            ("concat", vec![any], Some(any), vec![s]),
+            ("sort", vec![any], Some(any), vec![]),
+            ("unpack", vec![any], Some(any), vec![any]),
+            ("pack", vec![], Some(any), vec![any]),
+        ]);
+        self.prelude_global("table", table_lib);
+
+        let math_lib = self.prelude_lib(&[
+            ("floor", vec![n], None, vec![n]),
+            ("ceil", vec![n], None, vec![n]),
+            ("abs", vec![n], None, vec![n]),
+            ("max", vec![n], Some(n), vec![n]),
+            ("min", vec![n], Some(n), vec![n]),
+            ("sqrt", vec![n], None, vec![n]),
+            ("random", vec![], Some(n), vec![n]),
+            ("fmod", vec![n, n], None, vec![n]),
+            ("tointeger", vec![any], None, vec![num_or_nil]),
+            ("type", vec![any], None, vec![str_or_nil]),
+        ]);
+        // 常量字段得单独拼：prelude_lib 只会造函数字段
+        let math_lib = self.prelude_extend(
+            math_lib,
+            &[("pi", n), ("huge", n), ("maxinteger", n), ("mininteger", n)],
+        );
+        self.prelude_global("math", math_lib);
+
+        let os_lib = self.prelude_lib(&[
+            // getenv 可能没有：README 的 nil 收窄例子直接拿它开头
+            ("getenv", vec![s], None, vec![str_or_nil]),
+            ("time", vec![], Some(any), vec![n]),
+            ("clock", vec![], None, vec![n]),
+            ("date", vec![], Some(any), vec![s]),
+            ("remove", vec![s], None, vec![any]),
+            ("rename", vec![s, s], None, vec![any]),
+            // exit 和 error 同理，而且还钉住了「判据在类型上不在写法上」：
+            // 它是个字段读，可达性分析照样认得出来
+            ("exit", vec![], Some(any), vec![TypeId::NEVER]),
+        ]);
+        self.prelude_global("os", os_lib);
+
+        let io_lib = self.prelude_lib(&[
+            ("write", vec![], Some(any), vec![any]),
+            ("read", vec![], Some(any), vec![any]),
+            ("open", vec![s], Some(s), vec![any]),
+            ("lines", vec![], Some(any), vec![any]),
+            ("close", vec![], Some(any), vec![any]),
+        ]);
+        self.prelude_global("io", io_lib);
+
+        // `_G` 是全局表自己。形状无从静态说起（它的字段就是全体全局），
+        // 所以给 `table<string, any>`：README 里 `_G.logger as Logger` 那一句靠它成立
+        let args = self.type_arenas.intern_list(vec![s, any], None);
+        let g = self.type_arenas.reference(DeclId::TABLE, args);
+        self.prelude_global("_G", g);
+        self.prelude_global("arg", g);
+    }
+
+    /// 造一个非泛型函数类型。`vararg` 是尾部那格可选实参的元素类型 ——
+    /// 标准库里大量函数的后几个参数可省，而此处没有「可选形参」这一位，
+    /// 拿 vararg 当它用：个数检查于是只管住「必给的那几个」
+    fn prelude_func(
+        &mut self,
+        params: Vec<TypeId>,
+        vararg: Option<TypeId>,
+        ret: Vec<TypeId>,
+    ) -> TypeId {
+        let params = self.type_arenas.intern_list(params, vararg);
+        let ret = self.type_arenas.intern_list(ret, None);
+        self.type_arenas.func(ListId::EMPTY, params, ret)
+    }
+
+    /// 一张全是函数字段的 record（`string` / `os` / …那种库表）
+    fn prelude_lib(
+        &mut self,
+        entries: &[(&str, Vec<TypeId>, Option<TypeId>, Vec<TypeId>)],
+    ) -> TypeId {
+        let mut fields = Vec::with_capacity(entries.len());
+        for (name, params, vararg, ret) in entries {
+            let ty = self.prelude_func(params.clone(), *vararg, ret.clone());
+            fields.push(Field {
+                name: self.names.intern(name),
+                ty,
+                default: false,
+            });
+        }
+        self.type_arenas.record(fields)
+    }
+
+    /// 给一张已有的 record 再添几个非函数字段（`math.pi` 之类）
+    fn prelude_extend(&mut self, base: TypeId, extra: &[(&str, TypeId)]) -> TypeId {
+        let Types::Record(f) = self.type_arenas.get_type(base) else {
+            return base;
+        };
+        let mut fields = self.type_arenas.fields(f).to_vec();
+        for &(name, ty) in extra {
+            fields.push(Field {
+                name: self.names.intern(name),
+                ty,
+                default: false,
+            });
+        }
+        self.type_arenas.record(fields)
+    }
+
+    /// 落一个 prelude 全局。重名不覆写（`declare_global` 自己拦），
+    /// 返回值不看：这一串名字自己不重复，而它比任何用户代码都早
+    fn prelude_global(&mut self, name: &str, ty: TypeId) {
+        let slot = self.new_slot(ty, Span::default(), VarScope::Extern, true);
+        self.declare_global(name, slot);
+    }
+
+    /// 登记一个 pub 类型。同模块同名、但**换了一条声明**才算重复导出，返回 false。
+    /// 同一条声明重复登记是幂等的（类体预填的 eager 趟与主遍历各跟 check_pub 跑
+    /// 一次，拿到的是同一个 DeclId），不算冲突
+    pub fn export(&mut self, module: NameId, name: NameId, decl: DeclId) -> bool {
+        match self.exports.get(&(module, name)) {
+            Some(&existing) => existing == decl,
+            None => {
+                self.exports.insert((module, name), decl);
+                true
+            }
+        }
     }
 
     /// `import {A} in "mod_a"` 的查表入口。没有 pub 的类型查不到
@@ -1015,14 +1317,312 @@ impl Session {
         self.exports.get(&(module, name)).copied()
     }
 
-    /// 登记全局变量的类型。返回 false = 这名字之前已经登记过（标注照样
-    /// 覆盖：同一个全局在两处给出不同标注算不算错，由 linter 定）
-    pub fn declare_global(&mut self, name: &str, ty: TypeId) -> bool {
-        self.globals.insert(name.to_string(), ty).is_none()
+    /// 登记一个模块里的顶层类型（不管 pub 与否）。同名只认第一条，
+    /// 和 hoist_top_level_types 的 declare_type 一个口径（重名诊断另报）
+    pub fn declare_module_type(&mut self, module: NameId, name: NameId, decl: DeclId) {
+        self.module_types.entry((module, name)).or_insert(decl);
     }
 
-    pub fn lookup_global(&self, name: &str) -> Option<TypeId> {
+    /// 这个模块里到底有没有叫这名字的顶层类型。import 落空时：
+    /// 真有、只是没 pub → 报「没 pub」；压根没有 → 报「模块没导出」
+    pub fn module_has_type(&self, module: NameId, name: NameId) -> bool {
+        self.module_types.contains_key(&(module, name))
+    }
+
+    /// 同上但把 DeclId 给出来。判「这条声明是不是本模块自己写的」要用它：
+    /// 只问名字在不在会误判 —— 本模块自己有个 `Account`、又 import 了别处的
+    /// `Account as Remote` 时，两条声明同名不同身份
+    pub fn lookup_module_type(&self, module: NameId, name: NameId) -> Option<DeclId> {
+        self.module_types.get(&(module, name)).copied()
+    }
+
+    /// 造一格变量。`assigned` = 声明语句本身就给了值（有初值 / 形参 / for 变量 /
+    /// extern）；它和「ty 容得下 nil」任一成立，这个变量就算已初始化
+    pub fn new_slot(&self, ty: TypeId, span: Span, kind: VarScope, assigned: bool) -> VarInfo {
+        VarInfo {
+            ty,
+            inited: assigned || self.admits_nil(ty),
+            decl_span: span,
+            kind,
+        }
+    }
+
+    /// `nil` 是不是 `ty` 的合法值。这是「无初值声明」的判据：容得下 nil 的类型
+    /// 声明出来就是诚实的（那个变量此刻真的是 nil），不必等赋值
+    pub fn admits_nil(&self, ty: TypeId) -> bool {
+        let mut cur = ty;
+        // 别名链成环该由 typedef 自己的检查报，这里只负责不挂死
+        for _ in 0..64 {
+            match self.type_arenas.get_type(cur) {
+                // UNKNOWN 是「没算出来」，一律放过：不在推断失败之上再叠一条误报
+                Types::Trival(Trival::Nil | Trival::Any | Trival::Unknown) => return true,
+                // variants 已扁平化，所以 nil 在不在里面一眼就能看完
+                Types::Union(l) => return self.type_arenas.list(l).fixed.contains(&TypeId::NIL),
+                // 别名：剥掉再判。不代入泛型实参 —— `typedef Opt<T> = T|nil` 里的 nil
+                // 是写在定义体里的，代不代入都在；class 不是别名，到这就到头
+                Types::Ref { decl, .. } => match self.decls.get(decl).as_typedef() {
+                    Some(t) => cur = t.target,
+                    None => return false,
+                },
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// `sub` 的值放进 `sup` 位安不安全 —— 可赋值（子类型）判定的中枢。字段赋值、
+    /// extends 一致性、泛型上界最终都问它。现在只有标量 / nil / any / never /
+    /// union / intersect / record / 内建容器这些「体已算全」的类型走得到实处：
+    /// class 的 fields、extends、typedef 的 target 要等各自 check_* 落地后才填得上，
+    /// 那之前它们体是空的（extends=None / target=UNKNOWN），相关分支自然落到
+    /// 「不可赋」或渐进放过。规则照最终形态写好，体一填就即刻生效。
+    ///
+    /// 几处 P0b 暂定的口径（都待维护者最终拍板）：
+    ///   - Ref 的类型实参按**不变**处理（`array<never>` 不算 `array<string>` 的子型）——
+    ///     容器可变，协变会破坏写位安全，先取最保守的
+    ///   - record 只做宽度 + 字段协变；可选字段（default / 容 nil）的放宽暂不做
+    ///   - class Ref 不对结构 record 做结构化匹配（class 是名义类型）
+    ///
+    /// 尺度和 `expect_key` 一致：拿不准就放过（true），把误报压到最低 —— 类型
+    /// 信息还不全的阶段刷一屏假错，比漏一条难查得多
+    pub fn assignable(&mut self, sub: TypeId, sup: TypeId) -> bool {
+        self.assignable_within(sub, sup, 0)
+    }
+
+    fn assignable_within(&mut self, sub: TypeId, sup: TypeId, depth: u32) -> bool {
+        // 哈希 consing 保证同一个类型只有一个 TypeId，自反顺带收掉递归类型的自比
+        if sub == sup {
+            return true;
+        }
+        // 别名 / extends 链成环该由各自的检查报，这里够深就放过：不挂死也不误报
+        if depth >= 64 {
+            return true;
+        }
+        // 渐进逃逸口：any 是显式的、unknown 是「还没算出来」，两向都放过
+        if matches!(sub, TypeId::ANY | TypeId::UNKNOWN)
+            || matches!(sup, TypeId::ANY | TypeId::UNKNOWN)
+        {
+            return true;
+        }
+        // never 是底：塞得进任何位。反向只有 never 收得下 never，已被自反收掉
+        if sub == TypeId::NEVER {
+            return true;
+        }
+
+        // ---- 先拆两侧的 union / intersect：复合形状要在具体形状之前判 ----
+        // sub 是联合：每个分支都得进得去 sup
+        if let Types::Union(l) = self.type_arenas.get_type(sub) {
+            let ms = self.type_arenas.list(l).fixed.clone();
+            return ms
+                .iter()
+                .all(|&m| self.assignable_within(m, sup, depth + 1));
+        }
+        // sup 是交：sub 得同时满足每个成员
+        if let Types::Intersect(l) = self.type_arenas.get_type(sup) {
+            let ms = self.type_arenas.list(l).fixed.clone();
+            return ms
+                .iter()
+                .all(|&m| self.assignable_within(sub, m, depth + 1));
+        }
+        // sup 是联合：sub 进得了任一分支即可（sub 此时已非 union）
+        if let Types::Union(l) = self.type_arenas.get_type(sup) {
+            let ms = self.type_arenas.list(l).fixed.clone();
+            return ms
+                .iter()
+                .any(|&m| self.assignable_within(sub, m, depth + 1));
+        }
+        // sub 是交：任一成员进得去就行（sup 此时已非 union / 非 intersect）
+        if let Types::Intersect(l) = self.type_arenas.get_type(sub) {
+            let ms = self.type_arenas.list(l).fixed.clone();
+            return ms
+                .iter()
+                .any(|&m| self.assignable_within(m, sup, depth + 1));
+        }
+
+        // ---- 到这里两侧都是叶形状：Trival / Generic / Ref / Record / Func / Pack ----
+
+        // 泛型形参：实例化前还是个未知位，拿不准能否赋就放过。上界不在这
+        // 里校：它只管的是实参能不能代给形参，那归实例化点的 check_generic_bounds
+        if matches!(self.type_arenas.get_type(sub), Types::Generic(_))
+            || matches!(self.type_arenas.get_type(sup), Types::Generic(_))
+        {
+            return true;
+        }
+
+        // typedef 是透明别名：任一侧是 typedef 就展开定义体（带实参代入）再比
+        if let Some(expanded) = self.expand_typedef(sub) {
+            return self.assignable_within(expanded, sup, depth + 1);
+        }
+        if let Some(expanded) = self.expand_typedef(sup) {
+            return self.assignable_within(sub, expanded, depth + 1);
+        }
+
+        match (
+            self.type_arenas.get_type(sub),
+            self.type_arenas.get_type(sup),
+        ) {
+            // 空表 `{}` 能进内建容器位：`local xs:array<string> = {}`。名义 class
+            // 造不出来（得 `A{…}`），所以只对 array / table 开
+            (Types::Record(f), Types::Ref { decl, .. })
+                if decl.is_builtin_container() && self.type_arenas.fields(f).is_empty() =>
+            {
+                true
+            }
+            // 具名字段的表字面量进映射位：`local mod:Meta = {VERSION = 1}`。
+            // README「表的形状一次定死」里，模块表想事后长新成员就得写成
+            // `{VERSION:number} & table<string, …>`，那一半交就落在这一步。
+            // record 的字段名天生是 string，所以键那半只问 string 进不进得了 K，
+            // 值那半逐个字段比 V。只对 table 开：array 的键是下标，具名字段对不上
+            (Types::Record(f), Types::Ref { decl, args }) if decl == DeclId::TABLE => {
+                let fields = self.type_arenas.fields(f).to_vec();
+                let kv = self.type_arenas.list(args).fixed.clone();
+                let (Some(&k), Some(&v)) = (kv.first(), kv.get(1)) else {
+                    return true;
+                };
+                self.assignable_within(TypeId::STRING, k, depth + 1)
+                    && fields
+                        .iter()
+                        .all(|x| self.assignable_within(x.ty, v, depth + 1))
+            }
+            // record 宽度 + 字段协变：sup 要的每个字段 sub 都得有，且字段类型可赋
+            (Types::Record(fsub), Types::Record(fsup)) => {
+                let sub_fields = self.type_arenas.fields(fsub).to_vec();
+                let sup_fields = self.type_arenas.fields(fsup).to_vec();
+                sup_fields
+                    .iter()
+                    .all(|sf| match sub_fields.iter().find(|x| x.name == sf.name) {
+                        Some(x) => self.assignable_within(x.ty, sf.ty, depth + 1),
+                        None => false,
+                    })
+            }
+            // 名义子型：sub 是 class，沿 extends 链上溯（父类实参先用子类的代入过），
+            // 看能不能走到 sup。extends 现在恒 None，所以不同 class 现在一律不可赋
+            (Types::Ref { decl, args }, _) => {
+                let Some(parent) = self.class_extends(decl) else {
+                    return false;
+                };
+                let parent = self.subst_ref_args(decl, args, parent);
+                self.assignable_within(parent, sup, depth + 1)
+            }
+            // 函数：形参逆变、返回协变
+            (
+                Types::Func {
+                    params: ps,
+                    ret: rs,
+                    ..
+                },
+                Types::Func {
+                    params: pp,
+                    ret: rp,
+                    ..
+                },
+            ) => {
+                // 形参逆变：sup 的每个参数要能进 sub 的（调用点传的是 sub 参数位）
+                self.list_assignable(pp, ps, depth + 1)
+                    // 返回协变：sub 的返回要能进 sup 的
+                    && self.list_assignable(rs, rp, depth + 1)
+            }
+            // 标量之间、以及形状不匹配：只有相等才可赋，而相等已被自反收掉
+            _ => false,
+        }
+    }
+
+    /// `ty` 是个 typedef 引用就展开它的定义体（实参代进 target），否则 None。
+    /// class 不是别名，返回 None —— 名义身份要留住。
+    /// 容器形状的判定（as_array / as_map）只认 array / table 的 Ref，
+    /// 所以 linter 那边也要用它先展开别名，因此是公开的
+    pub fn expand_typedef(&mut self, ty: TypeId) -> Option<TypeId> {
+        let Types::Ref { decl, args } = self.type_arenas.get_type(ty) else {
+            return None;
+        };
+        let target = self.decls.get(decl).as_typedef()?.target;
+        Some(self.subst_ref_args(decl, args, target))
+    }
+
+    /// class 的父类（`extends`）。不是 class 或没有父类都给 None
+    fn class_extends(&self, decl: DeclId) -> Option<TypeId> {
+        self.decls.get(decl).as_class()?.extends
+    }
+
+    /// `decl` 的泛型形参 -> `args` 的代入表。非泛型时是空代入，subst 恒等。
+    /// 类字段存的都是本类形参写的类型，凡是从一个 Ref 往里查（字段 / 父类）
+    /// 都得先拿这张表代一遍，所以它是公开的
+    pub fn ref_subst(&mut self, decl: DeclId, args: ListId) -> SubstId {
+        let generics = self.decls.get(decl).generics.clone();
+        let arg_tys = self.type_arenas.list(args).fixed.clone();
+        self.type_arenas.intern_subst(&generics, &arg_tys)
+    }
+
+    /// 把 `decl` 的泛型形参按 `args` 代进 `ty`
+    fn subst_ref_args(&mut self, decl: DeclId, args: ListId, ty: TypeId) -> TypeId {
+        let s = self.ref_subst(decl, args);
+        self.type_arenas.subst(ty, s)
+    }
+
+    /// 列表逐位可赋：`sub_list[i]` 都能进 `sup_list[i]`，且定长个数一致。
+    /// 变长位的方差由调用点通过交换实参表达，这里只做逐位 assignable
+    fn list_assignable(&mut self, sub_list: ListId, sup_list: ListId, depth: u32) -> bool {
+        let a = self.type_arenas.list(sub_list).clone();
+        let b = self.type_arenas.list(sup_list).clone();
+        if a.fixed.len() != b.fixed.len() {
+            return false;
+        }
+        for (&x, &y) in a.fixed.iter().zip(b.fixed.iter()) {
+            if !self.assignable_within(x, y, depth) {
+                return false;
+            }
+        }
+        match (a.vararg, b.vararg) {
+            (None, None) => true,
+            (Some(x), Some(y)) => self.assignable_within(x, y, depth),
+            _ => false,
+        }
+    }
+
+    /// 登记全局变量。返回 false = 这名字之前已经登记过，**而且原声明保持不变**：
+    /// 「后续赋值不能背叛声明」要求第一处声明是唯一权威，覆盖掉就无从比较了
+    pub fn declare_global(&mut self, name: &str, slot: VarInfo) -> bool {
+        if self.globals.contains_key(name) {
+            return false;
+        }
+        self.globals.insert(name.to_string(), slot);
+        true
+    }
+
+    pub fn lookup_global(&self, name: &str) -> Option<VarInfo> {
         self.globals.get(name).copied()
+    }
+
+    /// 给全局置上「已赋值」。`None` = 这名字压根没声明过，由调用点报；
+    /// `Some(flipped)` 的 flipped = 这次真把 false 推成了 true —— 定值分析的
+    /// 日志只记翻转，回滚才是精确的（对本来就 inited 的变量再赋值不该留痕）
+    pub fn mark_global_inited(&mut self, name: &str) -> Option<bool> {
+        self.globals.get_mut(name).map(|slot| {
+            let flipped = !slot.inited;
+            slot.inited = true;
+            flipped
+        })
+    }
+
+    /// 顶层 `function f` 的类型补登记。抬升那一遍只登记名字 —— 那时函数体还没
+    /// 遍历过，类型无从得知，得留到 @FuncDecl 的 leave 补上来。
+    ///
+    /// 只认 HoistedFn、且只从 UNKNOWN 起改：`declare_global` 守着「第一处声明是
+    /// 唯一权威」，这里要是谁都能改，就等于给「后续赋值改写声明」开了后门
+    pub fn patch_hoisted_type(&mut self, name: &str, ty: TypeId) {
+        if let Some(slot) = self.globals.get_mut(name) {
+            if slot.kind == VarScope::HoistedFn && slot.ty == TypeId::UNKNOWN {
+                slot.ty = ty;
+            }
+        }
+    }
+
+    /// 按分支合并的结果就地改写 `inited`。和 `mark_global_inited` 分开是因为
+    /// 回滚要写 false，而「赋值」这个动作只会往 true 推
+    pub fn set_global_inited(&mut self, name: &str, inited: bool) {
+        if let Some(slot) = self.globals.get_mut(name) {
+            slot.inited = inited;
+        }
     }
 
     /// 内建类型名的兜底查表。linter 的 scope_stack 全落空才该问到这里，
@@ -1058,6 +1658,7 @@ fn write_type(s: &Session, ty: TypeId, f: &mut fmt::Formatter<'_>) -> fmt::Resul
             Trival::Boolean => "boolean",
             Trival::Number => "number",
             Trival::String => "string",
+            Trival::Never => "never",
         }),
         Types::Generic(g) => f.write_str(s.names.resolve(s.decls.generic(g).name())),
         Types::Ref { decl, args } => {
@@ -1099,8 +1700,20 @@ fn write_type(s: &Session, ty: TypeId, f: &mut fmt::Formatter<'_>) -> fmt::Resul
             }
             f.write_str("}")
         }
-        Types::Func { params, ret } => {
-            f.write_str("function(")?;
+        Types::Func {
+            generics,
+            params,
+            ret,
+        } => {
+            f.write_str("function")?;
+            // 泛型函数把形参表一并印出来：光看 `function(T) -> T` 分不出 T 是它
+            // 自己的形参还是外层 class 的
+            if !s.type_arenas.list(generics).fixed.is_empty() {
+                f.write_str("<")?;
+                write_seq(s, generics, f)?;
+                f.write_str(">")?;
+            }
+            f.write_str("(")?;
             write_seq(s, params, f)?;
             f.write_str(") -> ")?;
             let r = s.type_arenas.list(ret);
@@ -1136,4 +1749,172 @@ fn write_seq(s: &Session, l: ListId, f: &mut fmt::Formatter<'_>) -> fmt::Result 
         write_type(s, v, f)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod assignable_tests {
+    //! P0b `assignable` 的单测。直接拿 arena 造类型再问可赋，不走 parser：
+    //! 目前只有体已算全的那些类型（标量 / nil / any / never / union /
+    //! intersect / record / 内建容器）走得到实处。typedef 展开那一条手工填一下
+    //! target，提前验一下 P1 落地后的行为
+    use super::*;
+    use crate::lexer::type_def::Span;
+
+    fn field(s: &mut Session, name: &str, ty: TypeId) -> Field {
+        Field {
+            name: s.names.intern(name),
+            ty,
+            default: false,
+        }
+    }
+
+    fn array_of(s: &mut Session, elem: TypeId) -> TypeId {
+        let args = s.type_arenas.intern_list(vec![elem], None);
+        s.type_arenas.reference(DeclId::ARRAY, args)
+    }
+
+    fn table_of(s: &mut Session, k: TypeId, v: TypeId) -> TypeId {
+        let args = s.type_arenas.intern_list(vec![k, v], None);
+        s.type_arenas.reference(DeclId::TABLE, args)
+    }
+
+    /// 自反 + 标量之间不相容
+    #[test]
+    fn reflexive_and_scalars() {
+        let mut s = Session::new();
+        assert!(s.assignable(TypeId::NUMBER, TypeId::NUMBER));
+        assert!(!s.assignable(TypeId::NUMBER, TypeId::STRING));
+        assert!(!s.assignable(TypeId::NIL, TypeId::NUMBER));
+        assert!(!s.assignable(TypeId::BOOLEAN, TypeId::NUMBER));
+    }
+
+    /// any / unknown 是渐进逃逸口，两向都放过
+    #[test]
+    fn gradual_any_and_unknown_both_ways() {
+        let mut s = Session::new();
+        assert!(s.assignable(TypeId::NUMBER, TypeId::ANY));
+        assert!(s.assignable(TypeId::ANY, TypeId::NUMBER));
+        assert!(s.assignable(TypeId::STRING, TypeId::UNKNOWN));
+        assert!(s.assignable(TypeId::UNKNOWN, TypeId::STRING));
+    }
+
+    /// never 是底：进得了任何位；反向只有 never 收得下 never
+    #[test]
+    fn never_is_bottom() {
+        let mut s = Session::new();
+        assert!(s.assignable(TypeId::NEVER, TypeId::NUMBER));
+        assert!(s.assignable(TypeId::NEVER, TypeId::STRING));
+        assert!(s.assignable(TypeId::NEVER, TypeId::NEVER));
+        assert!(!s.assignable(TypeId::NUMBER, TypeId::NEVER));
+    }
+
+    /// nil / 标量 进可选联合 `number | nil`
+    #[test]
+    fn into_optional_union() {
+        let mut s = Session::new();
+        let opt = s.type_arenas.union(vec![TypeId::NUMBER, TypeId::NIL]);
+        assert!(s.assignable(TypeId::NIL, opt));
+        assert!(s.assignable(TypeId::NUMBER, opt));
+        assert!(!s.assignable(TypeId::STRING, opt));
+    }
+
+    /// sub 是联合：每个分支都得进得去 sup
+    #[test]
+    fn union_sub_requires_every_member() {
+        let mut s = Session::new();
+        let ns = s.type_arenas.union(vec![TypeId::NUMBER, TypeId::STRING]);
+        let nsn = s
+            .type_arenas
+            .union(vec![TypeId::NUMBER, TypeId::STRING, TypeId::NIL]);
+        // number|string 进 number|string|nil：两个分支都能落到右边某个分支
+        assert!(s.assignable(ns, nsn));
+        // number|string 进 number：string 进不去
+        assert!(!s.assignable(ns, TypeId::NUMBER));
+    }
+
+    /// 交类型：sup 交要同时满足每个成员、sub 交任一成员满足即可。
+    /// 用 record & array——两个 record 会被 intersect() 当场并成一个，这里要的是
+    /// 真正的 Intersect 变体，所以拿一个不可约的容器成员配上 record
+    #[test]
+    fn intersect_all_and_some() {
+        let mut s = Session::new();
+        let fa = field(&mut s, "a", TypeId::NUMBER);
+        let rec = s.type_arenas.record(vec![fa]);
+        let arr = array_of(&mut s, TypeId::NUMBER);
+        let inter = s.type_arenas.intersect(vec![rec, arr]);
+
+        // sub 是交：任一成员能进就行
+        assert!(s.assignable(inter, rec));
+        assert!(s.assignable(inter, arr));
+        // sup 是交：光有 array 满足不了 record 那个成员
+        assert!(!s.assignable(arr, inter));
+        // 交自己进自己（自反）
+        assert!(s.assignable(inter, inter));
+    }
+
+    /// record 宽度子型：sub 可以多字段，不能少 sup 要的字段
+    #[test]
+    fn record_width() {
+        let mut s = Session::new();
+        let fa = field(&mut s, "a", TypeId::NUMBER);
+        let fb = field(&mut s, "b", TypeId::STRING);
+        let narrow = s.type_arenas.record(vec![fa]);
+        let wide = s.type_arenas.record(vec![fa, fb]);
+        assert!(s.assignable(wide, narrow));
+        assert!(!s.assignable(narrow, wide));
+    }
+
+    /// record 字段协变：`{a:number}` 进 `{a:number|nil}`，反之不行
+    #[test]
+    fn record_field_covariant() {
+        let mut s = Session::new();
+        let opt = s.type_arenas.union(vec![TypeId::NUMBER, TypeId::NIL]);
+        let fa = field(&mut s, "a", TypeId::NUMBER);
+        let fa_opt = field(&mut s, "a", opt);
+        let strict = s.type_arenas.record(vec![fa]);
+        let loose = s.type_arenas.record(vec![fa_opt]);
+        assert!(s.assignable(strict, loose));
+        assert!(!s.assignable(loose, strict));
+    }
+
+    /// 内建容器实参不变：`array<number>` 与 `array<string>` 不相容，同实参才相等
+    #[test]
+    fn container_args_are_invariant() {
+        let mut s = Session::new();
+        let arr_n = array_of(&mut s, TypeId::NUMBER);
+        let arr_s = array_of(&mut s, TypeId::STRING);
+        assert!(s.assignable(arr_n, arr_n));
+        assert!(!s.assignable(arr_n, arr_s));
+        let tab = table_of(&mut s, TypeId::STRING, TypeId::NUMBER);
+        assert!(s.assignable(tab, tab));
+    }
+
+    /// 空表 `{}` 能进内建容器位；非空 record 不行
+    #[test]
+    fn empty_table_into_container() {
+        let mut s = Session::new();
+        let empty = s.type_arenas.record(vec![]);
+        let arr_s = array_of(&mut s, TypeId::STRING);
+        let tab = table_of(&mut s, TypeId::STRING, TypeId::NUMBER);
+        assert!(s.assignable(empty, arr_s));
+        assert!(s.assignable(empty, tab));
+        // 非空 record 进不了容器（它不是数组/表）
+        let fa = field(&mut s, "a", TypeId::NUMBER);
+        let rec = s.type_arenas.record(vec![fa]);
+        assert!(!s.assignable(rec, arr_s));
+    }
+
+    /// typedef 是透明别名：手工填上 `typedef Count = number` 的 target，
+    /// 验一下 P1 落地后 number 与 Count 两向相容、string 不行
+    #[test]
+    fn typedef_is_transparent() {
+        let mut s = Session::new();
+        let count_name = s.names.intern("Count");
+        let decl = s.decls.declare_typedef(count_name, Span::default());
+        s.decls.get_mut(decl).as_typedef_mut().unwrap().target = TypeId::NUMBER;
+        let count = s.type_arenas.reference(decl, ListId::EMPTY);
+        assert!(s.assignable(TypeId::NUMBER, count));
+        assert!(s.assignable(count, TypeId::NUMBER));
+        assert!(!s.assignable(TypeId::STRING, count));
+    }
 }

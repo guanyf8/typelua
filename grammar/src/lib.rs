@@ -9,10 +9,9 @@ pub fn grammar(input: TokenStream) -> TokenStream {
     let parser_table = ParseTable::generate_parse_table(&grammar);
 
     TokenStream::from(parser_table)
-
 }
 
-// proc_macro2 -> proc_macro::TokenStream 
+// proc_macro2 -> proc_macro::TokenStream
 impl From<ParseTable> for TokenStream {
     fn from(table: ParseTable) -> Self {
         table.export().into()

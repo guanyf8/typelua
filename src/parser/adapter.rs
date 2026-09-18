@@ -1,5 +1,5 @@
-use crate::lexer::type_def::{OpType, Reserved, Token};
 use super::table::{NOT_EXIST, SIMPLE_COL, symbol_col};
+use crate::lexer::type_def::{OpType, Reserved, Token};
 
 /// reserved -> index in grammar.names
 pub const RESERVED_COL: [u32; Reserved::LEN] = {
@@ -22,7 +22,6 @@ pub const OP_COL: [u32; OpType::COMPLEX_OP_LEN] = {
     }
     t
 };
-
 
 pub const COL_NAME: u32 = symbol_col("NAME");
 pub const COL_NUMERAL: u32 = symbol_col("NUMERAL");
@@ -49,7 +48,7 @@ pub const fn col(token: &Token<'_>) -> u32 {
         }
         Token::OPERATOR(o) => match o.index() {
             Some(i) => OP_COL[i],
-            None => NOT_EXIST,     // 不可达：SIMPLE 已拦住
+            None => NOT_EXIST, // 不可达：SIMPLE 已拦住
         },
     }
 }

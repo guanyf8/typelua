@@ -39,16 +39,22 @@ impl ParseTable {
         let rule_lhs = self.rule_lhs.iter().copied();
         let rule_rhs_len = self.rule_rhs_len.iter().copied();
         // 标签名直接当枚举变体名
-        let prod_variants: Vec<Ident> = self.label_names.iter()
-            .map(|name| Ident::new(name, Span::call_site())).collect();
-        let rule_prod: Vec<TokenStream> = self.rule_label.iter()
+        let prod_variants: Vec<Ident> = self
+            .label_names
+            .iter()
+            .map(|name| Ident::new(name, Span::call_site()))
+            .collect();
+        let rule_prod: Vec<TokenStream> = self
+            .rule_label
+            .iter()
             .map(|slot| match slot {
                 Some(index) => {
                     let variant = &prod_variants[*index as usize];
                     quote! { Some(Prod::#variant) }
                 }
                 None => quote! { None },
-            }).collect();
+            })
+            .collect();
 
         quote! {
             pub const NUM_STATES:  usize = #state_count;
@@ -79,7 +85,7 @@ impl ParseTable {
 
             #[inline]
             pub fn prod(rule: u32) -> Option<Prod> { RULE_PROD[rule as usize] }
-            
+
 
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub enum Action {

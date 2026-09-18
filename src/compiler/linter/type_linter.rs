@@ -1,28 +1,166 @@
-use super::types::*;
+//! 类型 linter：属性求值 + 诊断。
+//!
+//! 分节导航（改动前先认准落在哪一节）：
+//!   §1 节点属性   node_values 的存取，以及「多值截一个 / 取第 i 个值」这类
+//!                 只关乎属性本身的归一
+//!   §2 CST 形状   按形状认节点。全是只读 ast 的纯查询，不碰 linter 状态
+//!   §3 名字表     作用域栈：变量与块级类型名。栈内落空才去问 Session
+//!   §4 定值分析   流帧 / 分支合并 / 可信度降级
+//!   §5 分派       `resolve` 与 `resolve_prod`：本文件的目录，一个标签一行
+//!   §6 表达式     运算、索引、字段查找、调用、变量读
+//!   §7 表构造     值位表字面量与类型位匿名 record 共用的字段收集
+//!   §8 类型位     类型名 / 泛型实例化 / 联合 / 交 / 列表打包
+//!   §9 声明与语句 local / 全局赋值 / extern / function，以及驱动点要用的动作
+//!   §10 类与方法   class 子系统：声明填体、继承、字段，以及类体内外的方法定义
+//!   §11 跨模块    import / pub：只搬「类型名 -> DeclId」，纯编译期
+//!   §12 占位      语义不在节点本身上的产生式，一律返回 UNKNOWN
+//!   驱动          `impl Linter`：前序开作用域与流帧、后序求值与收口
+//!
+//! 文件太大，按上面的分节拆了几块到同名子模块（都还是 `impl TypeLinter` 的
+//! 内在方法，标 pub(super) 给父模块和兄弟节调用）：§4→flow.rs、§6→expr.rs、
+//! §7→table.rs、§8→type_pos.rs、§9→decl_stmt.rs、§10→class.rs、§11→cross_module.rs。
+//! §1/§2/§3/§5/§12 与驱动仍留在本文件。
+//!
+//! 两条贯穿全文的约定：
+//!   - **求值在后序**（`leave`）：孩子的类型先算好才谈得上组合。要在前序做的
+//!     事只有三类，且各自在原处写明了为什么（作用域/流帧的「进」、@VarRef 的
+//!     两条诊断、`local function` 的名字预声明）
+//!   - `resolve_*` 出类型、`check_*` 出诊断。前者的返回值会被登记进
+//!     `node_values` 供父节点读，后者只往 log 里写
+
+// 属性只有一种值：`TypeId`。类型列表也是一等的（`Types::Pack(ListId)`），装进去用
+// `type_arenas.pack(..)`、拆出来用 `type_arenas.as_list(..)`，中间只走 TypeId 一条道
 use super::*;
 use crate::compiler::utils::string_literal;
+use crate::lexer::type_def::*;
 use crate::parser::ast::Tree;
 use crate::parser::parser::*;
-use crate::lexer::type_def::*;
 use crate::parser::table::*;
-
-// 不再有 Value：类型列表现在是一等的 `Types::Pack(ListId)`，和别的类型一样用 TypeId 携带。
-// 装进去用 `type_arenas.pack(..)`，拆出来用 `type_arenas.as_list(..)`，中间只走 TypeId 一条道。
-
-use core::panic;
 use std::collections::HashMap;
+use std::collections::HashSet;
+
+// TypeLinter 的 impl 按 §分节拆到这些子模块里：都是 `impl TypeLinter` 的
+// 内在方法，跨文件互调不用 import；方法在子模块里标 pub(super)，父模块的分派
+// （§5）与各兄弟节才看得见。子模块靠 `use super::*` 取到本文件的私有辅助类型
+mod class; // §10 类与方法
+mod decl_and_stat; // §9 声明与语句
+mod expr; // §6 表达式
+mod flow; // §4 定值分析
+mod import; // §11 import / pub
+mod table; // §7 表构造
+mod type_note; // §8 类型位
+mod types;
+
+use types::*;
+
 struct Scope {
-    variables: HashMap<String, TypeId>,
-    type_names: HashMap<String, TypeRef>,  // 块级类型名：声明时注册，内层遮蔽外层
+    /// 变量位。存 `VarSlot` 而不是裸 `TypeId`：定值分析要那一位 `inited`，
+    /// 「赋值背叛声明」的诊断要 `decl_span`
+    variables: HashMap<String, VarInfo>,
+    /// 本块入口处的 nil 收窄（`if s ~= nil then` 的体内 s 不再含 nil）。
+    /// 和 `variables` 分两张表放：它**不是一次声明** —— 同层再 `local s`
+    /// 不算重复声明，而变量的归属（哪一层、inited 没没）也还归原那格管
+    narrowed: HashMap<String, TypeId>,
+    type_names: HashMap<String, TypeRef>, // 块级类型名：声明时注册，内层遮蔽外层
 }
 
 impl Scope {
     fn new() -> Self {
         Scope {
             variables: HashMap::new(),
+            narrowed: HashMap::new(),
             type_names: HashMap::new(),
         }
     }
+}
+
+/// 一次「`inited` 从 false 推到 true」的翻转。回滚和取交集都按它走。
+///
+/// 光记名字不行：分支里 `local n:number` 遮蔽外层同名变量、再给它赋值时，
+/// 按名字回滚会打到外层那一个。得把「当时打的是哪一格」一起记下来
+#[derive(Clone, PartialEq)]
+struct InitFlip {
+    name: String,
+    /// 置位落在 `scope_stack` 的第几层。`None` = Session 里的全局
+    scope: Option<usize>,
+}
+
+/// 一个「直线区域」的帧：文件本体、一条分支块、或一个函数体。
+/// 开着的时候是它，关掉之后结果是 `BranchExit`
+struct FlowFrame {
+    /// 进来时 `init_record` 的长度。本帧内的翻转全在这之后
+    record_mark: usize,
+    /// 进来时作用域栈的深度。比它深的翻转落在离开时已经弹掉的作用域里，
+    /// 那些变量出了本帧就不存在，既不回滚也不参与交集
+    scope_depth: usize,
+    /// 已经 `return` / `break` / `goto` / 调过不返回的函数：后面的语句到不了，
+    /// 这一支也就不参与交集。`if c then n=1 else return end` 就靠它走通
+    terminated: bool,
+    /// 本帧已经报过一条「到不了」。不可达是成段出现的，逐条报就是一屏；
+    /// 而「已经报过」是本帧的属性不是全局的 —— 内层块报过不影响外层再报
+    dead_reported: bool,
+    /// 帧内出现过 `goto` / label：向后跳让线性合并失效（那才需要定点迭代），
+    /// 于是这整段的 inited 检查降级为放过：宁可漏报，不误报
+    untrusted: bool,
+    /// 这一格是函数体（文件 chunk 也算，Lua 里它就是个函数）。它同时是两件事
+    /// 的边界：`untrusted` 往外传到这里为止（嵌套闭包里的一个 `goto` 不应该
+    /// 把整个文件的检查关掉），`return` 也终结不了它外面那层
+    is_fn_body: bool,
+}
+
+/// 一个函数体的返回信息。进 funcbody / methoddef 压一格，出体弹掉；
+/// 嵌套闭包各占一格，所以是栈
+struct RetFrame {
+    /// 体那个节点。leave 里认下标才敢弹，也是「推断出来的返回类型归谁」的钥匙
+    node: usize,
+    /// 带 rettype 槽的那个节点：funcbody 是它自己，@MethodDef 是它的 methodsig。
+    /// 标注的返回类型要从这儿取
+    sig: usize,
+    /// 写了 `->` 没有。**形状**在前序就看得出来，而类型得等 rettype 那棵子树求完
+    annotated: bool,
+    /// 函数自己的名字，`function f` / `local function f` 才有。体里读到它
+    /// 而又没标注返回类型，就是「递归函数必须标注返回类型」
+    name: Option<NameId>,
+    /// 体里见过的 return 值，每条 return 一项。没标注时靠它们推返回类型
+    seen: Vec<TypeId>,
+    /// 「递归须标注」已经报过：一个体里可能有好几处自引用，报一次就够
+    reported: bool,
+}
+
+/// 条件里那一句 nil 测试的形状。三种的区别在「反面能不能用」：
+/// `s ~= nil` / `s == nil` 两面都确切，而裸 `if s then` 只正面确切 ——
+/// 落空那一支里 s 可能是 false，那不能推出它是 nil
+#[derive(Clone, Copy)]
+enum NilTest {
+    /// `s ~= nil`
+    NotNil,
+    /// `s == nil`
+    IsNil,
+    /// 裸名字当条件：`if s then`
+    Truthy,
+}
+
+/// 一条分支跑完的结果：`FlowFrame` 关掉之后留下的那些
+struct BranchExit {
+    /// 本分支里翻转过的位。只记翻转，所以天然去重，交集就是一次 `contains`
+    flips: Vec<InitFlip>,
+    terminated: bool,
+}
+
+/// 各分支的置位怎么合进外层帧。三条路子一一对应 Lua 的语句种类，分的是
+/// 「这些分支盖住了多少路径」而**不是分支数** —— `do … end` 和没 else 的
+/// `if` 都只有一个块，却分属 `Always` 和 `Skippable`
+#[derive(Clone, Copy, PartialEq)]
+enum JoinMode {
+    /// 分支穷尽了所有路径（`if … else … end`）：非终结分支取交集；
+    /// 一条都出不来就连外层一起终结
+    Exhaustive,
+    /// 还有一条什么都不做的落空路径，分支可能整个被跳过：交集必然为空，
+    /// 一律丢弃。没有 else 的 `if`、可能 0 次的 `while`/`for`、**以及函数体**
+    /// （不知道会不会被调）在定值分析里是同一件事，共用这一支
+    Skippable,
+    /// 那唯一一条分支必定执行（`do … end`、`repeat` 的体）：原样应用
+    Always,
 }
 
 /// 表字面量里一个元素的三种去处。位置字段和动态键都成不了具名 `Field`
@@ -35,6 +173,19 @@ enum Elem {
     Named(Field),
     /// 动态键 `[k]=v`：k 既不是 number 也不是字面量 string
     Dynamic { key: TypeId, val: TypeId },
+}
+
+/// 沿 extends 链拍平后的一个类字段（类型已代入实参）。`Field` 差一位
+/// `method` —— 那位在声明层的 `ClassField` 上、故意不进类型层，而构造检查
+/// 恰恰要靠它分路（方法不许在构造里给），所以单独成一个类型
+#[derive(Clone, Copy)]
+struct FlatField {
+    name: NameId,
+    ty: TypeId,
+    /// 声明里带了默认值：构造时可省
+    default: bool,
+    /// 方法（只有 @MethodDef 算），不是函数变量字段
+    method: bool,
 }
 
 /// 字段列表的两个来源。同一个 `resolve_fields` 服务两边，但重名的处理相反，
@@ -95,13 +246,30 @@ fn metamethod(op: &Token, unary: bool) -> Option<(&'static str, MetaResult)> {
     Some(hit)
 }
 
-pub struct TypeLinter<'a>{
+pub struct TypeLinter {
     // 这里都是一些要传递继承属性而存在的缓冲区，最理想的状况是
     // 这里什么也没有，可以从子节点自然继承
     //todo node_index 本身是稠密的 arena 下标，Tree 暴露节点总数后这里能换成 Vec<TypeId>
-    node_values:HashMap<usize, TypeId>,
+    node_values: HashMap<usize, TypeId>,
     scope_stack: Vec<Scope>,
-    ast: &'a Tree<NodeSyntax<'static>>,
+    /// 定值分析的置位日志。只记**翻转**（false -> true），所以回滚是精确的
+    init_record: Vec<InitFlip>,
+    /// 流帧栈。栈底那格是 `flow_reset` 压的「文件帧」，于是「当前帧」
+    /// 永远存在，`flow_*` 不必到处判空
+    flow_stack: Vec<FlowFrame>,
+    /// 分支语句栈。一条 `if` / 循环 / `do` 进来占一格，各分支的结果攒在里面。
+    /// 和 `flow_stack` 分开是因为 `elseif` 在 CST 里是左递归嵌套的（后一个
+    /// @ElseIf 包着前一个），各分支块并不是兄弟，攒在节点上攒不起来
+    join_stack: Vec<Vec<BranchExit>>,
+    /// 本文件里 hoist 出来的 class/typedef DeclId。DeclTable 跨文件累积，
+    /// 字段覆盖的收口（finish）只该扫本文件这几条，所以单列、prepare 里清
+    file_decls: Vec<DeclId>,
+    /// 正在填体的 class 的 Ref 类型（进类体 push、出类体 pop）。methodsig 里
+    /// 不标注的 self 靠栈顶取默认类型；嵌套的 class 也能叠，所以是栈不是单格
+    class_stack: Vec<TypeId>,
+    /// 函数体栈。返回值核对、无标注时的返回类型推断、以及「递归须标注」
+    /// 都靠栈顶那格，见 `RetFrame`
+    ret_stack: Vec<RetFrame>,
     /// 旧的 File + Global 合并进 Session：名字/类型/声明/导出都在这一层。
     ///
     /// **自持,不外借**。共享的只是类型，这件事不该被 linter 层感知：`&mut Session`
@@ -110,21 +278,40 @@ pub struct TypeLinter<'a>{
     ///
     /// 跨文件累积靠的是**粒度**：TypeLinter 的粒度是「类型阶段」而非「一个文件」，
     /// 同一个实例被驱动着依次跑过各文件，Session 自然攒起来。per-file 的只有
-    /// node_values / scope_stack，该在 prepare() 里重置
+    /// node_values / scope_stack，该在 prepare() 里重置。
+    ///
+    /// 这也是 `ast` 不当字段、而是每个节点方法都吃一个参数的原因：存成字段
+    /// 就把实例绑在一颗树上，`prepare` 拿到的那个 `&Tree` 生命周期更短、存不回去，
+    /// 跨文件累积当场矛盾；附带好处是 TypeLinter 本身变成 'static，
+    /// 不再和 `Box<dyn Linter>` 打架
     session: Session,
+    /// 当前文件所属模块名，`prepare` 里由驱动传进来的 module 字串 intern 而成。
+    /// pub 拿它当导出的键一半，跨文件的 import 靠它知道自己往哪个模块查
+    current_module: NameId,
 }
 
-
-impl<'a> TypeLinter<'a> {
-    pub fn new(ast: &'a Tree<NodeSyntax<'static>>) -> Self {
+impl TypeLinter {
+    pub fn new() -> Self {
+        let mut session = Session::new();
+        // 占个默认模块名：真正的名字 prepare 每换一次文件就重置一次，
+        // 但未经 prepare 就被直接戳的路径（如单独单元测）不能拿到未初始化的 NameId
+        let current_module = session.names.intern("");
         TypeLinter {
             node_values: HashMap::new(),
             scope_stack: Vec::new(),
-            ast,
-            session: Session::new(),
+            init_record: Vec::new(),
+            flow_stack: Vec::new(),
+            join_stack: Vec::new(),
+            file_decls: Vec::new(),
+            class_stack: Vec::new(),
+            ret_stack: Vec::new(),
+            session,
+            current_module,
         }
     }
-    
+
+    // ================== §1 节点属性 ==================
+
     fn register_value(&mut self, node_index: usize, ty: TypeId) {
         if self.node_values.contains_key(&node_index) {
             panic!("reentry node {} not allowed", node_index)
@@ -135,15 +322,266 @@ impl<'a> TypeLinter<'a> {
     /// 取子节点已注册的类型。没注册（标点符号、未实现的分支）算 UNKNOWN
     #[inline]
     fn child_type(&self, node_index: usize) -> TypeId {
-        self.node_values.get(&node_index).copied().unwrap_or(TypeId::UNKNOWN)
+        self.node_values
+            .get(&node_index)
+            .copied()
+            .unwrap_or(TypeId::UNKNOWN)
     }
 
     /// 取第 `child` 个孩子的类型。`'(' x ')'`、`ARROW x`、`NAME ':' x` 这类
     /// 「标点包着一个真家伙」的产生式全是这个形状
     #[inline]
-    fn pass_through(&self, node_index: usize, child: usize) -> TypeId {
-        self.child_type(self.ast.get_node(node_index).children[child])
+    fn pass_through(&self, ast: &Tree<NodeSyntax<'_>>, node_index: usize, child: usize) -> TypeId {
+        self.child_type(ast.get_node(node_index).children[child])
     }
+
+    /// `optype : /*empty*/ | ':' type` 的标注。空产生式不可折叠，所以「没标注」
+    /// 是个零孩子的节点而不是缺孩子。按**形状**判而不是按类型判：
+    /// 标注成什么都算标注过，就算它没推出来而是 UNKNOWN
+    fn type_annotation(&self, ast: &Tree<NodeSyntax<'_>>, optype: usize) -> Option<TypeId> {
+        if ast.get_node(optype).children.is_empty() {
+            return None;
+        }
+        Some(self.child_type(optype))
+    }
+
+    /// 多值截成单值：非末位的多值表达式、以及 `(f())` 都只留第一个值。
+    /// 一个值都不产出（`-> ()`）时是 nil —— Lua 里少给的实参就是 nil
+    fn truncate_ret(&self, ty: TypeId) -> TypeId {
+        match self.session.type_arenas.get_type(ty) {
+            Types::Pack(l) => {
+                let list = self.session.type_arenas.list(l);
+                // 只有 vararg 的 Pack（`-> ...T`）截出来是它的元素类型
+                list.fixed
+                    .first()
+                    .copied()
+                    .or(list.vararg)
+                    .unwrap_or(TypeId::NIL)
+            }
+            _ => ty,
+        }
+    }
+
+    /// explist 的第 `i` 个值。多于一个表达式时脊顶已经摊平成 Pack（末位展开、
+    /// 其余截断都在 `resolve_list` 里做完了），所以这里只是取下标；
+    /// 单个表达式不进 Pack，但它自己可能就是多值（`local a,b = f()`），
+    /// 所以先判 Pack 再兑底。
+    /// `None` = 名字比值多（`local a, b = 1`），那个位置没人给值
+    fn listnode_value_at(&self, values: TypeId, i: usize) -> Option<TypeId> {
+        match self.session.type_arenas.get_type(values) {
+            Types::Pack(l) => {
+                let list = self.session.type_arenas.list(l);
+                list.fixed.get(i).copied().or(list.vararg)
+            }
+            _ => (i == 0).then_some(values),
+        }
+    }
+
+    // ================== §2 CST 形状 ==================
+    //
+    // 全是只读 ast 的纯查询：驱动点、声明处理、列表摊平都要按形状认节点，
+    // 一处写一遍。它们不碰 linter 状态，所以放在最前面当地基
+
+    /// 这个节点上的 NAME 字面。返回的 `&str` 借的是 **ast** 而不是 self，
+    /// 所以拿到名字之后能接着 `&mut self` 去声明它
+    fn get_name<'t>(&self, ast: &'t Tree<NodeSyntax<'t>>, node: usize) -> Option<&'t str> {
+        match ast.get_node(node).get_data() {
+            NodeSyntax::Token(Token::NAME(name)) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// 第 `i` 个孩子上的 NAME 字面。`local x` / `param` / `extern` / `for` 控制变量
+    /// 这些名字位在文法里都是固定下标的裸 NAME
+    fn get_child_name<'t>(
+        &self,
+        ast: &'t Tree<NodeSyntax<'t>>,
+        node: usize,
+        i: usize,
+    ) -> Option<&'t str> {
+        self.get_name(ast, *ast.get_node(node).children.get(i)?)
+    }
+
+    /// 名字位上的 NAME 字面，取不到就炸。`what` 只进 panic 文案。
+    /// 这几处（类型名、字段名、方法名、变量名）都是文法保证的不变式，
+    /// 静静返回 None 会让一个畸形节点悄悄改变语义，比当场炸难查得多
+    fn name_or_panic<'t>(&self, ast: &'t Tree<NodeSyntax<'t>>, node: usize, what: &str) -> &'t str {
+        self.get_name(ast, node)
+            .unwrap_or_else(|| panic!("{what} must be identifier"))
+    }
+
+    /// 这个节点的产生式标签。token 叶子和无标签产生式都给 `None` ——
+    /// 按形状认节点的地方只关心「是不是我要找的那个标签」，
+    /// 摊开 `NodeSyntax` 只会让判断埋在两层模式里。
+    /// 要分辨「无标签产生式」与「token」的地方（只有 `spine`）自己去看 get_data
+    fn get_production(&self, ast: &Tree<NodeSyntax<'_>>, node: usize) -> Option<Prod> {
+        match ast.get_node(node).get_data() {
+            NodeSyntax::Prod(prod) => *prod,
+            NodeSyntax::Token(_) => None,
+        }
+    }
+
+    /// 这个 @VarRef 是赋值目标而不是读。`var : prefixexp optype @Var` 只出现在
+    /// varlist 里，而 `a.b = 1` / `a[i] = 1` 的 @VarRef 挂在 @Dot / @Index 底下，
+    /// 所以「父节点是 @Var」恰好等价于「裸名字的写位」—— 写位是声明点或赋值点，
+    /// 都不该按「读一个变量」去查表和报诊断
+    fn is_writing(&self, ast: &Tree<NodeSyntax<'_>>, node_index: usize) -> bool {
+        let Some(parent) = ast.get_node(node_index).parent else {
+            return false;
+        };
+        self.get_production(ast, parent) == Some(Prod::Var)
+    }
+
+    /// 这条语句在不在 chunk 的**直接**语句列表里。全局的声明点（带标注的
+    /// 全局赋值、`extern`、顶层 `function`）只认这一层：`if c then G = 1 end`
+    /// 里那个 G 执行不执行取决于运行时，拿它当声明点就等于让类型表跟着控制流飘。
+    ///
+    /// `chunk : block` 是无标签单孩子，被 parser 折叠掉了，所以根就是那个 @Block
+    fn is_chunk_top(&self, ast: &Tree<NodeSyntax<'_>>, node: usize) -> bool {
+        let mut cur = node;
+        while let Some(parent) = ast.get_node(cur).parent {
+            match self.get_production(ast, parent) {
+                Some(Prod::Block) => return ast.get_node(parent).parent.is_none(),
+                // stat_list 的脊，接着往上爬
+                Some(Prod::ListTail) => cur = parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// 这个节点是不是「前面还有语句」的语句位。不可达诊断只在这种位置报：
+    /// 一个块里的第一条语句永远可达（它所在的帧刚开），从第二条起才谈得上死代码。
+    ///
+    /// 两种形状：`stat_list stat` 那条唯一的两孩子 @ListTail 的末位，
+    /// 以及 @Block 里跟在语句列表后面的 retstat
+    fn follows_stat(&self, ast: &Tree<NodeSyntax<'_>>, node: usize) -> bool {
+        let Some(parent) = ast.get_node(node).parent else {
+            return false;
+        };
+        let p = ast.get_node(parent);
+        match self.get_production(ast, parent) {
+            Some(Prod::ListTail) => p.children.len() == 2 && p.children[1] == node,
+            Some(Prod::Block) => p.children.first() != Some(&node),
+            _ => false,
+        }
+    }
+
+    /// 这个 block 是不是某条语句的分支块。funcbody 的 block 不算 —— 它的帧在
+    /// @FuncBody 的 enter 里就开好了（`flow_enter_body`，多带一个边界位），
+    /// 这里再开一格就成了两层，`flow_leave_branch` 会把结果攒到错的那一帧
+    fn block_is_branch(&self, ast: &Tree<NodeSyntax<'_>>, block: usize) -> bool {
+        ast.get_node(block).parent.is_some_and(|p| {
+            matches!(
+                self.get_production(ast, p),
+                Some(
+                    Prod::Do
+                        | Prod::While
+                        | Prod::Repeat
+                        | Prod::If
+                        | Prod::IfElse
+                        | Prod::ElseIf
+                        | Prod::ForNum
+                        | Prod::ForNumStep
+                        | Prod::ForIn
+                )
+            ) as bool
+        })
+    }
+
+    /// 这个列表节点是不是脊顶。左递归的上一节必然以本节点作累加器（children[0]），
+    /// 元素永远在末位，所以「父节点是同族标签且 children[0] 是我」就还没到顶
+    fn is_spine_top(&self, ast: &Tree<NodeSyntax<'_>>, node: usize) -> bool {
+        let Some(parent) = ast.get_node(node).parent else {
+            return true;
+        };
+        match self.get_production(ast, parent) {
+            Some(Prod::ListTail) => ast.get_node(parent).children[0] != node,
+            _ => true,
+        }
+    }
+
+    /// 摊平左递归列表脊，按源码顺序返回元素节点。
+    /// `list : elem | list sep elem` 这一族形状一致 —— 累加器在 children[0]、元素在末位，
+    /// 包括 classfields 在内的十一条都贴 @ListTail，所以这里只认一个标签
+    fn spine(&self, ast: &Tree<NodeSyntax<'_>>, node: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut cur = node;
+        loop {
+            let n = ast.get_node(cur);
+            match n.get_data() {
+                NodeSyntax::Prod(Some(Prod::ListTail)) => {
+                    out.push(*n.children.last().unwrap());
+                    cur = n.children[0];
+                }
+                // `fieldlist : fields fieldsep` / `classfieldlist : classfields ','`：
+                // 无标签但两个符号，不满足折叠条件，且没有信息，要继续下探
+                NodeSyntax::Prod(None)
+                    if n.children.len() == 2
+                        && matches!(
+                            ast.get_node(n.children[1]).get_data(),
+                            NodeSyntax::Token(Token::OPERATOR(OpType::SIMPLE(',' | ';')))
+                        ) =>
+                {
+                    cur = n.children[0]
+                }
+                //剩下的其他None产生式，大概率到头了
+                _ => {
+                    out.push(cur);
+                    break;
+                }
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// `decllist : NAME optype | decllist ',' NAME optype` 的脊，按源码顺序返回
+    /// （NAME 节点, optype 节点）。元素是一**对**而不是单个节点，套不进 `spine()`
+    fn decl_items(&self, ast: &Tree<NodeSyntax<'_>>, node: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut cur = node;
+        loop {
+            let n = ast.get_node(cur);
+            match self.get_production(ast, cur) {
+                Some(Prod::DeclRest) => {
+                    out.push((n.children[2], n.children[3]));
+                    cur = n.children[0];
+                }
+                // @DeclFirst：脊到底了
+                _ => {
+                    out.push((n.children[0], n.children[1]));
+                    break;
+                }
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// 这条语句的各分支怎么合，`None` = 它不是带分支的语句。
+    /// 驱动点拿它判「要不要 flow_open」，所以两边用同一张表，不会配不上。
+    ///
+    /// @ElseIf 不在表里：它的 block 是**外层 if** 的一支（左递归嵌套，
+    /// 见 join_stack 的注释），自己不开帧也就不用合
+    fn join_mode(prod: &Prod) -> Option<JoinMode> {
+        Some(match prod {
+            // 这两条盖住了所有路径
+            Prod::IfElse => JoinMode::Exhaustive,
+            // 没有 else 的 if、可能 0 次的循环、以及不知道会不会被调的函数体
+            Prod::If
+            | Prod::While
+            | Prod::ForNum
+            | Prod::ForNumStep
+            | Prod::ForIn
+            | Prod::FuncBody => JoinMode::Skippable,
+            // 体至少跑一次
+            Prod::Do | Prod::Repeat => JoinMode::Always,
+            _ => return None,
+        })
+    }
+
+    // ================== §3 名字表 ==================
 
     // ---- 类型名注册（走 scope_stack，支持块级作用域）----
 
@@ -173,873 +611,175 @@ impl<'a> TypeLinter<'a> {
 
     /// 声明**局部**变量（`local` / 形参 / for 变量）：写进当前作用域。
     /// Lua 允许 `local x = 1; local x = 2` 在同一块里重新声明（后者遮蔽前者），
-    /// 没有 local 的赋值不是局部声明，走 declare_global
-    fn declare_variable(&mut self, name: &str, ty: TypeId) -> bool {
-        let scope = self.scope_stack.last_mut().expect("文件级作用域在 prepare 里已入栈");
-        scope.variables.insert(name.to_string(), ty).is_none()
+    /// 所以这里是覆盖语义，返回值只报告「是不是个新名字」；没有 local 的赋值
+    /// 不是局部声明，走 declare_global。
+    /// `assigned` = 声明语句本身就给了值（有初值 / 形参 / for 变量）
+    fn declare_variable(
+        &mut self,
+        name: &str,
+        ty: TypeId,
+        span: Span,
+        kind: VarScope,
+        assigned: bool,
+    ) -> bool {
+        let slot = self.session.new_slot(ty, span, kind, assigned);
+        let scope = self
+            .scope_stack
+            .last_mut()
+            .expect("文件级作用域在 prepare 里已入栈");
+        scope.variables.insert(name.to_string(), slot).is_none()
     }
 
-    /// 登记全局变量（`G_config:Config = {...}`，以及赋值给一个查不到的名字）。
+    /// 登记全局变量（`G_config:Config = {...}`、`extern`、抬升上来的顶层函数名）。
     /// 全局只存 Session 这一份：复制进 scope_stack 就得两头同步，本文件里
     /// 后登记的全局立刻会和快照对不上
-    fn declare_global(&mut self, name: &str, ty: TypeId) -> bool {
-        self.session.declare_global(name, ty)
+    fn declare_global(
+        &mut self,
+        name: &str,
+        ty: TypeId,
+        span: Span,
+        kind: VarScope,
+        assigned: bool,
+    ) -> bool {
+        let slot = self.session.new_slot(ty, span, kind, assigned);
+        self.session.declare_global(name, slot)
+    }
+
+    /// 同层重复声明就报。Lua 允许同层遮蔽（`local x; local x`），TypeLua 不允许 ——
+    /// 跨层遮蔽（内层 block 盖外层同名）不在此列，那查的是 last() 这一格。
+    /// 报完照样让调用方接着 declare（覆盖旧格），免得后面每次读这个名字
+    /// 都因为「查不到」再叠一条误报
+    fn reject_same_scope_redecl(&self, name: &str, span: Span, log: &mut Vec<Logger>) {
+        if self
+            .scope_stack
+            .last()
+            .is_some_and(|s| s.variables.contains_key(name))
+        {
+            log.push(Logger {
+                span,
+                msg: format!("局部变量 {name} 在同一层作用域里重复声明"),
+            });
+        }
+    }
+
+    /// 赋值：把「已初始化」置上。从内向外找第一层持有这个名字的作用域就地置位，
+    /// 栈内全落空再去 Session 兜全局。返回 false = 这名字压根没声明过。
+    ///
+    /// 只认**整体赋值**。`r.host = "x"` 里的 `r` 走的是读的那条路 ——
+    /// 于是「不存在先声明再逐项注入字段」不必单独立规则，它自然报「r 可能尚未赋值」。
+    ///
+    /// 真把 false 推成 true 的那一次会记进 `init_record`：分支退出时靠它回滚。
+    /// 对本来就 inited 的变量再赋值不留痕，所以日志里同一格最多出一次。
+    ///
+    /// 还兼着把这个名字的 nil 收窄抹掉：`if s ~= nil then s = nil end` 之后
+    /// 那条收窄已经不成立了，留着就是不健全
+    fn mark_inited(&mut self, name: &str) -> bool {
+        let mut flipped: Option<InitFlip> = None;
+        let mut found = false;
+        for (depth, scope) in self.scope_stack.iter_mut().enumerate().rev() {
+            scope.narrowed.remove(name);
+            if let Some(slot) = scope.variables.get_mut(name) {
+                if !slot.inited {
+                    slot.inited = true;
+                    flipped = Some(InitFlip {
+                        name: name.to_string(),
+                        scope: Some(depth),
+                    });
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            match self.session.mark_global_inited(name) {
+                None => return false,
+                Some(true) => {
+                    flipped = Some(InitFlip {
+                        name: name.to_string(),
+                        scope: None,
+                    });
+                }
+                Some(false) => {}
+            }
+        }
+        if let Some(mark) = flipped {
+            self.init_record.push(mark);
+        }
+        true
     }
 
     /// 从内向外查变量，内层遮蔽外层；scope_stack 全落空才去 Session 兜全局，
     /// 「局部遮蔽全局」就是这个顺序的结果。
-    /// 兜到底是 UNKNOWN：读没赋值过的全局在 Lua 里合法（值是 nil）
-    fn lookup_variable(&self, name: &str) -> TypeId {
-        self.scope_stack
-            .iter()
-            .rev()
-            .find_map(|scope| scope.variables.get(name).copied())
-            .or_else(|| self.session.lookup_global(name))
-            .unwrap_or(TypeId::UNKNOWN)
-    }
-
-        /// 多值截成单值：非末位的多值表达式、以及 `(f())` 都只留第一个值。
-    /// 一个值都不产出（`-> ()`）时是 nil —— Lua 里少给的实参就是 nil
-    fn truncate_ret(&self, ty: TypeId) -> TypeId {
-        match self.session.type_arenas.get_type(ty) {
-            Types::Pack(l) => {
-                let list = self.session.type_arenas.list(l);
-                // 只有 vararg 的 Pack（`-> ...T`）截出来是它的元素类型
-                list.fixed.first().copied().or(list.vararg).unwrap_or(TypeId::NIL)
-            }
-            _ => ty,
-        }
-    }
-
-    fn resolve_prod(&mut self, prod:&Prod, node_index:usize, log:&mut Vec<Logger>)->TypeId{
-        match prod {
-            // ---- 运算。参数是操作符 token 所在的孩子下标 ----
-            Prod::BinOp => self.resolve_operator(node_index, 1, log),
-            Prod::UnOp => self.resolve_operator(node_index, 0, log),
-
-            // ARROW retspec
-            // '(' multilist ')'
-            // '(' explist ')'
-            // '(' type ')'
-            // ':' type
-            // ELLIPSIS type
-            Prod::ReturnType | Prod::RetMulti | Prod::Args |
-            Prod::ParenType | Prod::TypeAnnotation | Prod::VarargTyped=> self.pass_through(node_index, 1),      
-            // NAME ':' type，名字纯文档
-            // cast_exp AS type
-            // NAME '=' exp
-            Prod::ArgTypeNamed |Prod::Cast |Prod::FieldNamed => self.pass_through(node_index, 2),    
-            Prod::FieldKV => self.pass_through(node_index, 4),         // '[' exp ']' '=' exp
-
-            
-            Prod::RetVoid | Prod::ArgsEmpty => TypeId::VOID,
-            // 表达式位的 `{}` 和类型位的 `{}` 是同一个东西，intern 后同一个 TypeId
-            Prod::TableEmpty | Prod::RecordEmpty => self.session.type_arenas.record(vec![]),
-            // 非空的那两个同理：`'{' fieldlist '}'` 与 `'{' classfieldlist '}'`
-            Prod::Table => self.resolve_fields(node_index, FieldSite::Literal, log),
-            Prod::Record => self.resolve_fields(node_index, FieldSite::Record, log),
-
-            // ---- 类型位 ----
-            Prod::FuncType => self.resolve_func_type(node_index),
-            Prod::Union => self.resolve_union(node_index),
-            Prod::Intersect => self.resolve_intersect(node_index),
-            Prod::GenericType => self.resolve_generic_type(node_index),
-            // `X ',' vararg`：两处形状和语义都一样
-            Prod::ParamsVararg | Prod::RetVararg => self.pack_vararg(node_index),
-            Prod::RetFixed => self.pack_fixed(node_index),
-
-            // ---- 表达式 ----
-            Prod::Call => { let f = self.pass_through(node_index, 0); self.ret_of(f) }
-            Prod::MethodCall => self.resolve_method_call(node_index),
-            Prod::Paren => self.resolve_paren(node_index, log),
-            Prod::Index => self.resolve_index(node_index, log),
-            Prod::Dot => self.resolve_dot(node_index, log),
-            Prod::DottedName => self.resolve_dotted_name(node_index, log),
-            Prod::TurboFish => self.resolve_turbo_fish(node_index, log),
-            Prod::FuncExpr => self.resolve_func_expr(node_index, log),
-            Prod::FuncBody => self.resolve_func_body(node_index, log),
-
-            // ---- 声明与绑定 ----
-            Prod::Var => self.resolve_var(node_index, log),
-            Prod::Param => self.resolve_param(node_index, log),
-            Prod::MethodDecl => self.resolve_method_decl(node_index, log),
-            Prod::MethodDef => self.resolve_method_def(node_index, log),
-            Prod::MethodSig => self.resolve_method_sig(node_index, log),
-            Prod::Generics => self.resolve_generics(node_index, log),
-            Prod::TypeParamBound => self.resolve_type_param_bound(node_index, log),
-            Prod::ListTail => self.resolve_list(node_index, log),
-            Prod::DeclFirst | Prod::DeclRest => self.resolve_decl_list(node_index, log),
-
-            // ---- 语句：不产出类型，给 UNKNOWN（它**不是** VOID）----
-            Prod::Import => { self.resolve_import(node_index, log); TypeId::UNKNOWN }
-            Prod::ImportAlias => { self.resolve_import_alias(node_index, log); TypeId::UNKNOWN }
-            Prod::Pub => { self.resolve_pub(node_index, log); TypeId::UNKNOWN }
-            Prod::Block => { self.check_block(node_index, log); TypeId::UNKNOWN }
-            Prod::Do | Prod::While | Prod::Repeat | Prod::If | Prod::IfElse
-            | Prod::ElseIf | Prod::ForNum | Prod::ForNumStep | Prod::ForIn => {
-                self.check_control_flow(node_index, log);
-                TypeId::UNKNOWN
-            }
-            Prod::Assign => { self.check_assign(node_index, log); TypeId::UNKNOWN }
-            Prod::ExprStat => { self.check_expr_stat(node_index, log); TypeId::UNKNOWN }
-            Prod::Goto | Prod::Label => { self.check_jump(node_index, log); TypeId::UNKNOWN }
-            Prod::Return | Prod::ReturnVoid => { self.check_return(node_index, log); TypeId::UNKNOWN }
-            Prod::LocalDecl => { self.check_local_decl(node_index, log); TypeId::UNKNOWN }
-            Prod::LocalDeclInit => { self.check_local_decl_init(node_index, log); TypeId::UNKNOWN }
-            Prod::Extern => { self.check_extern(node_index, log); TypeId::UNKNOWN }
-            Prod::ClassDecl => { self.check_class_decl(node_index, log); TypeId::UNKNOWN }
-            Prod::ClassDeclExtends => { self.check_class_decl_extends(node_index, log); TypeId::UNKNOWN }
-            Prod::TypeDef => { self.check_type_def(node_index, log); TypeId::UNKNOWN }
-            Prod::FuncDecl => { self.check_func_decl(node_index, log); TypeId::UNKNOWN }
-            Prod::MethodName => { self.resolve_method_name(node_index, log); TypeId::UNKNOWN }
-            Prod::ClassBody => { self.resolve_class_body(node_index, log); TypeId::UNKNOWN }
-            Prod::FieldDecl => { self.resolve_field_decl(node_index, log); TypeId::UNKNOWN }
-        }
-    }
-
-    // 表达式运算
-    /// `op_child` 是操作符 token 所在的下标：BinOp 在中间（1）、UnOp 在最前（0）。
-    /// 它同时也是 arity —— `-` 和 `~` 一元二元同字符但元方法不同，得靠它分开。
     ///
-    /// 两条路：操作数都是标量走内建结果（Lua 在 number/string 之间自动强转）；
-    /// 否则要求两侧**同类型**、且那个类型带对应元方法，然后返回同类型。
-    /// class 查 fields、table 查交进来的元表 record，两者是 `lookup_field` 的同一条路
-    fn resolve_operator(&mut self, node_index: usize, op_child: usize, log: &mut Vec<Logger>) -> TypeId {
-        let op = self.ast.get_node(node_index).children[op_child];
-        let unary = op_child == 0;
-        let NodeSyntax::Token(op_token) = self.ast.get_node(op).get_data() else {
-            return TypeId::UNKNOWN;
-        };
-        // 内建出口：操作数都是标量时的结果，也是不查元表那些运算符的唯一出口
-        let builtin = match op_token {
-            Token::RESERVED(Reserved::AND | Reserved::OR | Reserved::NOT) => TypeId::BOOLEAN,
-            Token::OPERATOR(OpType::EQ | OpType::NE | OpType::LE | OpType::GE) => TypeId::BOOLEAN,
-            Token::OPERATOR(OpType::SIMPLE('<' | '>')) => TypeId::BOOLEAN,
-            Token::OPERATOR(
-                OpType::SIMPLE('+' | '-' | '*' | '/' | '%' | '^' | '#' | '~') | OpType::IDIV,
-            ) => TypeId::NUMBER,
-            Token::OPERATOR(OpType::SHL | OpType::SHR) => TypeId::NUMBER,
-            Token::OPERATOR(OpType::CONCAT) => TypeId::STRING,
-            _ => TypeId::UNKNOWN,
-        };
-        let Some((mm, kind)) = metamethod(op_token, unary) else {
-            return builtin;
-        };
-        // 操作数位可能是多值（`f() + 1`），截到一个
-        let lhs = self.truncate_ret(self.pass_through(node_index, if unary { 1 } else { 0 }));
-        let span = self.ast.span_of(node_index);
-        let operand = if unary {
-            lhs
-        } else {
-            let rhs = self.truncate_ret(self.pass_through(node_index, 2));
-            // 两侧都是标量就不必同类型：`1 .. "a"`、`"2" * 3` 在 Lua 里都合法
-            if self.is_primitive_operand(lhs) && self.is_primitive_operand(rhs) {
-                return builtin;
-            }
-            if lhs != rhs {
-                log.push(Logger {
-                    span,
-                    msg: format!(
-                        "{} 运算要求两侧同类型，实际是 {} 和 {}",
-                        mm,
-                        self.session.show(lhs),
-                        self.session.show(rhs)
-                    ),
-                });
-                return TypeId::UNKNOWN;
-            }
-            lhs
-        };
-        if self.is_primitive_operand(operand) {
-            return builtin;
-        }
-        // class 走 Ref 进 fields（带 extends 链）、`table<K,V> & {__add:...}` 走 Intersect
-        // 逐成员查 —— 用户要的「class 看 field」和「table 看元表」在 lookup_field 里是
-        // 同一条路，不用分开写
-        let name = self.session.names.intern(mm);
-        if self.lookup_field(operand, name).is_none() {
-            log.push(Logger {
-                span,
-                msg: format!(
-                    "{} 上没有 {} 元方法，不支持这个运算",
-                    self.session.show(operand),
-                    mm
-                ),
-            });
-            // 给 UNKNOWN 而不是 builtin：这里已经报过一次，回落成 number 会让后面
-            // 拿着一个假类型继续算，错报到别处去
-            return TypeId::UNKNOWN;
-        }
-        match kind {
-            MetaResult::SameAsOperand => operand,
-            MetaResult::Fixed => builtin,
-        }
+    /// 返回 `Option` 而不是 `TypeId`：「查不到」和「查到了但类型是 UNKNOWN」是
+    /// 两回事，前者要报「未声明」，后者是上游推断失败，不该在它上面再叠一条误报
+    fn lookup_variable(&self, name: &str) -> Option<VarInfo> {
+        self.lookup_variable_at(name).map(|(_, slot)| slot)
     }
 
-    /// 不查元表就能算的操作数。number/string 之间 Lua 的算术和 `..` 会自动强转；
-    /// any/unknown 是渐进类型的逃逸口；Generic 要等实例化才知道有没有元方法。
-    /// 和 `expect_key` 同一个尺度：宁可漏报，也不在类型信息还不全的阶段刷误报
-    fn is_primitive_operand(&self, ty: TypeId) -> bool {
-        matches!(
-            ty,
-            TypeId::NUMBER | TypeId::STRING | TypeId::ANY | TypeId::UNKNOWN
-        ) || matches!(self.session.type_arenas.get_type(ty), Types::Generic(_))
-    }
-
-    //todo Lua 的括号会把多值截成一个值（`(f())` 只留第一个），所以不能简单
-    //passthru —— 改成 `truncate_ret(passthru(node_index, 1))` 即可
-    fn resolve_paren(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-
-    // 访问与调用
-    /// `prefixexp '[' exp ']'` —— 只有内建容器能静态定出元素类型。
-    /// record 没有字面量类型（算不出键到底是哪个字段）、class 字段该走 `.`，
-    /// 所以它们和 any 一样给 ANY：渐进类型的逃逸口，不是 UNKNOWN
-    fn resolve_index(&mut self, node_index: usize, log: &mut Vec<Logger>) -> TypeId {
-        let base = self.pass_through(node_index, 0);
-        // `t[f()]`：键位不是末位，多值要截到一个
-        let key = self.truncate_ret(self.pass_through(node_index, 2));
-        let span = self.ast.span_of(node_index);
-        if let Some(elem) = self.session.type_arenas.as_array(base) {
-            self.expect_key(key, TypeId::NUMBER, span, log, "数组下标");
-            return elem;
-        }
-        if let Some((k, v)) = self.session.type_arenas.as_map(base) {
-            self.expect_key(key, k, span, log, "表键");
-            return v;
-        }
-        // 剩下的里面有确定不是表的：索引 nil / number / boolean 在 Lua 里是运行时错误
-        // （string 不拦 —— 它有元表，`s[1]` 只是 nil 而不报错）
-        if matches!(base, TypeId::NIL | TypeId::NUMBER | TypeId::BOOLEAN) {
-            log.push(Logger {
-                span,
-                msg: format!("不能索引 {} 类型的值", self.session.show(base)),
-            });
-        }
-        TypeId::ANY
-    }
-
-    /// 键类型的粗检。真正的可赋值判定（union / 名义子类型 / 宽度子类型）要等
-    /// assignable，这里只拦「写错得很明白」的：any / unknown / 泛型形参一律放过，
-    /// 否则在类型信息还不全的阶段会刷一屏误报
-    fn expect_key(&self, got: TypeId, want: TypeId, span: Span, log: &mut Vec<Logger>, what: &str) {
-        if got == want || matches!(got, TypeId::ANY | TypeId::UNKNOWN) {
-            return;
-        }
-        if matches!(self.session.type_arenas.get_type(got), Types::Generic(_)) {
-            return;
-        }
-        log.push(Logger {
-            span,
-            msg: format!(
-                "{}应为 {}，实际是 {}",
-                what,
-                self.session.show(want),
-                self.session.show(got)
-            ),
-        });
-    }
-
-    fn resolve_dot(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    fn resolve_dotted_name(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    /// 在 owner 上查名为 name 的字段/方法，返回**已代入实参**的类型。
-    /// 字段类型存的是类自己的泛型形参，所以查到就得 subst。
-    /// 沿 extends 链上溯时，父类的 Ref 实参先用子类的替换过一遍 ——
-    /// `class Flipped<A,B> : Pair<B,A>` 的重排靠这一步才不丢。
-    /// resolve_dot / resolve_index / resolve_method_call 也都该走它
-    fn lookup_field(&mut self, owner: TypeId, name: NameId) -> Option<TypeId> {
-        let mut cur = owner;
-        // extends 成环该由 check_class_decl_extends 报错；这里只负责不挂死
-        for _ in 0..64 {
-            match self.session.type_arenas.get_type(cur) {
-                // record 是普通table，没有元表
-                Types::Record(f) => {
-                    return self
-                        .session
-                        .type_arenas
-                        .fields(f)
-                        .iter()
-                        .find(|fld| fld.name == name)
-                        .map(|fld| fld.ty);
-                }
-                Types::Ref { decl, args } => {
-                    let generics = self.session.decls.get(decl).generics.clone();
-                    let arg_tys = self.session.type_arenas.list(args).fixed.clone();
-                    let s = self.session.type_arenas.intern_subst(&generics, &arg_tys);
-                    // 先把要用的拷成 Copy 值，借用结束后再动 arena
-                    let (hit, next) = match &self.session.decls.get(decl).body {
-                        DeclBody::Class(c) => (
-                            c.fields
-                                .iter()
-                                .find(|f| f.field.name == name)
-                                .map(|f| f.field.ty),
-                            c.extends,
-                        ),
-                        // 别名：展开定义体再查。递归 typedef 靠上面的圈数兜底
-                        DeclBody::Typedef(t) => (None, Some(t.target)),
-                    };
-                    match hit {
-                        Some(ty) => return Some(self.session.type_arenas.subst(ty, s)),
-                        None => cur = self.session.type_arenas.subst(next?, s),
-                    }
-                }
-                // 交类型：成员里依次查，命中即返。record & record 已在 intersect()
-                // 里合并，所以这里面最多一个 record，剩下是 Ref/table 这类不可约成员
-                Types::Intersect(l) => {
-                    let members = self.session.type_arenas.list(l).fixed.clone();
-                    return members.iter().find_map(|&m| self.lookup_field(m, name));
-                }
-                _ => return None,
+    /// 只问声明那一格，不带 nil 收窄。**写位**要的是这个：收窄说的是
+    /// 「此刻的值更具体」，而声明才是「这个变量允许装什么」。
+    /// `if s ~= nil then s = nil end` 里那次赋值是合法的 ——
+    /// 它只是让收窄失效（`mark_inited` 顺手抹掉那一条）
+    fn lookup_declared(&self, name: &str) -> Option<VarInfo> {
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(slot) = scope.variables.get(name) {
+                return Some(*slot);
             }
         }
-        None
+        self.session.lookup_global(name)
     }
 
-    /// 调用一个可调用类型得到的值。ret 是列表，单个会被 pack_of 折回裸类型
-    fn ret_of(&mut self, callee: TypeId) -> TypeId {
-        match self.session.type_arenas.get_type(callee) {
-            Types::Func { ret, .. } => self.session.type_arenas.pack_of(ret),
-            _ => TypeId::UNKNOWN,
-        }
-    }
-
-    //todo 调用产出多值时返回 Pack。注意 Lua 的截断/展开规则：只有末位的多值
-    //表达式才展开，非末位要截到 1 个值——Pack 不自动扁平化，这一步必须手写
-    /// prefixexp ':' NAME args
-    fn resolve_method_call(&mut self, node_index: usize) -> TypeId {
-        let children = &self.ast.get_node(node_index).children;
-        //prefix是class/table/array(后两者都是class)没跑了
-        let recv = self.child_type(children[0]);
-        let name = match self.ast.get_node(children[2]).get_data() {
-            NodeSyntax::Token(Token::NAME(n)) => self.session.names.intern(n),
-            _ => panic!("method name must be identifier"),
-        };
-        // 查不到先算 UNKNOWN：“没这个方法”归后面的检查阶段报，传递阶段不发诊断
-        match self.lookup_field(recv, name) {
-            Some(m) => self.ret_of(m),
-            None => TypeId::UNKNOWN,
-        }
-    }
-    fn resolve_turbo_fish(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-
-    // 表构造
-    /// `'{' fieldlist '}'`（表字面量）与 `'{' classfieldlist '}'`（类型位的匿名 record）。
-    /// 两边走的是不同的列表非终结符，但形状和终点一样 —— 摊脊取元素、逐个分类。
+    /// 和 `lookup_variable` 同一条链，额外报出它落在哪一层：`Some(depth)` 是
+    /// scope_stack 的下标，`None` 是 Session 里的全局。
     ///
-    /// 出口不止 record 一种。三个桶各自成型、非空的交起来，塌不塌只看一条判据：
-    /// **键空间重不重叠**。
-    ///   - `array<T>` 的键是 number，`record` 的键是它列出的那几个字符串 —— 不重叠，
-    ///     所以 `{1, x=2}` 出 `array<number> & record{x:number}`，两条投影都通：
-    ///     `[i]` 走 as_array 扫交成员，`.x` 走 lookup_field
-    ///   - `array<T>` 和 `table<K,V>` 在 K 含 number 时重叠，两边都能被 number 索，
-    ///     交出来 as_array / as_map 都命中、`t[i]` 取谁没有说法 —— 所以这一对得合成
-    ///     一个 `table<number|K, V>`，位置元素的类型并进 V
-    ///   - record 一律**不**参与塌。塌下去就得往键里掺 `string`，那等于声称「任意
-    ///     string 键都给 V」，可 `{1, x=2}` 里 `t["y"]` 在 Lua 里是 nil 而不是 V ——
-    ///     那不只是变糊，是凭空发明一个不成立的许诺
+    /// 「可能尚未赋值」要按变量归属决定查不查（见 `init_checkable`），光有类型不够。
     ///
-    /// 于是七种组合都由这一条规则导出：单桶各出自己那种（类型位的匿名 record 永远
-    /// 走 record，因为 classfield 四种形式全是静态的）；`record & table`（动机 A）；
-    /// `array & record`；`table<number|K,V>`；`record & table<number|K,V>`
-    fn resolve_fields(&mut self, node_index: usize, site: FieldSite, log: &mut Vec<Logger>) -> TypeId {
-        let list = self.ast.get_node(node_index).children[1];
-        // 具名字段带上元素节点：重名诊断要报到出问题的那一项上，而不是整个表
-        let mut named: Vec<(Field, usize)> = Vec::new();
-        let mut positional = Vec::new();
-        let mut dyn_keys = Vec::new();
-        let mut dyn_vals = Vec::new();
-        for item in self.spine(list) {
-            match self.classify_field(item) {
-                Elem::Named(f) => named.push((f, item)),
-                Elem::Positional(ty) => positional.push(ty),
-                Elem::Dynamic { key, val } => {
-                    dyn_keys.push(key);
-                    dyn_vals.push(val);
+    /// nil 收窄就插在这条链上：同一层先问 `variables` 再问 `narrowed`，
+    /// 于是内层的收窄盖得住外层的声明，而本层真写了 `local s` 之后
+    /// 那一格又盖回收窄 —— 正是 Lua 的语义次序。
+    /// 收窄只换类型，`inited` / `decl_span` / 归属层次都跟原那格
+    fn lookup_variable_at(&self, name: &str) -> Option<(Option<usize>, VarInfo)> {
+        let mut narrowed: Option<TypeId> = None;
+        for (depth, scope) in self.scope_stack.iter().enumerate().rev() {
+            if let Some(slot) = scope.variables.get(name) {
+                let mut slot = *slot;
+                if let Some(ty) = narrowed {
+                    slot.ty = ty;
                 }
+                return Some((Some(depth), slot));
+            }
+            // 里层的收窄优先：只记第一个碰上的
+            if narrowed.is_none() {
+                narrowed = scope.narrowed.get(name).copied();
             }
         }
-        let fields = self.dedup_named(named, site, log);
-        let mut parts = Vec::with_capacity(2);
-        if !fields.is_empty() {
-            parts.push(self.session.type_arenas.record(fields));
-        }
-        match (!positional.is_empty(), !dyn_keys.is_empty()) {
-            // 键空间重叠的那一对：number 进键，位置元素的类型并进值
-            (true, true) => {
-                let mut keys = vec![TypeId::NUMBER];
-                keys.extend(dyn_keys);
-                let mut vals = positional;
-                vals.extend(dyn_vals);
-                let k = self.session.type_arenas.union(keys);
-                let v = self.session.type_arenas.union(vals);
-                let tab = self.table_of(k, v);
-                parts.push(tab);
+        self.session.lookup_global(name).map(|slot| {
+            let mut slot = slot;
+            if let Some(ty) = narrowed {
+                slot.ty = ty;
             }
-            (true, false) => {
-                let elem = self.session.type_arenas.union(positional);
-                let arr = self.array_of(elem);
-                parts.push(arr);
-            }
-            (false, true) => {
-                let k = self.session.type_arenas.union(dyn_keys);
-                let v = self.session.type_arenas.union(dyn_vals);
-                let tab = self.table_of(k, v);
-                parts.push(tab);
-            }
-            (false, false) => {}
-        }
-        // 三桶全空由 @TableEmpty / @RecordEmpty 接走，正常到不了。真到了必须显式给空
-        // record：intersect(vec![]) 返回的是 ANY，会把「空表」悄悄放成「什么都行」
-        if parts.is_empty() {
-            return self.session.type_arenas.record(vec![]);
-        }
-        // intersect() 不展开 Ref，所以 record 和容器就地留成两个成员；单成员时它自己
-        // 折叠掉（`1 => rest[0]`），所以只有一个桶非空的情况不用特判
-        self.session.type_arenas.intersect(parts)
+            (None, slot)
+        })
     }
 
-    /// 重名字段归一。必须在 `record()` 之前做掉：`intern_fields` 的 dedup 是为哈希
-    /// 一致性服务的（`{a:number, a:number}` 得和 `{a:number}` 同一个 TypeId），它保留
-    /// 第一个，正好和 Lua 相反。所以语义这一层得自己定：
-    ///   - 值位（`{a=1, a=2}`）：Lua 是后写覆盖先写，取最后一个，不报错
-    ///   - 类型位（`{a:number, a:string}`）：没有「覆盖」这回事，重名就是笔误，报错。
-    ///     报完同样取最后一个继续往下跑 —— 不因为一个笔误连带出一串假错
-    fn dedup_named(
-        &self,
-        named: Vec<(Field, usize)>,
-        site: FieldSite,
+    // ================== §5 分派 ==================
+    //
+    // 这两个函数是本文件的目录：`resolve` 分 Prod / Token 两路，
+    // `resolve_prod` 一个标签一行地指向下面各节
+
+    pub fn resolve(
+        &mut self,
+        ast: &Tree<NodeSyntax<'_>>,
+        node_index: usize,
         log: &mut Vec<Logger>,
-    ) -> Vec<Field> {
-        let mut at: HashMap<NameId, usize> = HashMap::new();
-        let mut out: Vec<Field> = Vec::new();
-        for (f, item) in named {
-            match at.get(&f.name) {
-                Some(&i) => {
-                    if site == FieldSite::Record {
-                        log.push(Logger {
-                            span: self.ast.span_of(item),
-                            msg: format!(
-                                "字段 {} 重复声明",
-                                self.session.names.resolve(f.name)
-                            ),
-                        });
-                    }
-                    out[i] = f;
-                }
-                None => {
-                    at.insert(f.name, out.len());
-                    out.push(f);
-                }
-            }
-        }
-        out
-    }
-
-    /// 元素节点 -> 三种去处。`@FieldKV` 要按**键**再分一次：字面量 string 键算静态
-    /// 具名（交回 collect_field）、number 键算数组形态、其余才是动态键。
-    /// 按键的**类型**而不是字面量判 number，所以 `{[1]=v}` 和 `{[i]=v}`（i:number）同归一类。
-    ///
-    /// collect_field 给 None 的就当位置字段：文法上 fields 侧剩下的只有裸 exp（单元素
-    /// 那条被折叠所以没标签），classfields 侧四种形式 collect_field 全接得住
-    fn classify_field(&mut self, node: usize) -> Elem {
-        if let NodeSyntax::Prod(Some(Prod::FieldKV)) = self.ast.get_node(node).get_data() {
-            let key_node = self.ast.get_node(node).children[1];
-            let literal_name = matches!(
-                self.ast.get_node(key_node).get_data(),
-                NodeSyntax::Token(Token::STRING(_))
-            );
-            if !literal_name {
-                // '[' exp ']' '=' exp：键在 1、值在 4
-                let key = self.child_type(key_node);
-                let val = self.pass_through(node, 4);
-                if key == TypeId::NUMBER {
-                    return Elem::Positional(val);
-                }
-                return Elem::Dynamic { key, val };
-            }
-        }
-        match self.collect_field(node) {
-            Some(f) => Elem::Named(f),
-            None => Elem::Positional(self.child_type(node)),
-        }
-    }
-
-    /// `array<T>`。内建 decl 已在 register_builtins 里占了 DeclId::ARRAY，直接拿它造 Ref：
-    /// 不走 lookup_type —— 字面量推断不应该被用户自己声明的同名 `array` 遮蔽掉
-    fn array_of(&mut self, elem: TypeId) -> TypeId {
-        let args = self.session.type_arenas.intern_list(vec![elem], None);
-        self.session.type_arenas.reference(DeclId::ARRAY, args)
-    }
-
-    /// `table<K,V>`，同上
-    fn table_of(&mut self, key: TypeId, val: TypeId) -> TypeId {
-        let args = self.session.type_arenas.intern_list(vec![key, val], None);
-        self.session.type_arenas.reference(DeclId::TABLE, args)
-    }
-
-    /// 列表的一项 -> record 字段。返回 None **只**表示「这不是一个具名字段」（动态键，
-    /// 或无标签的裸 exp 位置字段），classify_field 靠这个约定把 None 归给位置桶。
-    /// 所以名字取不到一律 panic 而不是返回 None —— 文法保证那几处就是 NAME，
-    /// 静静返回 None 会把一个畸形的具名字段误标成数组元素，比当场炸难查得多
-    ///
-    /// 按**元素**标签 dispatch 而不是按父产生式，因为两侧的元素标签集不相交：
-    /// fields 只出 @FieldNamed / @FieldKV / 裸 exp，classfields 只出 @FieldDecl /
-    /// @MethodDecl / @MethodDef。`NAME '=' exp` 两边都能写，但表达式位归约成
-    /// @FieldNamed、类型位归约成 @FieldDecl，文法已经把它们分开了，所以这个
-    /// match 没有死分支，也不会让类型位放进本该被文法拦掉的形式
-    fn collect_field(&mut self, node: usize) -> Option<Field> {
-        match self.ast.get_node(node).get_data() {
-            // NAME '=' exp：类型从 exp 推（@FieldNamed 已经把 children[2] 透上来了）
-            NodeSyntax::Prod(Some(Prod::FieldNamed)) => {
-                let name_node = self.ast.get_node(node).children[0];
-                let ty = self.child_type(node);
-                let NodeSyntax::Token(Token::NAME(n)) = self.ast.get_node(name_node).get_data()
-                else {
-                    panic!("field name must be identifier");
-                };
-                let name = self.session.names.intern(n);
-                // default 说的是**声明**有没有默认值，字面量里没这个概念。必须填 false：
-                // 类型位的 record 一律 false（`= exp` 由 checker 拒绝），填 true 会让
-                // `local t: {a:number} = {a=1}` 两边 intern 成不同 TypeId
-                Some(Field { name, ty, default: false })
-            }
-            NodeSyntax::Prod(Some(Prod::FieldDecl)) => Some(self.collect_field_decl(node)),
-            NodeSyntax::Prod(Some(Prod::FieldKV)) => {
-                // '[' exp ']' '=' exp：键在 children[1]、值在 children[4]
-                let key_node = self.ast.get_node(node).children[1];
-                match self.ast.get_node(key_node).get_data() {
-                    // 字面量 string 键就是个静态字段名，和 `NAME = exp` 等价
-                    NodeSyntax::Token(Token::STRING(s)) => Some(Field {
-                        name: self.session.names.intern(&string_literal(s)),
-                        // 字段类型取**值**。取键节点的类型是错的 —— 字面量 string 键
-                        // 的类型恒为 string，`{["a"] = 5}` 会推成 `a: string`
-                        ty: self.pass_through(node, 4),
-                        default: false,
-                    }),
-                    //动态字段：键不是字面量（`[k] = v`），没有静态名字就成不了具名
-                    // Field，所以不给 record 贡献字段、直接跳过。检测是上层的事
-                    _ => None,
-                }
-            }
-            NodeSyntax::Prod(Some(Prod::MethodDecl | Prod::MethodDef)) => {
-                let sig = self.ast.get_node(node).children[0];
-                let name_node = self.ast.get_node(sig).children[0];
-                let NodeSyntax::Token(Token::NAME(n)) = self.ast.get_node(name_node).get_data()
-                else {
-                    panic!("method name must be identifier");
-                };
-                let name = self.session.names.intern(n);
-                let ty = self.pass_through(node, 0);
-                Some(Field { name, ty, default: false })
-            }
-            _ => None,
-        }
-    }
-
-    /// 摊平左递归列表脊，按源码顺序返回元素节点。
-    /// `list : elem | list sep elem` 这一族形状一致 —— 累加器在 children[0]、元素在末位，
-    /// 包括 classfields 在内的十一条都贴 @ListTail，所以这里只认一个标签
-    fn spine(&self, node: usize) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut cur = node;
-        loop {
-            let n = self.ast.get_node(cur);
-            match n.get_data() {
-                NodeSyntax::Prod(Some(Prod::ListTail)) => {
-                    out.push(*n.children.last().unwrap());
-                    cur = n.children[0];
-                }
-                // `fieldlist : fields fieldsep` / `classfieldlist : classfields ','`：
-                // 无标签但两个符号，不满足折叠条件，且没有信息，要继续下探
-                NodeSyntax::Prod(None)
-                    if n.children.len() == 2 && matches!(
-                            self.ast.get_node(n.children[1]).get_data(),
-                            NodeSyntax::Token(Token::OPERATOR(OpType::SIMPLE(',' | ';')))
-                        ) => {
-                    cur = n.children[0]
-                }
-                //剩下的其他None产生式，大概率到头了
-                _ => {
-                    out.push(cur);
-                    break;
-                }
-            }
-        }
-        out.reverse();
-        out
-    }
-
-    // 函数相关
-    fn resolve_func_expr(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    fn resolve_func_body(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    fn resolve_method_decl(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    fn resolve_method_def(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    fn resolve_method_name(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn resolve_method_sig(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-
-    // 类型位
-    /// functype : function '(' [argtypes] ')' [rettype]
-    fn resolve_func_type(&mut self, node_index: usize) -> TypeId {
-        // children 取所有权：循环里要用 &mut self.session，不能一直挂着 self.ast 的借用
-        let children = self.ast.get_node(node_index).children.clone();
-        // @ReturnType 折出来的子节点是返回列表，其余（argtypes 折出）当参数列表。
-        // 单个类型会被 parser 折叠成裸类型、多个才是 Pack —— as_list 统一成 ListId。
-        // 完整的参数/返回收集依赖 ListTail / retspec（仍是 stub），这里先按子节点
-        // 已注册的类型组装
-        let mut params = ListId::EMPTY;
-        let mut ret = ListId::EMPTY;
-        for &c in &children {
-            let is_ret = matches!(
-                self.ast.get_node(c).get_data(),
-                NodeSyntax::Prod(Some(Prod::ReturnType))
-            );
-            // 未注册的子节点（FUNCTION / 括号）跳过
-            if !self.node_values.contains_key(&c) {
-                continue;
-            }
-            let ty = self.child_type(c);
-            let list = self.session.type_arenas.as_list(ty);
-            if is_ret { ret = list; } else { params = list; }
-        }
-        self.session.type_arenas.func(params, ret)
-    }
-
-    /// uniontype : uniontype '|' basictype —— union() 自带扁平化/排序/去重，
-    /// 左边是不是 Union 都无所谓，收齐两侧类型丢进去即可
-    fn resolve_union(&mut self, node_index: usize) -> TypeId {
-        let left = self.pass_through(node_index, 0);
-        let right = self.pass_through(node_index, 2);
-        self.session.type_arenas.union(vec![left, right])
-    }
-
-    /// intertype : intertype '&' basictype —— 和 union 同型，intersect() 自带扁平化/
-    /// 急合并/去重，两侧收齐丢进去即可。矛盾交（`number & string`）不在这报，
-    /// 等 assignable / 声明处用 intersection_conflict 去查
-    fn resolve_intersect(&mut self, node_index: usize) -> TypeId {
-        let left = self.pass_through(node_index, 0);
-        let right = self.pass_through(node_index, 2);
-        self.session.type_arenas.intersect(vec![left, right])
-    }
-
-    /// NAME '<' typeargs '>'
-    fn resolve_generic_type(&mut self, node_index: usize) -> TypeId {
-        let children = self.ast.get_node(node_index).children.clone();
-        let name = match self.ast.get_node(children[0]).get_data() {
-            NodeSyntax::Token(Token::NAME(name)) => name.to_string(),
-            _ => panic!("generic type must be identifier"),
-        };
-        // 单实参折叠成裸类型、多实参是 Pack，as_list 都能收成 ListId
-        let arg_ty = self.child_type(children[2]);
-        let args = self.session.type_arenas.as_list(arg_ty);
-        // class 和 typedef 现在共用 TypeRef::Decl，是哪种由 DeclTable 说了算；
-        // 类型值只记 Ref{decl, args}，真正的实例化（subst）推迟到查字段时才做
-        let decl = match self.lookup_type(&name) {
-            Some(TypeRef::Decl(id)) => id,
-            Some(_) => panic!("{} is not a class or typedef", name),
-            None => panic!("no class or typedef for generic type {}", name),
-        };
-        let ng = self.session.decls.get(decl).generics.len();
-        let na = self.session.type_arenas.list(args).len();
-        if ng != na {
-            panic!("{} requires {} type args, got {}", name, ng, na);
-        }
-        self.session.type_arenas.reference(decl, args)
-    }
-
-    /// `typelist ',' type` —— 末位类型追加到定长部分。multilist 不左递归，
-    /// 所以它自己一层就够，不必走 resolve_list 那套脊顶收集
-    fn pack_fixed(&mut self, node_index: usize) -> TypeId {
-        let mut fixed = self.fixed_of(node_index);
-        fixed.push(self.pass_through(node_index, 2));
-        self.session.type_arenas.pack(fixed, None)
-    }
-
-    /// `list ',' vararg` —— 末位是变长，进 vararg 槽。
-    /// vararg 非 None，pack_of 的「长度 1 就折叠」不会触发，Pack 保得住
-    fn pack_vararg(&mut self, node_index: usize) -> TypeId {
-        let fixed = self.fixed_of(node_index);
-        let elem = self.pass_through(node_index, 2);
-        self.session.type_arenas.pack(fixed, Some(elem))
-    }
-
-    /// 取 children[0] 那个列表的定长部分。单个类型会被折成裸类型，as_list 统一收口。
-    /// clone 是必须的：list() 借着 session，而 pack() 要 &mut
-    fn fixed_of(&mut self, node_index: usize) -> Vec<TypeId> {
-        let head = self.pass_through(node_index, 0);
-        let l = self.session.type_arenas.as_list(head);
-        self.session.type_arenas.list(l).fixed.clone()
-    }
-
-    /// '{' classfieldlist '}' 的字段收集已并入 resolve_fields，这里只管单条 @FieldDecl。
-    /// FieldDecl: NAME ':' type  |  NAME ':' type '=' exp  |  NAME '=' exp
-    fn collect_field_decl(&mut self, node_index: usize) -> Field {
-        let children = self.ast.get_node(node_index).children.clone();
-        let name = match self.ast.get_node(children[0]).get_data() {
-            NodeSyntax::Token(Token::NAME(n)) => self.session.names.intern(n),
-            // 文法保证是 NAME。原来回退成 intern("") 会让多个畸形字段 dedup 成一个，
-            // 比直接炸难查；和 resolve_generic_type / resolve_method_call 对齐
-            _ => panic!("field name must be identifier"),
-        };
-        // 三条产生式共用 @FieldDecl，孩子数分不开（第一、三条都是 3 个），
-        // 得看 children[1] 是 ':' 还是 '='：
-        //   NAME ':' type           无默认值
-        //   NAME ':' type '=' exp   有默认值
-        //   NAME '=' exp            有默认值，类型从 exp 推
-        let annotated = matches!(
-            self.ast.get_node(children[1]).get_data(),
-            NodeSyntax::Token(Token::OPERATOR(OpType::SIMPLE(':')))
-        );
-        // children[2] 三条都对：前两条是 type，第三条是 exp
-        let ty = self.child_type(children[2]);
-        let default = !annotated || children.len() > 3;
-        Field { name, ty, default }
-    }
-
-    fn resolve_generics(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    //todo 形参上界：typeparam : NAME ':' type。解出 children[2] 的 TypeId 后
-    //往 GenericInfo.constrain 里填。注意约束位是单个 type（union 算一个），
-    //所以 constrain 应该是 Option<TypeId> 而不是 Option<Vec<TypeId>>
-    fn resolve_type_param_bound(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-
-    // 变量与绑定
-    /// var : prefixexp optype
-    fn resolve_var(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    /// param : NAME optype
-    fn resolve_param(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-    /// 这个列表节点是不是脊顶。左递归的上一节必然以本节点作累加器（children[0]），
-    /// 元素永远在末位，所以「父节点是同族标签且 children[0] 是我」就还没到顶
-    fn is_spine_top(&self, node: usize) -> bool {
-        let Some(parent) = self.ast.get_node(node).parent else {
-            return true;
-        };
-        let p = self.ast.get_node(parent);
-        match p.get_data() {
-            NodeSyntax::Prod(Some(Prod::ListTail)) => p.children[0] != node,
-            _ => true,
-        }
-    }
-
-    /// 列表脊 -> Pack。`list : elem | list sep elem` 这一族共用。
-    ///
-    /// **只在脊顶建一次**：脊上逐节点建表是 O(n²)（第 k 节点要把前 k 个元素
-    /// 重新拷一遍并 intern 一张只用一次的中间列表），认出非脊顶直接返回 UNKNOWN、
-    /// 顶上用 spine() 一次收齐就回到 O(n)。中间节点的值没人读 —— 消费点
-    /// （@Args / @Assign / @RetFixed / @ParamsVararg …）拿到的都是脊顶那个。
-    ///
-    /// 多值的截断/展开也落在这里而不是各个消费点：只有脊顶同时知道「全部元素」
-    /// 和「谁在末位」，`f(g(), h())` 里 g 截成 1 个值、h 原样展开这条规则
-    /// 换到消费点就得每处重新推一遍。元素是类型（typeargs / typelist / argtypelist）
-    /// 时两者都是恒等变换，不必分叉
-    fn resolve_list(&mut self, node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        // `stat_list stat` 是十一条 @ListTail 里唯一没有分隔符的（len == 2）：串的是
-        // 语句、不产出类型，形状本身就分得开，不用为它单开一个标签
-        if self.ast.get_node(node_index).children.len() == 2 {
-            return TypeId::UNKNOWN;
-        }
-        // 只有左递归顶才建list
-        if !self.is_spine_top(node_index) {
-            return TypeId::UNKNOWN;
-        }
-        let items = self.spine(node_index);
-        // spine() 至少产出一个元素，即tail就是本list的节点
-        let Some((&tail, head)) = items.split_last() else {
-            return TypeId::UNKNOWN;
-        };
-        let mut fixed = Vec::with_capacity(items.len());
-        for &item in head {
-            let ty = self.child_type(item);
-            fixed.push(self.truncate_ret(ty));
-        }
-        let mut vararg = None;
-        let last = self.child_type(tail);
-        match self.session.type_arenas.get_type(last) {
-            // 末位的多值原样铺开：定长接到后面，vararg 继续当 vararg
-            Types::Pack(l) => {
-                let list = self.session.type_arenas.list(l);
-                fixed.extend_from_slice(&list.fixed);
-                vararg = list.vararg;
-            }
-            _ => fixed.push(last),
-        }
-        self.session.type_arenas.pack(fixed, vararg)
-    }
-    /// decllist : NAME optype | decllist ',' NAME optype —— 元素是 (NAME, optype) 一对，
-    /// 不是单个节点，所以套不进 spine()
-    fn resolve_decl_list(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) -> TypeId {
-        TypeId::UNKNOWN
-    }
-
-    // 语句检查
-    fn resolve_import(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn resolve_import_alias(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn resolve_pub(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_block(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_control_flow(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_assign(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_expr_stat(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_jump(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_return(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_local_decl(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_local_decl_init(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_extern(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_class_decl(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_class_decl_extends(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_type_def(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn check_func_decl(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn resolve_class_body(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-    fn resolve_field_decl(&mut self,  _node_index: usize, _log: &mut Vec<Logger>) {
-    }
-
-    pub fn resolve(&mut self,node_index:usize, log:&mut Vec<Logger>)->TypeId{
-        let node = self.ast.get_node(node_index);
+    ) -> TypeId {
+        let node = ast.get_node(node_index);
         let action = node.get_data();
-        let typeid= match action {
+        let typeid = match action {
             NodeSyntax::Prod(prod) => {
                 if let Some(prod) = prod {
-                    self.resolve_prod(prod, node_index, log)
+                    self.resolve_prod(ast, prod, node_index, log)
                 } else {
                     //没有label的话，从子节点获取类型，从 buffer 推出 right.len 个子节点
                     let len = node.children.len();
@@ -1048,46 +788,460 @@ impl<'a> TypeLinter<'a> {
                     }
                     TypeId::UNKNOWN
                 }
-            },
-            // 空产生式或无类型的name必然是叶节点
+            }
+            // 空产生式或无类型的 name 必然是叶节点
             NodeSyntax::Token(token) => {
                 match token {
                     Token::STRING(_s) => TypeId::STRING,
                     Token::NUMERAL(_n) => TypeId::NUMBER,
-                    Token::NAME(n) => {
-                        //查询一下本地变量
-                        self.lookup_variable(n)
-                    },
+                    // NAME 一律不查表。六条「无标签单孩子」的裸 NAME 产生式现在都
+                    // 贴了标签（@VarRef / @TypeName / @TypeParam / @ImportItem / @FuncName），
+                    // 所以能走到这里的 NAME 全是**名字位**：字段名、方法名、label、
+                    // 形参名、class/typedef 名之类。它们的 parent 全是带标签的产生式且
+                    // 下标固定，字符串由那些处理器自己去取；在这里查变量会把每个
+                    // 字段名都当成一次变量读，一上线就是一屏误报
+                    Token::NAME(_n) => TypeId::UNKNOWN,
+                    // 类型位的 `nil`（`basictype : NIL`）和值位的 `nil`（`atom : NIL`）
+                    // 折叠成同一个 token，而两处的类型都是 nil，所以不必贴标签区分
+                    Token::RESERVED(Reserved::NIL) => TypeId::NIL,
+                    Token::RESERVED(Reserved::TRUE | Reserved::FALSE) => TypeId::BOOLEAN,
                     Token::RESERVED(_r) => TypeId::UNKNOWN,
+                    // 不带标注的 `...`：`vararg : ELLIPSIS` 单孩子被折叠掉，所以这个
+                    // token 自己就是那一格 vararg。值位的 `...`（`atom : ELLIPSIS`）
+                    // 是同一个形状、也是同一个意思 —— 零个或多个未经检查的值，
+                    // 元素类型只能给 any。列表的截断 / 展开由 Pack 那套统一处理
+                    Token::OPERATOR(OpType::ELLIPSIS) => {
+                        self.session.type_arenas.pack(vec![], Some(TypeId::ANY))
+                    }
                     Token::OPERATOR(_o) => TypeId::UNKNOWN,
                 }
-            },
+            }
         };
         //没有产生式只出的类型也登记
         self.register_value(node_index, typeid);
-        typeid  
+        typeid
+    }
+
+    fn resolve_prod(
+        &mut self,
+        ast: &Tree<NodeSyntax<'_>>,
+        prod: &Prod,
+        node_index: usize,
+        log: &mut Vec<Logger>,
+    ) -> TypeId {
+        match prod {
+            // ---- 运算。参数是操作符 token 所在的孩子下标 ----
+            Prod::BinOp => self.resolve_operator(ast, node_index, 1, log),
+            Prod::UnOp => self.resolve_operator(ast, node_index, 0, log),
+
+            // ARROW retspec
+            // '(' multilist ')'
+            // '(' explist ')'
+            // '(' type ')'
+            // ':' type
+            // ELLIPSIS type
+            Prod::ReturnType
+            | Prod::RetMulti
+            | Prod::Args
+            | Prod::ParenType
+            | Prod::TypeAnnotation => self.pass_through(ast, node_index, 1),
+            // ELLIPSIS type —— 产出的是只有 vararg 槽的 Pack，不是裸元素类型：
+            // `parlist : vararg` / `multilist : vararg` 都是单孩子折叠，这个节点
+            // 会直接当参数表 / 返回列表用，形状得自带「变长」这一位
+            Prod::VarargTyped => self.vararg_pack(ast, node_index),
+            // NAME ':' type，名字纯文档
+            // cast_exp AS type
+            // NAME '=' exp
+            Prod::ArgTypeNamed | Prod::Cast | Prod::FieldNamed => {
+                self.pass_through(ast, node_index, 2)
+            }
+            Prod::FieldKV => self.pass_through(ast, node_index, 4), // '[' exp ']' '=' exp
+
+            Prod::RetVoid | Prod::ArgsEmpty => TypeId::VOID,
+            // 表达式位的 `{}` 和类型位的 `{}` 是同一个东西，intern 后同一个 TypeId
+            Prod::TableEmpty | Prod::RecordEmpty => self.session.type_arenas.record(vec![]),
+            // 非空的那两个同理：`'{' fieldlist '}'` 与 `'{' classfieldlist '}'`
+            Prod::Table => self.resolve_fields(ast, node_index, FieldSite::Literal, log),
+            Prod::Record => self.resolve_fields(ast, node_index, FieldSite::Record, log),
+
+            // ---- 类型位 ----
+            // `basictype : NAME` / `extendtype : NAME`：折叠前它和变量位的裸 NAME
+            // 形状一样，靠标签才分得开该查 type_names 还是 variables
+            Prod::TypeName => self.resolve_type_name(ast, node_index, log),
+            Prod::FuncType => self.func_sig_type(ast, node_index),
+            Prod::Union => self.resolve_union(ast, node_index),
+            Prod::Intersect => self.resolve_intersect(ast, node_index),
+            Prod::GenericType => self.resolve_generic_type(ast, node_index, log),
+            // `X ',' vararg`：两处形状和语义都一样
+            Prod::ParamsVararg | Prod::RetVararg => self.pack_vararg(ast, node_index),
+            Prod::RetFixed => self.pack_fixed(ast, node_index),
+
+            // ---- 表达式 ----
+            // `prefixexp : NAME`，全 linter 唯一查变量的地方
+            Prod::VarRef => self.resolve_var_ref(ast, node_index, log),
+            Prod::Call => self.resolve_call(ast, node_index, log),
+            Prod::MethodCall => self.resolve_method_call(ast, node_index, log),
+            Prod::Paren => self.resolve_paren(ast, node_index),
+            Prod::Index => self.resolve_index(ast, node_index, log),
+            Prod::Dot => self.resolve_dot(ast, node_index, log),
+            Prod::DottedName => self.resolve_dotted_name(ast, node_index, log),
+            Prod::TurboFish => self.resolve_turbo_fish(ast, node_index, log),
+            Prod::FuncExpr => self.resolve_func_expr(ast, node_index),
+            Prod::FuncBody => self.func_sig_type(ast, node_index),
+
+            // ---- 声明与绑定 ----
+            Prod::Var => self.resolve_var(ast, node_index),
+            Prod::Param => self.resolve_param(ast, node_index, log),
+            Prod::MethodDef => self.resolve_method_def(ast, node_index, log),
+            Prod::MethodSig => self.func_sig_type(ast, node_index),
+            Prod::Generics => self.resolve_generics(ast, node_index, log),
+            Prod::TypeParamBound => self.resolve_type_param_bound(ast, node_index, log),
+            Prod::ListTail => self.resolve_list(ast, node_index, log),
+            Prod::DeclFirst | Prod::DeclRest => self.resolve_decl_list(ast, node_index, log),
+
+            // ---- 名字位：贴标签只为了不被当成变量读，名字由拥有者去取 ----
+            // @TypeParam 归 @Generics（形参声明）、@ImportItem 归 @Import、
+            // @FuncName 归 @FuncDecl / @MethodName（函数声明名的基名）。
+            // @FuncName 不能复用 @VarRef：后序遍历下 @VarRef 的查表/诊断会在
+            // @FuncDecl 登记名字之前跑，`function f() end` 会自己报自己未声明
+            Prod::TypeParam | Prod::ImportItem | Prod::FuncName => TypeId::UNKNOWN,
+
+            // ---- 语句：不产出类型，给 UNKNOWN（它**不是** VOID）----
+            Prod::Import => {
+                self.check_import(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::ImportAlias => {
+                self.check_import_alias(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::Pub => {
+                self.check_pub(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::Block => {
+                self.check_block(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::Do
+            | Prod::While
+            | Prod::Repeat
+            | Prod::If
+            | Prod::IfElse
+            | Prod::ElseIf
+            | Prod::ForNum
+            | Prod::ForNumStep
+            | Prod::ForIn => {
+                self.check_control_flow(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::Assign => {
+                self.check_assign(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::ExprStat => {
+                self.check_expr_stat(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::Goto | Prod::Label => {
+                self.check_jump(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::Return | Prod::ReturnVoid => {
+                self.check_return(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::LocalDecl => {
+                self.check_local_decl(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::LocalDeclInit => {
+                self.check_local_decl_init(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::Extern => {
+                self.check_extern(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::ClassDecl => {
+                self.check_class_decl(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::ClassDeclExtends => {
+                self.check_class_decl_extends(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::TypeDef => {
+                self.check_type_def(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::FuncDecl => {
+                self.check_func_decl(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::MethodName => self.resolve_method_name(ast, node_index),
+            Prod::ClassBody => {
+                self.check_class_body(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+            Prod::FieldDecl => {
+                self.check_field_decl(ast, node_index, log);
+                TypeId::UNKNOWN
+            }
+        }
+    }
+
+    // ================== §12 占位 ==================
+    //
+    // 没有自己的类型、但在 §5 分派表里得占一行的产生式。它们不是「还没做」，
+    // 而是「语义不在这个节点上」：该做的事由别处直接扮这颗子树完成，所以这里
+    // 只需一个 UNKNOWN 把分派表填满。每条都写清了真正的处理点在哪
+
+    /// `generics : '<' typeparams '>'` —— 声明一串泛型形参。铸 GenericId 并押进
+    /// 作用域由 hoist_decl_generics / scope_func_generics 直接扮这个节点完成（走
+    /// generic_param_names），形参表本身又由 generic_list_of 收进 `Types::Func`，
+    /// 节点自己拿不出一个有意义的类型。标签仍要留：它是发射器的抹除入口之一
+    fn resolve_generics(
+        &mut self,
+        _ast: &Tree<NodeSyntax<'_>>,
+        _node_index: usize,
+        _log: &mut Vec<Logger>,
+    ) -> TypeId {
+        TypeId::UNKNOWN
+    }
+
+    /// `decllist : NAME optype | decllist ',' NAME optype` —— 元素是 (NAME, optype)
+    /// 一对、不是单个节点，所以套不进 spine()，也组不成一个类型。真正拆它的
+    /// 是 check_local_decl_init：那里用 decl_items 逐对取名字与标注，配上 value_at
+    /// 把右侧的 Pack 按位发下去
+    fn resolve_decl_list(
+        &mut self,
+        _ast: &Tree<NodeSyntax<'_>>,
+        _node_index: usize,
+        _log: &mut Vec<Logger>,
+    ) -> TypeId {
+        TypeId::UNKNOWN
     }
 }
 
-
-impl<'a> Linter for TypeLinter<'a> {
+impl Linter for TypeLinter {
     fn name(&self) -> &'static str {
         "type"
     }
 
     /// 换文件就重置局部状态；全局在 Session 里，不用管
-    fn prepare(&mut self, _ast: &Tree<NodeSyntax<'_>>, _log: &mut Vec<Logger>) {
-        
+    fn prepare(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str, _log: &mut Vec<Logger>) {
+        // 当前模块名：pub 登记导出、hoist 登记 module_types 都要用，
+        // 得赶在两趟 hoist 之前定好
+        self.current_module = self.session.names.intern(module);
+        // 节点下标是每棵树自己从 0 数的，不清就会让 register_value 报重入
+        self.node_values.clear();
+        self.scope_stack.clear();
+        self.file_decls.clear();
+        self.class_stack.clear();
+        self.ret_stack.clear();
+        // 文件级作用域：它是 flow_reset 记 scope_depth 的基准，得先压。
+        // chunk 的 @Block 还会自己再压一格，顶层 local 落在那一格里
+        self.scope_stack.push(Scope::new());
+        self.flow_reset();
+        // 变量名与类型名两条独立的抬升：函数名进 variables，class/typedef 名进
+        // type_names。互不相干，先后无所谓
+        self.hoist_top_level(ast);
+        self.hoist_top_level_types(ast);
+        // 名字占好了再把 class / typedef 的体提前填上：内联方法体里的 `self.x`
+        // 要在主遍历里就查得到本类字段，而 P1 的 check_* 填体在各自 leave（方法体
+        // 之后）才发生 —— 这一趟抢在主遍历之前把字段/父类/别名目标灌进 ClassInfo
+        self.hoist_class_bodies(ast);
+        // 最后把顶层全局函数的签名补给抬升过的名字：签名里引得到 class /
+        // typedef，所以得等名字和体都填好（前三趟）之后才算
+        self.hoist_func_signatures(ast);
     }
 
-    fn enter(&mut self, ast: &Tree<NodeSyntax<'_>>, node:usize, log:&mut Vec<Logger>){
-
+    /// 前序：作用域与流帧的「进」、以及两条非前序不可的诊断。
+    ///
+    /// 哪些事必须在这里而不能拉到 leave：
+    ///   - 作用域/流帧得包住子树，开在后序就来不及了
+    ///   - @VarRef 的两条诊断：看 resolve_var_ref 的注释
+    ///   - `local function f` 得先声明名字才递归得了
+    fn enter(&mut self, ast: &Tree<NodeSyntax<'_>>, node: usize, log: &mut Vec<Logger>) {
+        // label 得在可达性检查之前处理：它是跳转的落点，前一条 `goto` / `return`
+        // 终结不了它。降级也放在这里 —— 向前跳的那一段代码在 label 之前就走过了，
+        // 但从 label 往后的 inited 结论全是那一跳污染出来的
+        if self.get_production(ast, node) == Some(Prod::Label) {
+            self.flow_untrust();
+            self.flow_revive();
+        }
+        self.check_reachable(ast, node, log);
+        let NodeSyntax::Prod(Some(prod)) = ast.get_node(node).get_data() else {
+            return;
+        };
+        match prod {
+            Prod::Block => {
+                // 先开帧再压作用域：反了的话本块自己那格会被当成外层，
+                // 内层遮蔽同名变量时回滚就打错人（见定值分析那节的注释）
+                if self.block_is_branch(ast, node) {
+                    self.flow_enter_branch();
+                }
+                self.scope_stack.push(Scope::new());
+                self.bind_loop_vars(ast, node);
+                // 收窄得在作用域压完之后：它就放在本块那一格里，
+                // 出块一弹就失效
+                self.bind_narrowing(ast, node);
+            }
+            // 帧开在这里而不是体的 block 上：这一格多带一个边界位（return 不终结
+            // 外层、goto 的降级到此为止），而且形参要比帧晚一步进作用域
+            Prod::FuncBody => {
+                self.flow_open();
+                self.flow_enter_body();
+                // rettype 槽就在本节点上；名字取得到才有（函数表达式没名字）
+                self.push_ret_frame(ast, node, node);
+                // 泛型形参和形参共用这一格：两者的可见范围都是整个 funcbody，
+                // 比体的 block 大一圈（rettype 也得看得见泛型形参）
+                self.scope_stack.push(Scope::new());
+                // 形参标注 / 返回类型 / 体里的 `T` 要解析成 Generic，泛型形参得先挂进这格。
+                // 每进一次现铸现挂：funcbody 不是名义声明，没有 DeclId 存身份
+                self.scope_func_generics(ast, node);
+                // 类体外方法的 funcname 是前一个兄弟节点，此时已经后序求值完、接收者
+                // TypeId 正挂在 node_values 上。':' 形式才注入隐式 self；'.' 形式写出的
+                // self 由 resolve_param 经同一颗 funcname 节点取默认类型
+                if let Some((ty, true)) = self.funcbody_receiver(ast, node) {
+                    self.declare_variable("self", ty, ast.span_of(node), VarScope::Local, true);
+                }
+            }
+            // 方法体和函数体同款：多带一个边界位（体内 return 不终结类体外的流），
+            // 形参比体的 block 早一步进这一格 —— methodsig 在文法上先于 block
+            Prod::MethodDef => {
+                self.flow_open();
+                self.flow_enter_body();
+                // 方法的 rettype 槽在 methodsig（children[0]）上，不在体这个节点上
+                let sig = ast.get_node(node).children[0];
+                self.push_ret_frame(ast, node, sig);
+                self.scope_stack.push(Scope::new());
+            }
+            // 进类体：把本类的 Ref 押上，methodsig 里不标注的 self 靠它取默认类型。
+            // 再单开一格把泛型形参挂进去 —— 字段/方法签名/extendtype 里的 `T` 都在
+            // 这棵子树内解析，得让它们查得到（P0a 已铸好身份，这里只按名字挂上）
+            Prod::ClassDecl | Prod::ClassDeclExtends => {
+                let ty = self.class_ref_of(ast, node);
+                self.class_stack.push(ty);
+                self.scope_stack.push(Scope::new());
+                self.scope_decl_generics(ast, node);
+            }
+            // typedef 的目标类型里也能引用自己的泛型形参（`typedef Box<T> = {v:T}`），
+            // 同样单开一格挂形参；没有 self、不进 class_stack
+            Prod::TypeDef => {
+                self.scope_stack.push(Scope::new());
+                self.scope_decl_generics(ast, node);
+            }
+            Prod::VarRef => self.check_var_read(ast, node, log),
+            // `local function f` = `local f; f = function...`，名字得在体之前就在，
+            // 否则递归调用自己会报未声明。类型等 leave 里覆
+            Prod::FuncDecl if ast.get_node(node).children.len() == 4 => {
+                if let Some(name) = self.get_child_name(ast, node, 2) {
+                    let span = ast.span_of(node);
+                    // `local function f` 的名字也是局部变量，同层重名照拦。这里是它
+                    // 唯一的声明点（leave 只补类型、不再 insert），所以不会自撞
+                    self.reject_same_scope_redecl(name, span, log);
+                    self.declare_variable(name, TypeId::UNKNOWN, span, VarScope::Local, true);
+                }
+            }
+            // 带分支的语句：开一格 join 帧，各分支由它们自己的 block 去填
+            p => {
+                if Self::join_mode(p).is_some() {
+                    self.flow_open();
+                }
+            }
+        }
     }
 
-    fn leave(&mut self, ast: &Tree<NodeSyntax<'_>>, node:usize, log:&mut Vec<Logger>){
-
+    /// 后序：先算类型，再收作用域与流帧。
+    ///
+    /// 顺序不能反：`resolve` 里的声明动作（形参、local）得落在当前还没弹的
+    /// 那格作用域里，而 `is_noreturn_stat` 更是非后序不可
+    fn leave(&mut self, ast: &Tree<NodeSyntax<'_>>, node: usize, log: &mut Vec<Logger>) {
+        self.resolve(ast, node, log);
+        match ast.get_node(node).get_data() {
+            NodeSyntax::Prod(Some(prod)) => match prod {
+                Prod::Block => {
+                    let repeat_body = ast
+                        .get_node(node)
+                        .parent
+                        .is_some_and(|p| self.get_production(ast, p) == Some(Prod::Repeat));
+                    if self.block_is_branch(ast, node) {
+                        self.flow_leave_branch();
+                    }
+                    if repeat_body {
+                        // `repeat local x = 1 until x == 1` 在 Lua 里合法：until 条件
+                        // 看得见体内的局部。所以这格作用域留给 @Repeat 去弹，
+                        // 而合并提到条件之前做（体必执行，本来就该先生效），
+                        // 否则条件里读体内赋过的外层变量会误报「可能尚未赋值」
+                        self.flow_close(JoinMode::Always);
+                    } else {
+                        self.scope_stack.pop();
+                    }
+                }
+                // 方法体收口和函数体一模一样
+                Prod::FuncBody | Prod::MethodDef => {
+                    self.scope_stack.pop();
+                    // 弹得比 resolve 晚：本节点的类型就是那个函数类型，没标注时
+                    // 它的返回列表要用帧上攒的 return 推出来
+                    self.pop_ret_frame(node);
+                    self.flow_leave_branch();
+                    self.flow_close(JoinMode::Skippable);
+                }
+                // 出类体：弹掉泛型形参那格作用域，再弹本类的 Ref
+                Prod::ClassDecl | Prod::ClassDeclExtends => {
+                    self.scope_stack.pop();
+                    self.class_stack.pop();
+                }
+                // 出 typedef：弹掉泛型形参那格
+                Prod::TypeDef => {
+                    self.scope_stack.pop();
+                }
+                // 合并已经在体的 block 里做完了，这里只补那一次没弹的作用域
+                Prod::Repeat => {
+                    self.scope_stack.pop();
+                }
+                Prod::ExprStat => {
+                    if self.is_noreturn_stat(ast, node) {
+                        self.flow_terminate();
+                    }
+                }
+                Prod::Return | Prod::ReturnVoid => self.flow_terminate(),
+                // 向后跳让一遍前序合并失效，两头都降级：向后跳的 label 必先于 goto
+                // 被看到，向前跳的 goto 必先于它跳过的代码，合起来盖得住
+                Prod::Goto => {
+                    self.flow_untrust();
+                    self.flow_terminate();
+                }
+                p => {
+                    if let Some(mode) = Self::join_mode(p) {
+                        self.flow_close(mode);
+                    }
+                }
+            },
+            // `stat : BREAK` 是无标签单孩子，被折叠成了这个 token 节点本身。
+            // BREAK 在整张文法里只出现在这一处，所以认 token 就够
+            NodeSyntax::Token(Token::RESERVED(Reserved::BREAK)) => self.flow_terminate(),
+            _ => {}
+        }
     }
 
-    fn finish(&mut self, log:&mut Vec<Logger>){
+    /// 驱动点配对的自检。走完一棵树，栈上只该剩 flow_reset 压的文件帧和
+    /// prepare 压的文件作用域。不平就是某条语句的 enter/leave 漏了一半，
+    /// 而那种错不会当场爆，只会让后面的诊断莫名其妙地少一条多一条
+    fn finish(&mut self, log: &mut Vec<Logger>) {
+        // 字段覆盖的收口留到这里：extends 的父类可能声明在子类后面（前向继承），
+        // 子类 leave 时父类体还没填，只有全走完才查得准
+        self.check_field_overrides(log);
+        debug_assert_eq!(self.flow_stack.len(), 1, "流帧栈没配平");
+        debug_assert!(self.join_stack.is_empty(), "join 帧没配平");
+        debug_assert!(self.ret_stack.is_empty(), "函数体栈没配平");
+        debug_assert_eq!(self.scope_stack.len(), 1, "作用域栈没配平");
     }
 }
+
+/// 测试搬去了 type_linter/tests.rs：定值分析的内部单测和驱动点的端到端
+/// 各占一节，正文这边只留这一行
+#[cfg(test)]
+mod tests;

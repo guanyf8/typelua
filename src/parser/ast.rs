@@ -49,7 +49,15 @@ impl<T: NodeData> Tree<T> {
     pub fn new() -> Tree<T> {
         Tree {
             current: 0,
-            nodes: vec![Node { data: T::default(), span: Span::default(), children: vec![], parent: None };300],
+            nodes: vec![
+                Node {
+                    data: T::default(),
+                    span: Span::default(),
+                    children: vec![],
+                    parent: None
+                };
+                300
+            ],
             root: -1,
         }
     }
@@ -57,7 +65,15 @@ impl<T: NodeData> Tree<T> {
     pub fn alloc_node(&mut self) -> (&mut Node<T>, usize) {
         if self.current >= self.nodes.len() {
             //自动扩容
-            self.nodes.extend(vec![Node { data: T::default(), span: Span::default(), children: vec![], parent: None };300]);
+            self.nodes.extend(vec![
+                Node {
+                    data: T::default(),
+                    span: Span::default(),
+                    children: vec![],
+                    parent: None
+                };
+                300
+            ]);
         }
         let node = &mut self.nodes[self.current];
         self.current += 1;
@@ -81,7 +97,7 @@ impl<T: NodeData> Tree<T> {
         }
     }
 
-    pub fn relation(&mut self, parent: usize,child: usize) {
+    pub fn relation(&mut self, parent: usize, child: usize) {
         self.nodes[child].parent = Some(parent);
         self.nodes[parent].children.push(child);
     }
@@ -90,7 +106,7 @@ impl<T: NodeData> Tree<T> {
         &self.nodes[node]
     }
     pub fn append_child(&mut self, parent: Option<usize>, data: T, span: Span) -> usize {
-        let (node,index) = self.alloc_node();
+        let (node, index) = self.alloc_node();
         node.data = data;
         node.span = span;
         node.parent = parent;

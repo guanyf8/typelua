@@ -195,7 +195,11 @@ fn render_rule(grammar: &Grammar, rule_index: usize) -> String {
     if rule.right.is_empty() {
         return format!("{lhs} -> ε");
     }
-    let rhs: Vec<&str> = rule.right.iter().map(|&s| grammar.names[s as usize].as_str()).collect();
+    let rhs: Vec<&str> = rule
+        .right
+        .iter()
+        .map(|&s| grammar.names[s as usize].as_str())
+        .collect();
     format!("{lhs} -> {}", rhs.join(" ")) as String
 }
 
@@ -214,7 +218,11 @@ fn lookaheads_of(
     rule_index: usize,
     position: usize,
 ) -> Vec<String> {
-    let item = Item0 { rule_index, position, lookahead: () };
+    let item = Item0 {
+        rule_index,
+        position,
+        lookahead: (),
+    };
     let mut names: Vec<String> = table[state][&item]
         .iter()
         .map(|&t| grammar.names[t as usize].clone())
@@ -225,14 +233,22 @@ fn lookaheads_of(
 
 /// 找出唯一含指定内核项的状态下标
 fn state_with(table: &Lookaheads, rule_index: usize, position: usize) -> usize {
-    let item = Item0 { rule_index, position, lookahead: () };
+    let item = Item0 {
+        rule_index,
+        position,
+        lookahead: (),
+    };
     let hits: Vec<usize> = table
         .iter()
         .enumerate()
         .filter(|(_, m)| m.contains_key(&item))
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(hits.len(), 1, "规则 {rule_index} 位置 {position} 的项应只在一个状态里，实际 {hits:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "规则 {rule_index} 位置 {position} 的项应只在一个状态里，实际 {hits:?}"
+    );
     hits[0]
 }
 
@@ -269,12 +285,18 @@ fn shift_reduce_conflicts(grammar: &Grammar, table: &ParseTable) -> Vec<String> 
     let lookaheads = resolve_lookaheads(spontaneous, &propagate);
 
     let mut conflicts = Vec::new();
-    for (state, kernel) in build_lalr_kernels(&kernels_lr0, &lookaheads).iter().enumerate() {
+    for (state, kernel) in build_lalr_kernels(&kernels_lr0, &lookaheads)
+        .iter()
+        .enumerate()
+    {
         for item in build_closure::<u32, _>(kernel.clone(), grammar) {
             if item.position != grammar.rules[item.rule_index].right.len() {
                 continue;
             }
-            if matches!(table.action.get(&(state as u32, item.lookahead)), Some(Action::Shift(_))) {
+            if matches!(
+                table.action.get(&(state as u32, item.lookahead)),
+                Some(Action::Shift(_))
+            ) {
                 conflicts.push(format!(
                     "前看 {} 时丢掉归约 [{}]",
                     grammar.names[item.lookahead as usize],
@@ -286,7 +308,6 @@ fn shift_reduce_conflicts(grammar: &Grammar, table: &ParseTable) -> Vec<String> 
     conflicts.sort();
     conflicts
 }
-
 
 // ============ 产生式标签 ============
 
@@ -315,7 +336,12 @@ fn labels_are_optional_and_only_the_tagged_ones_are_recorded() {
     });
     assert_eq!(
         labeled_rules(&grammar),
-        ["-: start -> s", "Alpha: s -> A", "-: s -> B", "Gamma: s -> C"]
+        [
+            "-: start -> s",
+            "Alpha: s -> A",
+            "-: s -> B",
+            "Gamma: s -> C"
+        ]
     );
     // labels 只装被贴过的，按首次出现顺序
     assert_eq!(grammar.labels, ["Alpha", "Gamma"]);
@@ -342,7 +368,12 @@ fn a_label_may_sit_anywhere_inside_its_alternative() {
     });
     assert_eq!(
         labeled_rules(&grammar),
-        ["-: start -> s", "Front: s -> A B", "Middle: s -> A B", "Back: s -> A B"]
+        [
+            "-: start -> s",
+            "Front: s -> A B",
+            "Middle: s -> A B",
+            "Back: s -> A B"
+        ]
     );
 }
 
@@ -409,7 +440,11 @@ fn label_indices_always_point_into_the_label_table() {
     }
     // 每个标签恰好被一条产生式引用 —— 标签是身份不是分类
     for (index, name) in grammar.labels.iter().enumerate() {
-        let users = grammar.rules.iter().filter(|r| r.label == Some(index as u32)).count();
+        let users = grammar
+            .rules
+            .iter()
+            .filter(|r| r.label == Some(index as u32))
+            .count();
         assert_eq!(users, 1, "标签 `{name}` 被 {users} 条产生式引用");
     }
 }
@@ -430,14 +465,18 @@ fn labels_are_interned_so_several_productions_can_share_one() {
     // 发射出来的 Prod 只有一个变体，RULE_PROD 里有两处指向它
     let table = ParseTable::generate_parse_table(&grammar);
     assert_eq!(table.label_names, ["Dup"]);
-    assert_eq!(table.rule_label.iter().filter(|l| **l == Some(0)).count(), 2);
+    assert_eq!(
+        table.rule_label.iter().filter(|l| **l == Some(0)).count(),
+        2
+    );
 }
 
 #[test]
 fn labels_are_shared_across_nonterminals_too() {
     // 驻留不区分左部：`L : L sep item` 分散在 explist / varlist / params / typeargs …
     // 十几个非终结符上，它们要能共用同一个 @Append
-    let grammar = Grammar::build_grammar(quote! { start : s ; s : A @Decl ; t : B @Decl ; s : t ; });
+    let grammar =
+        Grammar::build_grammar(quote! { start : s ; s : A @Decl ; t : B @Decl ; s : t ; });
     assert_eq!(grammar.labels, ["Decl"]);
     assert_eq!(
         grammar.rules.iter().filter(|r| r.label == Some(0)).count(),
@@ -500,10 +539,18 @@ fn export_turns_labels_into_an_enum() {
         start : s ;
         s : A @Alpha | B | C @Gamma ;
     });
-    let emitted = ParseTable::generate_parse_table(&grammar).export().to_string();
+    let emitted = ParseTable::generate_parse_table(&grammar)
+        .export()
+        .to_string();
 
-    assert!(emitted.contains("pub enum Prod { Alpha , Gamma }"), "{emitted}");
-    assert!(emitted.contains("# [allow (non_camel_case_types)]"), "缺 allow 属性");
+    assert!(
+        emitted.contains("pub enum Prod { Alpha , Gamma }"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("# [allow (non_camel_case_types)]"),
+        "缺 allow 属性"
+    );
     // 数组要和规则一一对应，未标注的是 None。这里也顺带守住了
     // 「不能直接发射 Option<u32>」那个坑 —— quote 对 None 发射空 token
     assert!(
@@ -513,14 +560,22 @@ fn export_turns_labels_into_an_enum() {
         ),
         "{emitted}"
     );
-    assert!(emitted.contains("pub fn prod (rule : u32) -> Option < Prod >"), "缺 prod()");
+    assert!(
+        emitted.contains("pub fn prod (rule : u32) -> Option < Prod >"),
+        "缺 prod()"
+    );
 }
 
 #[test]
 fn export_without_labels_yields_an_empty_enum() {
-    let emitted = ParseTable::generate_parse_table(&minimal()).export().to_string();
+    let emitted = ParseTable::generate_parse_table(&minimal())
+        .export()
+        .to_string();
     assert!(emitted.contains("pub enum Prod { }"), "{emitted}");
-    assert!(emitted.contains("RULE_PROD : [Option < Prod > ; NUM_RULES] = [None]"), "{emitted}");
+    assert!(
+        emitted.contains("RULE_PROD : [Option < Prod > ; NUM_RULES] = [None]"),
+        "{emitted}"
+    );
 }
 
 #[test]
@@ -542,7 +597,6 @@ fn exported_tokens_are_valid_rust() {
     }
 }
 
-
 // ============ DSL 解析 ============
 
 #[test]
@@ -560,9 +614,16 @@ fn char_literal_terminals_keep_their_quotes() {
         start : s ;
         s : '(' N ')' ;
     });
-    assert!(grammar.names.contains(&"'('".to_string()), "names = {:?}", grammar.names);
+    assert!(
+        grammar.names.contains(&"'('".to_string()),
+        "names = {:?}",
+        grammar.names
+    );
     assert!(grammar.names.contains(&"')'".to_string()));
-    assert!(!grammar.names.contains(&"(".to_string()), "不该有不带引号的版本");
+    assert!(
+        !grammar.names.contains(&"(".to_string()),
+        "不该有不带引号的版本"
+    );
 }
 
 #[test]
@@ -582,7 +643,11 @@ fn semicolon_terminal_must_be_a_char_literal() {
         start : s ;
         s : ';' | X ;
     });
-    assert!(grammar.names.contains(&"';'".to_string()), "names = {:?}", grammar.names);
+    assert!(
+        grammar.names.contains(&"';'".to_string()),
+        "names = {:?}",
+        grammar.names
+    );
     let s = sym(&grammar, "s");
     let alternatives: Vec<String> = (0..grammar.rules.len())
         .filter(|&i| grammar.rules[i].left == s)
@@ -656,7 +721,12 @@ fn only_single_char_terminals_look_like_quoted_chars() {
             b.len() == 3 && b[0] == b'\'' && b[2] == b'\''
         })
         .collect();
-    assert_eq!(looks_like_char, [&"'('".to_string()], "names = {:?}", grammar.names);
+    assert_eq!(
+        looks_like_char,
+        [&"'('".to_string()],
+        "names = {:?}",
+        grammar.names
+    );
 }
 
 #[test]
@@ -682,7 +752,11 @@ fn end_symbol_is_appended_last_and_marked_terminal() {
         let last = grammar.names.len() - 1;
         assert_eq!(grammar.names[last], "$end", "{label}: $end 应当在末尾");
         assert!(grammar.terminals[last], "{label}: $end 应当是终结符");
-        assert_eq!(grammar.end_symbol() as usize, last, "{label}: end_symbol() 应当指向它");
+        assert_eq!(
+            grammar.end_symbol() as usize,
+            last,
+            "{label}: end_symbol() 应当指向它"
+        );
         // $end 不出现在任何产生式右部
         for rule in &grammar.rules {
             assert!(
@@ -915,7 +989,10 @@ fn lr0_automaton_is_well_formed() {
                 "{label}: 转移 ({from}, {}) 的目标 {to} 越界",
                 grammar.names[symbol as usize]
             );
-            assert!((from as usize) < states.len(), "{label}: 转移源 {from} 越界");
+            assert!(
+                (from as usize) < states.len(),
+                "{label}: 转移源 {from} 越界"
+            );
         }
         // 除起始态外，每个状态都必须至少被一条转移指向，否则是不可达的死状态
         let reached: HashSet<u32> = transitions.values().copied().collect();
@@ -935,7 +1012,10 @@ fn every_rule_reaches_the_automaton() {
             .filter(|i| !reachable.contains(i))
             .map(|i| render_rule(&grammar, i))
             .collect();
-        assert!(dead.is_empty(), "{label}: 这些规则从未出现在任何闭包里：{dead:?}");
+        assert!(
+            dead.is_empty(),
+            "{label}: 这些规则从未出现在任何闭包里：{dead:?}"
+        );
     }
 }
 
@@ -952,7 +1032,11 @@ fn there_is_exactly_one_accepting_state() {
             })
             .map(|(idx, _)| idx)
             .collect();
-        assert_eq!(accepting.len(), 1, "{label}: 接受状态应当唯一，实际 {accepting:?}");
+        assert_eq!(
+            accepting.len(),
+            1,
+            "{label}: 接受状态应当唯一，实际 {accepting:?}"
+        );
     }
 }
 
@@ -1003,7 +1087,11 @@ fn propagation_is_what_supplies_the_inherited_lookahead() {
     let (kernels, transitions) = build_kernels(&grammar);
     let (spontaneous, _) = build_lookaheads(&kernels, &grammar, &transitions);
     let state = state_with(&spontaneous, 4, 1);
-    let item = Item0 { rule_index: 4, position: 1, lookahead: () };
+    let item = Item0 {
+        rule_index: 4,
+        position: 1,
+        lookahead: (),
+    };
     assert!(
         !spontaneous[state][&item].contains(&grammar.end_symbol()),
         "自发前看集里不该有 $end，它是继承来的"
@@ -1076,7 +1164,11 @@ fn lalr_kernels_expand_one_item_per_lookahead() {
     let lalr = build_lalr_kernels(&kernels, &lookaheads);
 
     // 每个内核项摊成 (前看符号个数) 条 Item1，总数应当等于所有前看集大小之和
-    let expected: usize = lookaheads.iter().flat_map(|m| m.values()).map(|s| s.len()).sum();
+    let expected: usize = lookaheads
+        .iter()
+        .flat_map(|m| m.values())
+        .map(|s| s.len())
+        .sum();
     let actual: usize = lalr.iter().map(|s| s.len()).sum();
     assert_eq!(actual, expected);
 
@@ -1141,8 +1233,16 @@ fn accept_is_unique_and_on_the_end_symbol() {
             .filter(|(_, action)| matches!(action, Action::Accept))
             .map(|(&key, _)| key)
             .collect();
-        assert_eq!(accepts.len(), 1, "{label}: 接受动作应当唯一，实际 {accepts:?}");
-        assert_eq!(accepts[0].1, grammar.end_symbol(), "{label}: 接受动作必须在 $end 列");
+        assert_eq!(
+            accepts.len(),
+            1,
+            "{label}: 接受动作应当唯一，实际 {accepts:?}"
+        );
+        assert_eq!(
+            accepts[0].1,
+            grammar.end_symbol(),
+            "{label}: 接受动作必须在 $end 列"
+        );
     }
 }
 
@@ -1154,7 +1254,10 @@ fn every_state_has_something_to_do() {
         for state in 0..states.len() as u32 {
             let has_action = table.action.keys().any(|&(s, _)| s == state);
             let has_goto = table.goto.keys().any(|&(s, _)| s == state);
-            assert!(has_action || has_goto, "{label}: 状态 {state} 既无动作也无 goto");
+            assert!(
+                has_action || has_goto,
+                "{label}: 状态 {state} 既无动作也无 goto"
+            );
         }
     }
 }
@@ -1189,7 +1292,11 @@ fn epsilon_production_gets_a_reduce_action() {
     // 建表时如果只扫内核项，这条归约会整条丢掉，`A B` 就永远解析不了
     let grammar = epsilon_reduce();
     let table = ParseTable::generate_parse_table(&grammar);
-    let eps = grammar.rules.iter().position(|rule| rule.right.is_empty()).unwrap();
+    let eps = grammar
+        .rules
+        .iter()
+        .position(|rule| rule.right.is_empty())
+        .unwrap();
     assert_eq!(render_rule(&grammar, eps), "opt -> ε");
 
     let sites: Vec<(u32, &str)> = table
@@ -1261,7 +1368,11 @@ fn dense_cells_round_trip_every_entry() {
         let symbol_count = grammar.names.len();
         let cells = table.dense_cells();
         let (states, _) = build_kernels(&grammar);
-        assert_eq!(cells.len(), states.len() * symbol_count, "{label}: 稠密表尺寸");
+        assert_eq!(
+            cells.len(),
+            states.len() * symbol_count,
+            "{label}: 稠密表尺寸"
+        );
 
         for (&(state, symbol), &action) in &table.action {
             let cell = cells[state as usize * symbol_count + symbol as usize];
@@ -1274,7 +1385,11 @@ fn dense_cells_round_trip_every_entry() {
                 v if v > 0 => Action::Shift((v - 1) as u32),
                 v => Action::Reduce((-v - 1) as u32),
             };
-            assert_eq!(decoded, action, "{label}: 状态 {state} 符号 {}", grammar.names[symbol as usize]);
+            assert_eq!(
+                decoded, action,
+                "{label}: 状态 {state} 符号 {}",
+                grammar.names[symbol as usize]
+            );
         }
         for (&(state, symbol), &target) in &table.goto {
             let cell = cells[state as usize * symbol_count + symbol as usize];
@@ -1338,9 +1453,18 @@ fn emitted_tokens_contain_the_expected_api() {
     let emitted = table.export().to_string();
 
     // 规模常量必须和分析结果一致
-    assert!(emitted.contains("NUM_STATES : usize = 2usize"), "缺 NUM_STATES");
-    assert!(emitted.contains("NUM_SYMBOLS : usize = 3usize"), "缺 NUM_SYMBOLS");
-    assert!(emitted.contains("NUM_RULES : usize = 1usize"), "缺 NUM_RULES");
+    assert!(
+        emitted.contains("NUM_STATES : usize = 2usize"),
+        "缺 NUM_STATES"
+    );
+    assert!(
+        emitted.contains("NUM_SYMBOLS : usize = 3usize"),
+        "缺 NUM_SYMBOLS"
+    );
+    assert!(
+        emitted.contains("NUM_RULES : usize = 1usize"),
+        "缺 NUM_RULES"
+    );
     assert!(
         emitted.contains(&format!("END_SYMBOL : u32 = {}u32", grammar.end_symbol())),
         "缺 END_SYMBOL"
@@ -1363,10 +1487,12 @@ fn emitted_tokens_contain_the_expected_api() {
     }
 
     // 发射的是 token 而不是字符串，所以名字必须是带引号的字面量
-    assert!(emitted.contains(r#""$end""#), "SYMBOL_NAMES 里应有 \"$end\" 字面量");
+    assert!(
+        emitted.contains(r#""$end""#),
+        "SYMBOL_NAMES 里应有 \"$end\" 字面量"
+    );
     assert!(emitted.contains(r#""start""#));
 }
-
 
 // ============ 字符字面量解析 ============
 
@@ -1383,7 +1509,9 @@ fn char_literal_value_agrees_with_syn() {
     let tokens: TokenStream = source.parse().unwrap();
     let mut checked = 0;
     for token in tokens {
-        let TokenTree::Literal(literal) = token else { panic!("只该有字面量") };
+        let TokenTree::Literal(literal) = token else {
+            panic!("只该有字面量")
+        };
         let text = literal.to_string();
         let expected = match syn::Lit::new(literal) {
             syn::Lit::Char(c) => c.value(),
@@ -1407,7 +1535,9 @@ fn char_literal_value_rejects_other_literal_kinds() {
     let tokens: TokenStream = source.parse().unwrap();
     let mut checked = 0;
     for token in tokens {
-        let TokenTree::Literal(literal) = token else { continue };
+        let TokenTree::Literal(literal) = token else {
+            continue;
+        };
         let text = literal.to_string();
         assert_eq!(char_literal_value(&text), None, "{text} 不该被认成字符");
         checked += 1;
@@ -1419,21 +1549,21 @@ fn char_literal_value_rejects_other_literal_kinds() {
 fn char_literal_value_rejects_malformed_input() {
     // 这些形状在合法 token 流里出现不了，但不能因为「上游保证」就崩掉或误判
     let malformed = [
-        "",                 // 空
-        "'",                // 只有一个引号
-        "''",               // 空字符
-        "'ab'",             // 两个字符
-        "'\\'",             // 反斜杠没跟转义符
-        "'\\q'",            // 未知转义
-        "'\\nx'",           // 转义后还有别的字符
-        "'\\x'",            // \x 没有十六进制位
-        "'\\xZZ'",          // 非十六进制
-        "'\\u'",            // \u 没有花括号
-        "'\\u{}'",          // 花括号里是空的
-        "'\\u{110000}'",    // 超出 Unicode 上限
-        "'\\u{D800}'",      // 代理区码点
-        "'\\u{4e2d'",       // 花括号没闭合
-        "x",                // 没有引号
+        "",              // 空
+        "'",             // 只有一个引号
+        "''",            // 空字符
+        "'ab'",          // 两个字符
+        "'\\'",          // 反斜杠没跟转义符
+        "'\\q'",         // 未知转义
+        "'\\nx'",        // 转义后还有别的字符
+        "'\\x'",         // \x 没有十六进制位
+        "'\\xZZ'",       // 非十六进制
+        "'\\u'",         // \u 没有花括号
+        "'\\u{}'",       // 花括号里是空的
+        "'\\u{110000}'", // 超出 Unicode 上限
+        "'\\u{D800}'",   // 代理区码点
+        "'\\u{4e2d'",    // 花括号没闭合
+        "x",             // 没有引号
     ];
     for text in malformed {
         assert_eq!(char_literal_value(text), None, "{text:?} 不该解析出字符");

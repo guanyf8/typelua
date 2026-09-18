@@ -12,29 +12,38 @@ typedef Pair<A, B> = {first:A, second:B}                -- 泛型
 typedef Bounded<T:number> = {v:T}                       -- 形参上界
 typedef Meta = {VERSION:number} & table<string, any>    -- 交类型：形状合并
 typedef Logger  = {                                     -- 描述外部已存在的表的形状
-    log(...string),
-    system_os() -> number,
+    log:function(...string),                            -- 类型位只能写函数变量字段：
+    system_os:function() -> number,                     -- 「只给签名的方法」这种东西不存在
     os:function() -> string,
 }
 
 -- ========================= Classes =========================
+-- 类成员分两种，**互不为糖**：
+--   `m(self) … end`  是**方法**：必须带函数体（只给签名不合法），不参与 `A{…}`
+--                    构造，也只有它能被类体外的 `function A:m` / `function A.m` 重定义
+--   `m : function(…)` 是**函数变量字段**：和 string / number 一样的普通字段，有默认值
+--                    就随实例带一份、没有就每处构造都得给；不能用 `function` 去定义它
 class A{
     a:string = "hello",                                 -- 有默认值
     b:boolean,                                          -- 无默认值 -> 每处初始化都必须给
     c:number,
-    greet:function(self:A, msg:string) -> string,       -- 成员函数【声明】：只给签名，没有函数体
-    greet2(self, msg:string) -> number,                 -- 同上的简写；self 的类型自动是 A
-    bye(self) -> string return "bye" end,               -- 成员函数【定义】：有 self -> 方法
+    greet(self, msg:string) -> string                   -- 有 self -> 方法；self 的类型自动是 A
+        return msg
+    end,
+    bye(self) -> string return "bye" end,
     hello_again(self) -> (string, number) return "hello", 1 end,
     make(n:number) -> A return A{b = true, c = n} end,  -- 无 self -> 静态方法
-    onclick:function(number) -> (),                     -- 无 self -> 普通函数字段（回调）
+    onclick:function(number) -> () = function(n:number) end,
+                                                        -- 函数变量字段（回调）：这里给了默认值，
+                                                        -- 不给默认值就得每处构造都传
 }
 
 class B : A{
     d:number = 0                                        -- 继承 A 的字段和方法
 }
 
--- 成员函数也可以在类体外定义（Lua 的 ':' 形式，self 隐式）
+-- 方法可以在类体外**重定义**（Lua 的 ':' 形式，self 隐式补在形参表头）。
+-- 名字必须是类体里声明过的方法，签名也得对得上
 function A:greet(msg:string) -> string
     return msg
 end
@@ -45,6 +54,11 @@ local x = A {
 }
 -- local bad = A { b = true }                           -- 不允许：c 无默认值，没给就拒绝
 -- local bad = A { b = true, c = 1, zz = 9 }            -- 不允许：zz 不是 A 的字段
+-- local bad = A { b = true, c = 1, bye = f }           -- 不允许：bye 是方法，构造里给不了
+-- function A:absent() end                              -- 不允许：类体里没声明过这个方法
+-- function A:onclick(n:number) end                     -- 不允许：onclick 是函数变量字段
+-- A.greet = f                                          -- 不允许：A 是类名而不是变量
+-- x.greet = f                                          -- 不允许：方法不能赋值覆盖
 local y = B { b = false, c = 2 }                        -- 继承来的非空字段照样要给；d 有默认值
 x:bye()                                                 -- 方法
 x.onclick(42)                                           -- 回调字段：点号调用，不传 self
@@ -52,21 +66,25 @@ A.make(3)                                               -- 静态方法
 
 -- ========================= Typed locals & globals =========================
 local a:string = "hello"
-local a:string, b:number, c:number = "world", 1, 2
-local a = "hello"                                       -- 能推断的不必标注
+local w:string, m:number, k:number = "world", 1, 2     -- 一句声明多个，各带各的类型
+local guess = "hello"                                   -- 能推断的不必标注
 -- local a                                              -- 不允许：无初始化必须声明类型
--- local n:number                                       -- 不允许：它实际是 nil，要写 number|nil
+-- local a  local a                                     -- 不允许：同层不许重复声明（Lua 能遮蔽，TypeLua 拒）
+local n:number                                          -- OK：无初值，读之前必须赋值（定值分析盯着）
 local p:{x:number, y:number} = {x = 1, y = 2}           -- 匿名 record
 local pr:Pair<string, number> = {first = "a", second = 1}
 local h:Handler = function(evt:string) end
-local E:Result                                          -- OK：Result 含 nil，无初值就是 nil
+local E:Result                                          -- OK：Result 含 nil，声明出来就已经是合法值
 
 -- 空表 {} 推不出形状，所以必须标注，且标注得是「能空着的类型」
 local xs:array<string> = {}                             -- 集合：元素后加
 local t:table<string, any> = {}                         -- 映射：键后加
 -- local m = {}                                         -- 不允许：{} 推不出形状
 -- local r:Config = {}                                  -- 不允许：host/port 是非空字段，没给
--- local _mytype:Logger                                 -- 不允许：record 也不许只声明不赋值
+local cfg:Config                                        -- 表也能只声明不赋值
+cfg = {host = "h", port = 80}                           -- 这一句才是它的构造点
+-- local r2:Config  print(r2.host)                      -- 不允许：r2 尚未赋值就被读
+-- local r3:Config  r3.host = "h"                       -- 不允许：同上，逐项注入也是一次读
 local _mytype = _G.logger as Logger                     -- 已有表达式来源时用 as 落地
 
 -- 宿主（C 层）注入的全局用 extern 声明：只说形状，不核实存在性，零代码生成
@@ -91,6 +109,30 @@ end
 
 function noop() -> () end                               -- 无返回值(void)
 function unpackall(t) -> (...any) return 1, 2, 3 end    -- 变长返回
+
+-- 全局函数声明参与抬升，所以 Lua 的互递归写法原样保留（pong 的声明点在后面）
+function ping(n:number) -> number
+    if n > 0 then return pong(n - 1) end
+    return 0
+end
+function pong(n:number) -> number return ping(n) end
+
+local function fact(n:number) -> number                 -- 自递归：名字在进入函数体前已登记
+    if n <= 1 then return 1 end
+    return n * fact(n - 1)
+end
+-- local function fact2(n) return n * fact2(n - 1) end  -- 不允许：递归函数必须标注返回类型
+
+-- 局部互递归：local function 不抬升，照 Lua 的规矩写前向声明
+local step1:function(number) -> number
+local step2:function(number) -> number
+step1 = function(n:number) -> number return step2(n - 1) end
+step2 = function(n:number) -> number
+    if n > 0 then return step1(n) end
+    return 0
+end
+-- local function bad1() -> number return bad2() end    -- 不允许：bad2 在 Lua 里会被编译成
+-- local function bad2() -> number return bad1() end       全局读，运行时炸 nil
 
 function map<T, U>(t:array<T>, fn:function(T) -> U) -> array<U>
     local out:array<U> = {}
@@ -124,12 +166,91 @@ local json = raw as {encode:function(any) -> string}    -- 用 as 落地
     `local M:{} = {}` 之后 `M.VERSION = 1` 报「`{}` 上没有字段 VERSION」。模块表要么一次
     写全成一个完整字面量，要么用 `table<K,V>`，要么两者交起来：
     `typedef Mod = {VERSION:number} & table<string, function() -> ()>`。
-  - 同理，无初值的 `local x:T` 要求 T 容得下 nil（`local E:Result` 行，`local n:number`
-    不行）—— record 不再是例外。描述外部已存在的东西有两条路：手里已经有表达式来源时
-    用 `as`（`_G.logger as Logger`）；宿主注入的全局用 `extern`（见下节）。
+  - 无初值的 `local x:T` 里 T **可以**是表，但形状仍然只从构造点来：`local r:Config` 之后
+    必须**整体赋一次** `r = {…}`，`r.host = "h"` 不算 —— 那是一次「读 r」，而 r 此刻还没赋值。
+    于是上一条不必单独立规则，它是「先声明后使用」的推论（见下面「无初值声明」）。
+    描述外部已存在的表另有两条路：手里已经有表达式来源时用 `as`（`_G.logger as Logger`）；
+    宿主注入的全局用 `extern`（见下节）。
 
 不管辖的：`a.b = {}` / `a[1] = {}`。它们的类型由所属 record / 集合定，而且文法本来就
 只许把标注贴在裸 Name 上。
+
+先声明后使用
+
+所有变量都必须先声明后使用，全局也不例外。四条规则：
+  - **局部变量**的声明点是 `local decllist [‘=’ explist]`，作用域从该语句**之后**开始 ——
+    和 Lua 一致（`local x = x` 右边那个 x 是外层的）。
+  - **全局变量**的声明点是它第一次出现的地方，而且**只能在文件顶层**：顶层的 `G:T = exp`
+    （带标注）或 `G = exp`（能推断）。嵌在任何 block 里的赋值只是赋值，找不到声明就报错 ——
+    不给「在 if 里第一次赋值也算声明」留口子，否则声明点取决于控制流，判据会一路滑向
+    可达性分析，而读代码的人也无从判断 G 到底是谁的。
+  - 后续赋值可以在任意地方，但**不能背叛声明**：走和 `extern` 同一条兼容性检查。
+  - `extern Name ‘:’ type` 是第三种声明形态，同样只能顶层。它声明存在性而不核实存在性。
+标准库的全局（print / require / ipairs / string / os / tostring / pcall / _G / …）由一份
+内建 prelude 提前声明，形态上等价于一串 `extern`，所以不必在每个文件顶上重复写。这份
+prelude 是「先声明后使用」的必要配件，没有它每个文件都会报一屏。
+
+无初值声明
+
+`local x:T` 可以不给初值，**T 是什么都行**，唯一的硬要求是标注得在：
+  - `local n:number` / `local f:function() -> ()` / `local r:Config` —— 都可以。
+  - `local a` —— 不行，没标注就没类型可言。
+代价是每个变量多带一位「已赋过值」，**读一个尚未赋值的变量是错**（TS2454
+「used before being assigned」）。这一位把 soundness 拉回来了：类型说 `number` 而
+运行时是 nil 的那段窗口里，变量根本不允许被读。
+老规则「无初值就要求 T 容得下 nil」不再是门槛，而是降级成**这一位的初值**：
+`local E:Result`（`A|B|nil`）声明出来就算已赋值 —— nil 真是它的合法值，读它安全；
+`local n:number` 从未赋值起步。
+
+何处查：只在**立即求值位置**查，**函数体内一律不查**。后一条不是偷懒：
+`a = function() b() end` 里的 `b` 此刻当然还没赋值，查了就把局部互递归当场判死。
+这和下面「抬升只在延迟求值位置生效」是同一条线，TS 也是这么划的
+（`let x:number; const f = () => x + 1; x = 1;` 在 TS 里不报）。
+
+分支怎么合：赋值只会把这一位从「未赋」推向「已赋」，所以不建控制流图，
+一遍遍历配上快照 / 回滚 / 取交集就够：
+  - `if c then n=1 else n=2 end` 过；`if c then n=1 end` 报 —— 落空路径没赋值。
+  - `while` / `for` 的体可能执行 0 次，体内的赋值不往外传；`do` / `repeat` 至少
+    一次，往外传。
+  - 走不出来的分支不参与交集，所以 guard 写法照常：
+    `if c then n=1 else return end` 、`if c then n=1 else error("bad") end` 都过。
+    后一例靠的是 prelude 把 `error` / `os.exit` 声明成返回 `never`（底类型，
+    一个值也没有）：调用求不出值来，于是这一支走不到下一句。
+    判据在类型上、不在写法上，所以 `os.exit()`（字段读）和 `local e = error`
+    之后的 `e("x")` 一样算。反过来，`assert` 不能这么声明 —— 条件为真时它正常返回。
+    `never` 是个普通的内建类型名（和 `array` / `table` 同列），各个类型位都写得出，
+    否则 prelude 自己就无法声明这类函数。它没有值，所以 `local x:never` 声明得出来
+    却永远赋不上，读它就报「可能尚未赋值」—— 无需为它另立规则。
+  - 函数里一出现 `goto`，该函数的这项检查降级为放过 —— 向后跳让线性合并失效，
+    宁可漏报不误报。
+
+为什么不要求写 `|nil` 再收窄：**代价不对称**。record 的收窄能在一处包住一整段代码，而互递归
+的调用点在**别的函数体里**，收窄跨不过函数边界，每个调用点都得重写一遍 `if a ~= nil then`。
+所以这里选择放过，而不是让惯用写法付仪式钱。换来的是 Lua 的局部互递归能原样写
+（见 sample 里的 step1 / step2）。
+全局没有对应形态 —— 文法上全局的声明点必然带 `= explist`，所以全局互递归走下面的抬升。
+
+函数声明抬升
+
+Lua 里 `function a() b() end function b() a() end` 合法（`a` 体内的 `b` 是 `_ENV.b` 的
+运行时查找），这是最常见的互递归写法。为了不砍掉它，**顶层的全局函数声明参与抬升**：
+`function Name funcbody` 的名字在整个文件可见，不必等到它的声明语句。四条边界：
+  - 只抬升 `function Name funcbody`（funcname 是裸 Name）。`function M.a()` / `function A:f()`
+    不引入新名字，它们是给已有变量的字段赋值，字段由 `M` / `A` 的类型给出，本来就不需要抬升。
+  - **`local function` 不抬升**。Lua 的局部名字是词法解析的：`local function a() b() end`
+    里的 `b`，若 `local b` 出现在它之后，编译出来的是 `_ENV.b` 而不是那个局部 —— 抬升它
+    等于放行一份运行时必炸的代码。`local function f` 只享有「名字在进入函数体之前就已登记」
+    这一条（手册规定它展开成 `local f; f = function…`，而不是 `local f = function…`），
+    所以**自递归**可用、互递归得靠上面的前向声明。
+  - **函数表达式不抬升**：`local g = function() … end` 的 `g` 是普通局部变量，声明点就是那行。
+  - 抬升只让名字在**延迟求值位置**（函数体内）可见。顶层立即求值的位置引用一个声明点还在
+    后面的函数，原生 Lua 也是运行时炸 nil，checker 照 TS2448 的形状报「b 在此处尚未赋值」。
+
+递归函数的返回类型
+
+没有 `->` 标注时返回类型靠体内的 return 表达式推断，而自引用会让这个推断依赖自己。所以
+**参与递归（自递归或互递归）的函数必须显式标注返回类型**，和 TS7023 同一个动机，标注即解环。
+参数类型不受影响：签名在进入函数体之前就已登记，递归调用的实参照常检查。
 
 宿主声明 extern
 
@@ -162,7 +283,7 @@ pub class A {                                           -- pub：类型名可被
 }
 
 pub typedef Shape = {                                   
-    g(s:string, n:number) -> number,
+    g:function(s:string, n:number) -> number,           -- 类型位只有函数变量字段
 }
 
 typedef Internal = number                             
@@ -222,8 +343,8 @@ stat ::=  ‘;’ |                                                        (~Lua
      for Name [‘:’ type] ‘=’ exp ‘,’ exp [‘,’ exp] do block end |
                                                -- (~Lua) 循环变量可带类型
      for decllist in explist do block end |     -- (~Lua) namelist -> decllist
-     function funcname funcbody |
-     local function Name funcbody |
+     function funcname funcbody |              -- (~Lua) 顶层裸名参与抬升，见「函数声明抬升」
+     local function Name funcbody |            -- (~Lua) 不抬升，只保证名字先于函数体登记
      local decllist [‘=’ explist] |             -- (~Lua) namelist -> decllist
      [pub] class Name [generics] [‘:’ extendtype] classbody |
                                                -- (+TLUA) 类声明；pub = 跨文件可见
@@ -286,6 +407,7 @@ importlist ::= importitem {‘,’ importitem} [‘,’]
 importitem ::= Name | Name as Name            
 
 decllist ::= Name [‘:’ type] {‘,’ Name [‘:’ type]}
+     -- 无初值时标注必给，类型不限；读之前必须赋过值（见「无初值声明」）。
 
 -- ---- 泛型形参 ----
 generics   ::= ‘<’ typeparams ‘>’
@@ -313,6 +435,12 @@ basictype ::= Name
             | Name ‘<’ typeargs ‘>’          -- 泛型（支持任意嵌套）
             | ‘(’ type ‘)’                   -- 括号分组，如 (function()->A)|B
             | ‘{’ [classfieldlist] ‘}’       -- 匿名 record
+     -- 四个标量名（any / boolean / number / string）、两个内建泛型名
+     -- （array / table）和 `never` 都只是预先注册好的 Name，不是关键字 ——
+     -- 用户自己声明的同名类型遮蔽它们。`never` 是底类型（一个值也没有），
+     -- 主用于返回位：`extern error:function(any) -> never` 告诉 checker
+     -- 调它就回不来，详见「无初值声明」。checker 内部还有个 `unknown`
+     -- （「还没算出来」），它**不在**这张表里：能写就等于给了一个关掉检查的后门。
      -- record 直接复用 classfieldlist，所以类体那套写法在类型位置原样可用；
      -- 类型位置只许「声明」形式，`= exp` 和 `block end` 由 checker 拒绝。
      -- `{...}` 归 record，所以数组/映射不给新语法，约定内建泛型名
@@ -346,14 +474,24 @@ classbody      ::= ‘{’ [classfieldlist] ‘}’
 classfieldlist ::= classfield {‘,’ classfield} [‘,’]
 classfield     ::= Name ‘:’ type [‘=’ exp]        -- 属性：声明[+默认值]
                  | Name ‘=’ exp                    -- 属性：定义(类型推断)
-                 | methodsig [ block end ]         -- 方法：签名 / 内联定义
+                 | methodsig block end             -- 方法：必带函数体
 methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
+     -- 前两条是**属性**，第三条是**方法**，两者不互为糖：
+     --   属性就是普通字段，类型写 function(…) 就是个函数变量字段，和 string /
+     --   number 一样待：没默认值就每处构造都得给，一人一份，不能用 function 定义；
+     --   方法是类上的行为，不参与构造，但可以在类体外被 `function A:m` / `function A.m`
+     --   重定义（名字必须先在类体里声明过，签名也得对得上）。
+     -- 所以「只给签名的方法」这条候选式不存在：methodsig 必须跟着 block end。
+     -- 这也顺手封住了类型位：basictype 的 ‘{’ classfieldlist ‘}’ 和类体共用
+     -- 同一个 classfieldlist，而匿名 record 里的函数体归谁、何时查都没答案 ——
+     -- 想要个函数成员就写属性 `m : function(…)`。
      -- self 是显式的普通参数：第一个参数写 self 就是方法（其类型在类体内默认为
      -- 本类），不写就是静态方法。类型系统里没有「方法」这个概念，只有字段持有
-     -- 函数值；`a:f(x)` 就是 `a.f(a, x)`，纯语法糖。
-     -- 允许尾随逗号，但分隔符只能是 ‘,’ 而不是 fieldsep：‘;’ 既能当分隔符
-     -- 又能当方法体里的空语句（`stat : ';'`），无函数体的 methodsig 后面
-     -- 那个 ‘;’ 分不清是哪个。
+     -- 函数值；`a:f(x)` 就是 `a.f(a, x)`，纯语法糖。「是不是方法」只活在声明层。
+     -- 允许尾随逗号，但分隔符只能是 ‘,’ 而不是 fieldsep。当初的硬理由是 ‘;’ 既能当
+     -- 分隔符又能当方法体里的空语句（`stat : ‘;’`），无函数体的 methodsig 后面那个
+     -- ‘;’ 分不清是哪个；那条候选式现在删了，留下的理由只是一致性 ——
+     -- 类体是声明表，而 parlist / typelist / record 这些声明位一律只用 ‘,’。
      -- 字段是非空的：每个字段要么有默认值，要么在**每一处**初始化里给出，否则报错。
      -- 没有构造器，也没有 Name.new：初始化照结构体字面量来 ——
      --     local x = A{b = true, c = 1}
@@ -843,14 +981,16 @@ classfields
     ;
 
 classfield
-    /* 第一条是「无默认值」：checker 要求每一处 `Name{…}` 都给出它。
-       后两条带默认值。init 不再是保留的方法名 —— 没有构造器了，
-       初始化是字面量（见 prefixexp args），所以这里五条候选式一条没动。 */
+    /* 前三条是**属性**（普通字段，含函数变量字段）：第一条无默认值，
+       checker 要求每一处 `Name{…}` 都给出它；后两条带默认值。
+       第四条是**方法**，methodsig 必须带函数体 —— 「只有签名」那条候选式
+       删掉了，因为方法和函数变量字段不互为糖，只给签名的函数成员得写成
+       属性 `m : function(…)`。init 不是保留的方法名 —— 没有构造器了，
+       初始化是字面量（见 prefixexp args）。 */
     : NAME ':' type                  { $$ = ast_own("Field", $1); ast_add($$, $3); }
     | NAME ':' type '=' exp          { $$ = ast_own("Field", $1);
                                        ast_add($$, $3); ast_add($$, $5); }
     | NAME '=' exp                   { $$ = ast_own("Field", $1); ast_add($$, $3); }
-    | methodsig                      { $$ = $1; }
     | methodsig block END            { $$ = $1; ast_add($$, $2); }
     ;
 

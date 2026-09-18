@@ -110,19 +110,19 @@ grammar::grammar! {
     chunk
         : block
         ;
-    
+
     block
         : stat_list                      @Block
         | stat_list retstat              @Block
         | retstat                        @Block
         | /* empty */                    @Block
         ;
-    
+
     stat_list
         : stat
         | stat_list stat                 @ListTail
         ;
-    
+
     stat
         : ';'                            /* empty stmt dropped */
         | varlist '=' explist            @Assign
@@ -134,15 +134,15 @@ grammar::grammar! {
         | WHILE exp DO block END         @While
         | REPEAT block UNTIL exp         @Repeat
         | IF exp THEN block elseif_list END @If
-    
+
         | IF exp THEN block elseif_list ELSE block END @IfElse
-    
+
         | FOR NAME optype '=' exp ',' exp DO block END @ForNum
-    
+
         | FOR NAME optype '=' exp ',' exp ',' exp DO block END @ForNumStep
-    
+
         | FOR decllist IN explist DO block END @ForIn
-    
+
         | FUNCTION funcname funcbody     @FuncDecl
         | LOCAL FUNCTION NAME funcbody   @FuncDecl
         | LOCAL decllist                 @LocalDecl
@@ -155,152 +155,152 @@ grammar::grammar! {
            「只许顶层」不在文法里，和带标注的全局赋值一样由 checker 拦；
            不给 optpub 槽，于是 `pub extern` 天然是语法错 */
         | EXTERN NAME ':' type                         @Extern
-    
+
         ;
-    
+
     optpub
         : /* empty */
         | PUB                            @Pub
         ;
-    
+
     importlist
         : importitems
         | importitems ','
         ;
-    
+
     importitems
         : importitem
         | importitems ',' importitem     @ListTail
         ;
-    
+
     importitem
-        : NAME
+        : NAME                           @ImportItem
         | NAME AS NAME                   @ImportAlias
         ;
-    
+
     elseif_list
         : /* empty */
         | elseif_list ELSEIF exp THEN block @ElseIf
-    
+
         ;
-    
+
     retstat
         : RETURN                         @ReturnVoid
         | RETURN ';'                     @ReturnVoid
         | RETURN explist                 @Return
         | RETURN explist ';'             @Return
         ;
-    
+
     label
         : DBCOLON NAME DBCOLON           @Label
         ;
-    
+
     funcname
         : dotted_name
         | dotted_name ':' NAME           @MethodName
         ;
-    
+
     dotted_name
-        : NAME
+        : NAME                           @FuncName
         | dotted_name '.' NAME           @DottedName
         ;
-    
+
     varlist
         : var
         | varlist ',' var                @ListTail
         ;
-    
+
     var
         : prefixexp optype               /* 标注只允许贴裸 NAME，由 checker 拦 */ @Var
         ;
-    
+
     decllist
         : NAME optype                    @DeclFirst
         | decllist ',' NAME optype       @DeclRest
         ;
-    
+
     optype
         : /* empty */                    /* 无标注：什么都不用做 */
         | ':' type                       @TypeAnnotation
         ;
-    
+
     generics                             /* 泛型形参表，class / typedef / funcbody 共用 */
         : /* empty */
         | '<' typeparams '>'             @Generics
         ;
-    
+
     typeparams
         : typeparam
         | typeparams ',' typeparam       @ListTail
         ;
-    
-    typeparam                            
-        : NAME
+
+    typeparam
+        : NAME                           @TypeParam
         | NAME ':' type                  @TypeParamBound
         ;
-    
-    extendtype                          
-        : NAME
+
+    extendtype
+        : NAME                           @TypeName
         | NAME '<' typeargs '>'          @GenericType
         ;
-    
+
     type
         : uniontype
         | functype
         ;
-    
+
     uniontype
         : intertype
         | uniontype '|' intertype        @Union
         ;
-    
+
     intertype                            /* 交类型：形状合并。比 '|' 紧，`A & B | C` = `(A&B) | C` */
         : basictype
         | intertype '&' basictype        @Intersect
         ;
-    
+
     basictype
-        : NAME
+        : NAME                           @TypeName
         | NIL                            /* nil type */
         | NAME '<' typeargs '>'          @GenericType
-    
+
         | '(' type ')'                   /* grouping: (function()->A)|B */ @ParenType
         | '{' '}'                        /* 匿名 record */ @RecordEmpty
         | '{' classfieldlist '}'         /* 复用 classfieldlist：类型位只许声明形式 */ @Record
         ;
-    
+
     typeargs
         : type
         | typeargs ',' type              @ListTail
         ;
-    
+
     functype                             /* 类型位的参数表：名字可省，故不能复用 parlist */
         : FUNCTION '(' ')'               @FuncType
         | FUNCTION '(' ')' rettype       @FuncType
         | FUNCTION '(' argtypes ')'      @FuncType
         | FUNCTION '(' argtypes ')' rettype @FuncType
         ;
-    
+
     argtypes
         : argtypelist
         | argtypelist ',' vararg         @ParamsVararg
         | vararg
         ;
-    
+
     argtypelist
         : argtype
         | argtypelist ',' argtype        @ListTail
         ;
-    
+
     argtype
         : NAME ':' type                  /* 带名，纯文档 */ @ArgTypeNamed
         | type                           /* 裸类型：function(string) -> number */
         ;
-    
+
     rettype
         : ARROW retspec                  @ReturnType
         ;
-    
+
     retspec
         : type                           /* single return */
         | '(' ')'                        /* void */ @RetVoid
@@ -313,25 +313,27 @@ grammar::grammar! {
         | typelist ',' vararg            /* 定长 + 末位 vararg */ @RetVararg
         | vararg                         /* 只有 vararg */
         ;
-    
+
     typelist
         : type
         | typelist ',' type              @ListTail
         ;
-    
+
     classbody
         : '{' '}'                        @ClassBody
         | '{' classfieldlist '}'         @ClassBody
         ;
-    
-    classfieldlist                       /* 允许尾随逗号；但分隔符只能是 ','：
-                                            用 fieldsep 会让 ';' 和 `stat : ';'` 打起来
-                                            —— 无函数体的 methodsig 后面那个 ';' 分不清
-                                            是分隔符还是方法体里的空语句 */
+
+    classfieldlist                       /* 允许尾随逗号；分隔符只收 ','。
+                                            原来的理由是「无函数体的 methodsig 后面那个
+                                            ';' 分不清是分隔符还是方法体里的空语句」——
+                                            那条候选式已经删了（见 classfield），理由随之
+                                            失效。仍然只收 ',' 是为了类体和类型位的 record
+                                            写法一致，没再去实测 fieldsep 那半 */
         : classfields
         | classfields ','
         ;
-    
+
     classfields                          /* 单元素那条不贴标签：命中 parser.rs 的折叠，
                                             脊底直接是 classfield 本身。贴了反而多一层壳，
                                             还要 linter 的 spine() 专门剥它。
@@ -340,30 +342,36 @@ grammar::grammar! {
         : classfield
         | classfields ',' classfield     @ListTail
         ;
-    
-    classfield                           /* 第一条是「无默认值」：checker 要求每一处
-                                            `Name{…}` 都给出它，给不全就报错（helper.md 12）。
-                                            后两条带默认值，字面量里可省。
+
+    classfield                           /* 前三条是**属性**（普通字段，含函数变量字段）：
+                                            第一条无默认值，checker 要求每一处 `Name{…}`
+                                            都给出它（helper.md 12）；后两条带默认值，
+                                            构造时可省。
+                                            第四条是**方法**，methodsig 必须带函数体 ——
+                                            「只有签名」那条候选式删掉了：方法和函数变量
+                                            字段不互为糖，声明了却没人定义的方法无处收口
+                                            （诊断按文件在 finish 收，定义可能在别的文件）。
+                                            要一个只给签名的函数成员就写成属性：
+                                            `m : function(self:A) -> T`。
                                             没有构造器，所以 init 在这里只是个普通方法名 */
         : NAME ':' type                  @FieldDecl
         | NAME ':' type '=' exp          @FieldDecl
         | NAME '=' exp                   @FieldDecl
-        | methodsig                      @MethodDecl
         | methodsig block END            @MethodDef
         ;
-    
+
     methodsig
         : NAME '(' ')'                        @MethodSig
         | NAME '(' ')' rettype                @MethodSig
         | NAME '(' parlist ')'                @MethodSig
         | NAME '(' parlist ')' rettype        @MethodSig
         ;
-    
+
     explist
         : exp
         | explist ',' exp                @ListTail
         ;
-    
+
     /* Precedence and associativity are encoded in the rules themselves:
        one nonterminal per precedence level, left recursion for left
        associativity, right recursion for right associativity. */
@@ -469,9 +477,9 @@ grammar::grammar! {
         | prefixexp
         | tableconstructor
         ;
-    
+
     prefixexp
-        : NAME
+        : NAME                           @VarRef
         | '(' exp ')'                    @Paren
         | prefixexp '[' exp ']'          @Index
         | prefixexp '.' NAME             @Dot
@@ -479,7 +487,7 @@ grammar::grammar! {
         | prefixexp ':' NAME args        @MethodCall
         | prefixexp TURBOFISH typeargs '>'    @TurboFish
         ;
-    
+
     args                                 /* tableconstructor 那条兼任 class 初始化：
                                             `A{…}` 就是它，见文件头。`A"str"` 同理是
                                             Lua 自带的糖，只是对 class 没有意义 */
@@ -488,59 +496,59 @@ grammar::grammar! {
         | tableconstructor
         | STRING
         ;
-    
+
     functiondef
         : FUNCTION funcbody              @FuncExpr
         ;
-    
+
     funcbody
         : generics '(' ')' block END     @FuncBody
         | generics '(' ')' rettype block END @FuncBody
         | generics '(' parlist ')' block END @FuncBody
         | generics '(' parlist ')' rettype block END @FuncBody
         ;
-    
+
     parlist
         : params
         | params ',' vararg              @ParamsVararg
         | vararg
         ;
-    
+
     params
         : param
         | params ',' param               @ListTail
         ;
-    
+
     param
         : NAME optype                    @Param
         ;
-    
+
     vararg
         : ELLIPSIS
         | ELLIPSIS type                  @VarargTyped
         ;
-    
+
     tableconstructor
         : '{' '}'                        @TableEmpty
         | '{' fieldlist '}'              @Table
         ;
-    
+
     fieldlist
         : fields
         | fields fieldsep
         ;
-    
+
     fields
         : field
         | fields fieldsep field          @ListTail
         ;
-    
+
     field
         : '[' exp ']' '=' exp            @FieldKV
         | NAME '=' exp                   @FieldNamed
         | exp
         ;
-    
+
     fieldsep
         : ','
         | ';'
