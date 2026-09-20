@@ -15,29 +15,37 @@ mod flow_tests {
     /// 一个只有文件级作用域 + 文件帧的 linter，里面声明了 `local n:number`：
     /// number 容不下 nil、声明处又没给值，所以 `inited` 从 false 起步。
     /// 不需要 AST —— `flow_*` 全部只动内部状态，不读树
-    fn linter() -> TypeLinter {
+    fn linter() -> (TypeLinter, Context) {
         let mut lint = TypeLinter::new();
-        lint.scope_stack.push(Scope::new());
-        lint.flow_reset();
-        lint.declare_variable("n", TypeId::NUMBER, Span::default(), VarScope::Local, false);
-        assert!(!lint.inited("n"));
-        lint
+        let mut ctx = Context::new();
+        ctx.scope_stack.push(Scope::new());
+        lint.flow_reset(&mut ctx);
+        lint.declare_variable(
+            &mut ctx,
+            "n",
+            TypeId::NUMBER,
+            Span::default(),
+            VarScope::Local,
+            false,
+        );
+        assert!(!lint.inited(&ctx, "n"));
+        (lint, ctx)
     }
 
     impl TypeLinter {
         /// 测试用的查位快捷方式
-        fn inited(&self, name: &str) -> bool {
-            self.lookup_variable(name).expect("没声明过").inited
+        fn inited(&self, ctx: &Context, name: &str) -> bool {
+            self.lookup_variable(ctx, name).expect("没声明过").inited
         }
 
         /// 跑一条分支：里面给 `n` 赋值，`terminated` 控制它走不走得出去
-        fn branch_assigning_n(&mut self, terminated: bool) {
-            self.flow_enter_branch();
-            assert!(self.mark_inited("n"));
+        fn branch_assigning_n(&mut self, ctx: &mut Context, terminated: bool) {
+            self.flow_enter_branch(ctx);
+            assert!(self.mark_inited(ctx, "n"));
             if terminated {
-                self.flow_terminate();
+                self.flow_terminate(ctx);
             }
-            self.flow_leave_branch();
+            self.flow_leave_branch(ctx);
         }
     }
 
@@ -46,18 +54,21 @@ mod flow_tests {
     /// `if c then n=1 end` 那种写法会跟着蒙混过关
     #[test]
     fn if_else_intersects_and_rolls_back() {
-        let mut lint = linter();
+        let (mut lint, mut ctx) = linter();
 
-        lint.flow_open();
-        lint.branch_assigning_n(false);
-        assert!(!lint.inited("n"), "分支退出必须回滚，合并之前外层看不见");
-        lint.branch_assigning_n(false);
-        assert!(!lint.inited("n"));
-        lint.flow_close(JoinMode::Exhaustive);
-
-        assert!(lint.inited("n"));
+        lint.flow_open(&mut ctx);
+        lint.branch_assigning_n(&mut ctx, false);
         assert!(
-            lint.init_record.len() == 1,
+            !lint.inited(&ctx, "n"),
+            "分支退出必须回滚，合并之前外层看不见"
+        );
+        lint.branch_assigning_n(&mut ctx, false);
+        assert!(!lint.inited(&ctx, "n"));
+        lint.flow_close(&mut ctx, JoinMode::Exhaustive);
+
+        assert!(lint.inited(&ctx, "n"));
+        assert!(
+            ctx.init_record.len() == 1,
             "合并结果要记回日志，外层才回滚得掉"
         );
     }
@@ -66,96 +77,103 @@ mod flow_tests {
     /// `while c do n=1 end` / `for` / funcbody 走的是同一支
     #[test]
     fn fallthrough_joins_nothing() {
-        let mut lint = linter();
+        let (mut lint, mut ctx) = linter();
 
-        lint.flow_open();
-        lint.branch_assigning_n(false);
-        lint.flow_close(JoinMode::Skippable);
+        lint.flow_open(&mut ctx);
+        lint.branch_assigning_n(&mut ctx, false);
+        lint.flow_close(&mut ctx, JoinMode::Skippable);
 
-        assert!(!lint.inited("n"));
-        assert!(lint.init_record.is_empty());
+        assert!(!lint.inited(&ctx, "n"));
+        assert!(ctx.init_record.is_empty());
     }
 
     /// `do n=1 end` / `repeat n=1 until c` —— 必定执行一次，原样应用
     #[test]
     fn always_taken_branch_applies() {
-        let mut lint = linter();
+        let (mut lint, mut ctx) = linter();
 
-        lint.flow_open();
-        lint.branch_assigning_n(false);
-        lint.flow_close(JoinMode::Always);
+        lint.flow_open(&mut ctx);
+        lint.branch_assigning_n(&mut ctx, false);
+        lint.flow_close(&mut ctx, JoinMode::Always);
 
-        assert!(lint.inited("n"));
+        assert!(lint.inited(&ctx, "n"));
     }
 
     /// `if c then n=1 else return end` —— 终结的分支不参与交集。
     /// 没这一条，guard 写法全部误报，比一刀切的「不许无初值」更招人烦
     #[test]
     fn terminated_branch_skipped() {
-        let mut lint = linter();
+        let (mut lint, mut ctx) = linter();
 
-        lint.flow_open();
-        lint.branch_assigning_n(false);
+        lint.flow_open(&mut ctx);
+        lint.branch_assigning_n(&mut ctx, false);
         // else 分支什么都不赋，但 return 了
-        lint.flow_enter_branch();
-        lint.flow_terminate();
-        lint.flow_leave_branch();
-        lint.flow_close(JoinMode::Exhaustive);
+        lint.flow_enter_branch(&mut ctx);
+        lint.flow_terminate(&mut ctx);
+        lint.flow_leave_branch(&mut ctx);
+        lint.flow_close(&mut ctx, JoinMode::Exhaustive);
 
-        assert!(lint.inited("n"));
+        assert!(lint.inited(&ctx, "n"));
     }
 
     /// 两边都走不出来（`if c then return else error("x") end`）：
     /// 外层从这条语句起也到不了下一句
     #[test]
     fn all_terminated_propagates_outward() {
-        let mut lint = linter();
+        let (mut lint, mut ctx) = linter();
 
-        lint.flow_open();
-        lint.branch_assigning_n(true);
-        lint.branch_assigning_n(true);
-        lint.flow_close(JoinMode::Exhaustive);
+        lint.flow_open(&mut ctx);
+        lint.branch_assigning_n(&mut ctx, true);
+        lint.branch_assigning_n(&mut ctx, true);
+        lint.flow_close(&mut ctx, JoinMode::Exhaustive);
 
-        assert!(lint.flow_terminated());
-        assert!(!lint.inited("n"), "到不了的代码里那些赋值不能算数");
+        assert!(lint.flow_terminated(&ctx));
+        assert!(!lint.inited(&ctx, "n"), "到不了的代码里那些赋值不能算数");
     }
 
     /// 分支里的内层同名变量不能泄到外层。这是 `InitFlip` 存作用域下标
     /// 而不是只存名字的缘由：按名字回滚 / 应用会打到被遮蔽的那一个
     #[test]
     fn inner_shadow_does_not_leak() {
-        let mut lint = linter();
+        let (mut lint, mut ctx) = linter();
 
-        lint.flow_open();
-        lint.flow_enter_branch();
+        lint.flow_open(&mut ctx);
+        lint.flow_enter_branch(&mut ctx);
         // 分支自己那层作用域在 flow_enter_branch 之后才入栈
-        lint.scope_stack.push(Scope::new());
-        lint.declare_variable("n", TypeId::NUMBER, Span::default(), VarScope::Local, false);
-        assert!(lint.mark_inited("n"));
-        lint.scope_stack.pop();
-        lint.flow_leave_branch();
+        ctx.scope_stack.push(Scope::new());
+        lint.declare_variable(
+            &mut ctx,
+            "n",
+            TypeId::NUMBER,
+            Span::default(),
+            VarScope::Local,
+            false,
+        );
+        assert!(lint.mark_inited(&mut ctx, "n"));
+        ctx.scope_stack.pop();
+        lint.flow_leave_branch(&mut ctx);
         // 必定执行一次也不行：那次赋值根本不是给外层这个 n 赋的
-        lint.flow_close(JoinMode::Always);
+        lint.flow_close(&mut ctx, JoinMode::Always);
 
-        assert!(!lint.inited("n"));
+        assert!(!lint.inited(&ctx, "n"));
     }
 
     /// 函数体里的 `return` 不能终结外层：
     /// `local f = function() return end` 之后外层照样往下跑
     #[test]
     fn function_body_does_not_terminate_outer() {
-        let mut lint = linter();
+        let (mut lint, mut ctx) = linter();
 
-        lint.flow_open();
-        lint.flow_enter_body();
-        assert!(lint.mark_inited("n"));
-        lint.flow_terminate();
-        lint.flow_leave_branch();
-        lint.flow_close(JoinMode::Skippable);
+        lint.flow_open(&mut ctx);
+        lint.flow_enter_body(&mut ctx);
+        assert!(lint.mark_inited(&mut ctx, "n"));
+        lint.flow_terminate(&mut ctx);
+        lint.flow_leave_branch(&mut ctx);
+        lint.flow_close(&mut ctx, JoinMode::Skippable);
 
-        assert!(!lint.flow_terminated());
+        assert!(!lint.flow_terminated(&ctx));
         assert!(
-            !lint.inited("n"),
+            !lint.inited(&ctx, "n"),
             "不知道这个函数会不会被调，体内的赋值不能算数"
         );
     }
@@ -164,19 +182,19 @@ mod flow_tests {
     /// 不应该把整个文件的检查关掉
     #[test]
     fn untrust_stops_at_function_boundary() {
-        let mut lint = linter();
+        let (mut lint, mut ctx) = linter();
 
-        lint.flow_open();
-        lint.flow_enter_body();
-        lint.flow_enter_branch(); // 体内的一个 if 分支
-        lint.flow_untrust();
-        assert!(!lint.flow_trusted());
-        lint.flow_leave_branch();
-        assert!(!lint.flow_trusted(), "分支退出后这个函数体仍然不可信");
-        lint.flow_leave_branch(); // 函数体
-        lint.flow_close(JoinMode::Skippable);
+        lint.flow_open(&mut ctx);
+        lint.flow_enter_body(&mut ctx);
+        lint.flow_enter_branch(&mut ctx); // 体内的一个 if 分支
+        lint.flow_untrust(&mut ctx);
+        assert!(!lint.flow_trusted(&ctx));
+        lint.flow_leave_branch(&mut ctx);
+        assert!(!lint.flow_trusted(&ctx), "分支退出后这个函数体仍然不可信");
+        lint.flow_leave_branch(&mut ctx); // 函数体
+        lint.flow_close(&mut ctx, JoinMode::Skippable);
 
-        assert!(lint.flow_trusted(), "文件帧不该被它传染");
+        assert!(lint.flow_trusted(&ctx), "文件帧不该被它传染");
     }
 
     /// 判据在类型上、不在被调者的写法上：只要调用求出来是 `never` 就终结，
@@ -191,17 +209,18 @@ mod flow_tests {
             ("tostring(1)", TypeId::STRING, false),
         ] {
             let mut parser = Parser::new(src);
-            let (ast, _) = parser.parse();
+            let ast = parser.parse().tree;
             let mut lint = TypeLinter::new();
+            let mut ctx = Context::new();
 
             let stat = find_prod(ast, Prod::ExprStat).expect("这几句都是 @ExprStat");
             let call = ast.get_node(stat).children[0];
-            lint.register_value(call, ty);
-            assert_eq!(lint.is_noreturn_stat(ast, stat), expect, "{src}");
+            lint.register_value(&mut ctx, call, ty);
+            assert_eq!(lint.is_noreturn_stat(&ctx, ast, stat), expect, "{src}");
         }
     }
 
-    /// `never` 能写（prelude 要在 .tlua 里声明 `-> never`），`unknown` 不能写
+    /// `never` 能写（prelude 要在 .tua 里声明 `-> never`），`unknown` 不能写
     /// —— 后者是「还没算出来」这个内部状态，能写就是关闭检查的后门。
     /// 顺带钉住预 intern 的顺序：NEVER 插在 VOID 前面，很容易错位
     #[test]
@@ -251,7 +270,7 @@ mod driver_tests {
     /// 这样 `prepare` / `finish` 的配平自检也一并跑到
     fn lint(src: &str) -> Vec<String> {
         let mut parser = Parser::new(src);
-        let (ast, _) = parser.parse();
+        let ast = parser.parse().tree;
         LintDriver::new()
             .init(TypeLinter::new())
             .run(ast, "main")
@@ -606,14 +625,18 @@ mod driver_tests {
         clean("extern w : Widget\nclass Widget { n : number }");
     }
 
-    /// 只抬顶层：嵌在 do 里的 class 不是顶层声明点，外面引用不到它。
-    /// 和 top_level_functions_are_hoisted 同一个尺度 —— 抬升只认 chunk 直属语句
+    /// 只抬顶层：嵌在 do 里的 class 不是顶层声明点。以前只是静默不抬升、引用处
+    /// 才撞上「未声明的类型」；现在 decl_to_fill 就地报明确诊断（extern / import /
+    /// pub 同一个尺度）。抬升只认 chunk 直属语句
     #[test]
-    fn only_top_level_types_are_hoisted() {
-        only(
-            "do class Inner { n : number } end\nextern w : Inner",
-            "未声明的类型 Inner",
-        );
+    fn nested_class_reports_must_be_top_level() {
+        only("do class Inner { n : number } end", "只能写在文件顶层");
+    }
+
+    /// typedef 走同一条前导，嵌套同样报明确诊断
+    #[test]
+    fn nested_typedef_reports_must_be_top_level() {
+        only("do typedef T = number end", "只能写在文件顶层");
     }
 
     // ---- P1 class / typedef 名义体填充 ----
@@ -2080,7 +2103,7 @@ mod driver_tests {
         let mut out = Vec::new();
         for (i, &src) in srcs.iter().enumerate() {
             let mut parser = Parser::new(src);
-            let (ast, _) = parser.parse();
+            let ast = parser.parse().tree;
             // 模块名只要彼此不撞就行，这组测的是累积 / 不泄露，不涉跨模块引用
             let module = format!("m{i}");
             out.push(
@@ -2101,7 +2124,7 @@ mod driver_tests {
         let mut out = Vec::new();
         for &(module, src) in mods {
             let mut parser = Parser::new(src);
-            let (ast, _) = parser.parse();
+            let ast = parser.parse().tree;
             out.push(driver.run(ast, module).into_iter().map(|e| e.msg).collect());
         }
         out
@@ -2267,31 +2290,27 @@ mod driver_tests {
 
     // ---- 整棵样例 ----
 
-    /// README sample 的可运行版：`examples/sample.tlua` 是 README 语言参考里
+    /// README sample 的可运行版：`examples/sample.tua` 是 README 语言参考里
     /// 那份示例的落地文件，整篇应当零诊断 —— 端到端把「设计」和「实现」钉在一起。
-    /// `examples/pkg/account.tlua` 是它 import 的模块，先按 `pkg.account` 灌进
+    /// `examples/pkg/account.tua` 是它 import 的模块，先按 `pkg.account` 灌进
     /// 同一个 driver，sample 里的跨文件引用才解析得到
     #[test]
     fn readme_sample_is_clean_end_to_end() {
-        let account = std::fs::read_to_string("examples/pkg/account.tlua").unwrap();
-        let sample = std::fs::read_to_string("examples/sample.tlua").unwrap();
+        let account = std::fs::read_to_string("examples/pkg/account.tua").unwrap();
+        let sample = std::fs::read_to_string("examples/sample.tua").unwrap();
         let got = lint_modules(&[("pkg.account", &account), ("main", &sample)]);
-        assert!(
-            got[0].is_empty(),
-            "account.tlua 该零诊断，实得 {:?}",
-            got[0]
-        );
-        assert!(got[1].is_empty(), "sample.tlua 该零诊断，实得 {:?}", got[1]);
+        assert!(got[0].is_empty(), "account.tua 该零诊断，实得 {:?}", got[0]);
+        assert!(got[1].is_empty(), "sample.tua 该零诊断，实得 {:?}", got[1]);
     }
 
-    /// examples/ 里的东西至少不能把驱动点跑崩。demo.tlua 是负面展示（下半部分
+    /// examples/ 里的东西至少不能把驱动点跑崩。demo.tua 是负面展示（下半部分
     /// 每条都该报），只断言「不崩」不断言数量 —— 重点在 `finish` 里那三条配平
     /// 断言，它们只在 debug 下才响，而测试就是 debug
     #[test]
     fn examples_survive_the_driver() {
-        let account = std::fs::read_to_string("examples/pkg/account.tlua").unwrap();
-        let demo = std::fs::read_to_string("examples/demo.tlua").unwrap();
+        let account = std::fs::read_to_string("examples/pkg/account.tua").unwrap();
+        let demo = std::fs::read_to_string("examples/demo.tua").unwrap();
         let got = lint_modules(&[("pkg.account", &account), ("demo", &demo)]);
-        println!("demo.tlua -> {:?}", got[1]);
+        println!("demo.tua -> {:?}", got[1]);
     }
 }

@@ -26,10 +26,11 @@
 //!     事只有三类，且各自在原处写明了为什么（作用域/流帧的「进」、@VarRef 的
 //!     两条诊断、`local function` 的名字预声明）
 //!   - `resolve_*` 出类型、`check_*` 出诊断。前者的返回值会被登记进
-//!     `node_values` 供父节点读，后者只往 log 里写
+//!     `node_values` 供父节点读，后者只往 diags 里写
 
 // 属性只有一种值：`TypeId`。类型列表也是一等的（`Types::Pack(ListId)`），装进去用
 // `type_arenas.pack(..)`、拆出来用 `type_arenas.as_list(..)`，中间只走 TypeId 一条道
+use super::super::utils::{DFS, Diagnostic};
 use super::*;
 use crate::compiler::utils::string_literal;
 use crate::lexer::type_def::*;
@@ -246,7 +247,7 @@ fn metamethod(op: &Token, unary: bool) -> Option<(&'static str, MetaResult)> {
     Some(hit)
 }
 
-pub struct TypeLinter {
+pub struct Context {
     // 这里都是一些要传递继承属性而存在的缓冲区，最理想的状况是
     // 这里什么也没有，可以从子节点自然继承
     //todo node_index 本身是稠密的 arena 下标，Tree 暴露节点总数后这里能换成 Vec<TypeId>
@@ -270,33 +271,17 @@ pub struct TypeLinter {
     /// 函数体栈。返回值核对、无标注时的返回类型推断、以及「递归须标注」
     /// 都靠栈顶那格，见 `RetFrame`
     ret_stack: Vec<RetFrame>,
-    /// 旧的 File + Global 合并进 Session：名字/类型/声明/导出都在这一层。
-    ///
-    /// **自持,不外借**。共享的只是类型，这件事不该被 linter 层感知：`&mut Session`
-    /// 得由搭 LintDriver 的那一层提供，会逼着通用 lint 层认识类型系统，还和
-    /// `Box<dyn Linter>` 的 'static 打架、独占借用挡住 emitter。
-    ///
-    /// 跨文件累积靠的是**粒度**：TypeLinter 的粒度是「类型阶段」而非「一个文件」，
-    /// 同一个实例被驱动着依次跑过各文件，Session 自然攒起来。per-file 的只有
-    /// node_values / scope_stack，该在 prepare() 里重置。
-    ///
-    /// 这也是 `ast` 不当字段、而是每个节点方法都吃一个参数的原因：存成字段
-    /// 就把实例绑在一颗树上，`prepare` 拿到的那个 `&Tree` 生命周期更短、存不回去，
-    /// 跨文件累积当场矛盾；附带好处是 TypeLinter 本身变成 'static，
-    /// 不再和 `Box<dyn Linter>` 打架
-    session: Session,
     /// 当前文件所属模块名，`prepare` 里由驱动传进来的 module 字串 intern 而成。
     /// pub 拿它当导出的键一半，跨文件的 import 靠它知道自己往哪个模块查
     current_module: NameId,
 }
 
-impl TypeLinter {
+impl Context {
+    /// per-file 上下文的初始态：各缓冲区全空。prepare / warm_up 会在头上再
+    /// 压文件作用域、flow_reset，并把 current_module 设成真正的模块名；
+    /// 这里的 NameId::default() 只是占位，被读之前必被覆写
     pub fn new() -> Self {
-        let mut session = Session::new();
-        // 占个默认模块名：真正的名字 prepare 每换一次文件就重置一次，
-        // 但未经 prepare 就被直接戳的路径（如单独单元测）不能拿到未初始化的 NameId
-        let current_module = session.names.intern("");
-        TypeLinter {
+        Context {
             node_values: HashMap::new(),
             scope_stack: Vec::new(),
             init_record: Vec::new(),
@@ -305,24 +290,56 @@ impl TypeLinter {
             file_decls: Vec::new(),
             class_stack: Vec::new(),
             ret_stack: Vec::new(),
-            session,
-            current_module,
+            current_module: NameId::default(),
+        }
+    }
+}
+
+pub struct TypeLinter {
+    /// 旧的 File + Global 合并进 Session：名字/类型/声明/导出都在这一层。
+    ///
+    /// **自持,不外借**。共享的只是类型，这件事不该被 linter 层感知：`&mut Session`
+    /// 得由搭 LintDriver 的那一层提供，会逼着通用 lint 层认识类型系统，还和
+    /// `Box<dyn Linter>` 的 'static 打架、独占借用挡住 emitter。
+    ///
+    /// 跨文件累积靠的是**粒度**：TypeLinter 的粒度是「类型阶段」而非「一个文件 」，
+    /// 同一个实例被驱动着依次跑过各文件，Session 自然攒起来。per-file 的临时状态
+    /// 不长在实例上，而是拆进独立的 `Context`——由驱动每文件现建一份，像 `ast`
+    /// 一样当参数贯穿 prepare / enter / leave / finish，实例跨文件复用时不必再清。
+    ///
+    /// 这也是 `ast` 不当字段、而是每个节点方法都吃一个参数的原因：存成字段
+    /// 就把实例绑在一颗树上，`prepare` 拿到的那个 `&Tree` 生命周期更短、存不回去，
+    /// 跨文件累积当场矛盾；附带好处是 TypeLinter 本身变成 'static，
+    /// 不再和 `Box<dyn Linter>` 打架
+    session: Session,
+    /// 是否走过跨文件 BUILD 趟（warm_up/prefill）。只有 prefill 铸过 DeclId 后，
+    /// prepare 复跑同一棵树才该按 (module,name,span) 复用那条；纯 run（单文件测、
+    /// lint_modules）没 prefill，须每次照铸，否则同模块同 span 的同名声明会被误当
+    /// 成「同一处」复用掉，重复导出等冲突就报不出来
+    warmed: bool,
+}
+
+impl TypeLinter {
+    pub fn new() -> Self {
+        TypeLinter {
+            session: Session::new(),
+            warmed: false,
         }
     }
 
     // ================== §1 节点属性 ==================
 
-    fn register_value(&mut self, node_index: usize, ty: TypeId) {
-        if self.node_values.contains_key(&node_index) {
+    fn register_value(&mut self, ctx: &mut Context, node_index: usize, ty: TypeId) {
+        if ctx.node_values.contains_key(&node_index) {
             panic!("reentry node {} not allowed", node_index)
         }
-        self.node_values.insert(node_index, ty);
+        ctx.node_values.insert(node_index, ty);
     }
 
     /// 取子节点已注册的类型。没注册（标点符号、未实现的分支）算 UNKNOWN
     #[inline]
-    fn child_type(&self, node_index: usize) -> TypeId {
-        self.node_values
+    fn child_type(&self, ctx: &Context, node_index: usize) -> TypeId {
+        ctx.node_values
             .get(&node_index)
             .copied()
             .unwrap_or(TypeId::UNKNOWN)
@@ -331,18 +348,29 @@ impl TypeLinter {
     /// 取第 `child` 个孩子的类型。`'(' x ')'`、`ARROW x`、`NAME ':' x` 这类
     /// 「标点包着一个真家伙」的产生式全是这个形状
     #[inline]
-    fn pass_through(&self, ast: &Tree<NodeSyntax<'_>>, node_index: usize, child: usize) -> TypeId {
-        self.child_type(ast.get_node(node_index).children[child])
+    fn pass_through(
+        &self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node_index: usize,
+        child: usize,
+    ) -> TypeId {
+        self.child_type(ctx, ast.get_node(node_index).children[child])
     }
 
     /// `optype : /*empty*/ | ':' type` 的标注。空产生式不可折叠，所以「没标注」
     /// 是个零孩子的节点而不是缺孩子。按**形状**判而不是按类型判：
     /// 标注成什么都算标注过，就算它没推出来而是 UNKNOWN
-    fn type_annotation(&self, ast: &Tree<NodeSyntax<'_>>, optype: usize) -> Option<TypeId> {
+    fn type_annotation(
+        &self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        optype: usize,
+    ) -> Option<TypeId> {
         if ast.get_node(optype).children.is_empty() {
             return None;
         }
-        Some(self.child_type(optype))
+        Some(self.child_type(ctx, optype))
     }
 
     /// 多值截成单值：非末位的多值表达式、以及 `(f())` 都只留第一个值。
@@ -586,8 +614,8 @@ impl TypeLinter {
     // ---- 类型名注册（走 scope_stack，支持块级作用域）----
 
     /// 在当前作用域注册类型名。同作用域内重名返回 false
-    fn declare_type(&mut self, name: &str, r#ref: TypeRef) -> bool {
-        let scope = self.scope_stack.last_mut().unwrap();
+    fn declare_type(&mut self, ctx: &mut Context, name: &str, r#ref: TypeRef) -> bool {
+        let scope = ctx.scope_stack.last_mut().unwrap();
         if scope.type_names.contains_key(name) {
             false
         } else {
@@ -598,8 +626,8 @@ impl TypeLinter {
 
     /// 从内向外查类型名，内层遮蔽外层；栈内全落空再问 Session 的内建名
     /// （array / table / 四个标量），所以用户自己声明的同名类型天然遮蔽内建
-    fn lookup_type(&self, name: &str) -> Option<TypeRef> {
-        for scope in self.scope_stack.iter().rev() {
+    fn lookup_type(&self, ctx: &Context, name: &str) -> Option<TypeRef> {
+        for scope in ctx.scope_stack.iter().rev() {
             if let Some(r) = scope.type_names.get(name) {
                 return Some(*r);
             }
@@ -616,6 +644,7 @@ impl TypeLinter {
     /// `assigned` = 声明语句本身就给了值（有初值 / 形参 / for 变量）
     fn declare_variable(
         &mut self,
+        ctx: &mut Context,
         name: &str,
         ty: TypeId,
         span: Span,
@@ -623,7 +652,7 @@ impl TypeLinter {
         assigned: bool,
     ) -> bool {
         let slot = self.session.new_slot(ty, span, kind, assigned);
-        let scope = self
+        let scope = ctx
             .scope_stack
             .last_mut()
             .expect("文件级作用域在 prepare 里已入栈");
@@ -649,13 +678,19 @@ impl TypeLinter {
     /// 跨层遮蔽（内层 block 盖外层同名）不在此列，那查的是 last() 这一格。
     /// 报完照样让调用方接着 declare（覆盖旧格），免得后面每次读这个名字
     /// 都因为「查不到」再叠一条误报
-    fn reject_same_scope_redecl(&self, name: &str, span: Span, log: &mut Vec<Logger>) {
-        if self
+    fn reject_same_scope_redecl(
+        &self,
+        ctx: &Context,
+        name: &str,
+        span: Span,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        if ctx
             .scope_stack
             .last()
             .is_some_and(|s| s.variables.contains_key(name))
         {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("局部变量 {name} 在同一层作用域里重复声明"),
             });
@@ -673,10 +708,10 @@ impl TypeLinter {
     ///
     /// 还兼着把这个名字的 nil 收窄抹掉：`if s ~= nil then s = nil end` 之后
     /// 那条收窄已经不成立了，留着就是不健全
-    fn mark_inited(&mut self, name: &str) -> bool {
+    fn mark_inited(&mut self, ctx: &mut Context, name: &str) -> bool {
         let mut flipped: Option<InitFlip> = None;
         let mut found = false;
-        for (depth, scope) in self.scope_stack.iter_mut().enumerate().rev() {
+        for (depth, scope) in ctx.scope_stack.iter_mut().enumerate().rev() {
             scope.narrowed.remove(name);
             if let Some(slot) = scope.variables.get_mut(name) {
                 if !slot.inited {
@@ -703,7 +738,7 @@ impl TypeLinter {
             }
         }
         if let Some(mark) = flipped {
-            self.init_record.push(mark);
+            ctx.init_record.push(mark);
         }
         true
     }
@@ -713,16 +748,16 @@ impl TypeLinter {
     ///
     /// 返回 `Option` 而不是 `TypeId`：「查不到」和「查到了但类型是 UNKNOWN」是
     /// 两回事，前者要报「未声明」，后者是上游推断失败，不该在它上面再叠一条误报
-    fn lookup_variable(&self, name: &str) -> Option<VarInfo> {
-        self.lookup_variable_at(name).map(|(_, slot)| slot)
+    fn lookup_variable(&self, ctx: &Context, name: &str) -> Option<VarInfo> {
+        self.lookup_variable_at(ctx, name).map(|(_, slot)| slot)
     }
 
     /// 只问声明那一格，不带 nil 收窄。**写位**要的是这个：收窄说的是
     /// 「此刻的值更具体」，而声明才是「这个变量允许装什么」。
     /// `if s ~= nil then s = nil end` 里那次赋值是合法的 ——
     /// 它只是让收窄失效（`mark_inited` 顺手抹掉那一条）
-    fn lookup_declared(&self, name: &str) -> Option<VarInfo> {
-        for scope in self.scope_stack.iter().rev() {
+    fn lookup_declared(&self, ctx: &Context, name: &str) -> Option<VarInfo> {
+        for scope in ctx.scope_stack.iter().rev() {
             if let Some(slot) = scope.variables.get(name) {
                 return Some(*slot);
             }
@@ -739,9 +774,9 @@ impl TypeLinter {
     /// 于是内层的收窄盖得住外层的声明，而本层真写了 `local s` 之后
     /// 那一格又盖回收窄 —— 正是 Lua 的语义次序。
     /// 收窄只换类型，`inited` / `decl_span` / 归属层次都跟原那格
-    fn lookup_variable_at(&self, name: &str) -> Option<(Option<usize>, VarInfo)> {
+    fn lookup_variable_at(&self, ctx: &Context, name: &str) -> Option<(Option<usize>, VarInfo)> {
         let mut narrowed: Option<TypeId> = None;
-        for (depth, scope) in self.scope_stack.iter().enumerate().rev() {
+        for (depth, scope) in ctx.scope_stack.iter().enumerate().rev() {
             if let Some(slot) = scope.variables.get(name) {
                 let mut slot = *slot;
                 if let Some(ty) = narrowed {
@@ -770,21 +805,22 @@ impl TypeLinter {
 
     pub fn resolve(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let node = ast.get_node(node_index);
         let action = node.get_data();
         let typeid = match action {
             NodeSyntax::Prod(prod) => {
                 if let Some(prod) = prod {
-                    self.resolve_prod(ast, prod, node_index, log)
+                    self.resolve_prod(ctx, ast, prod, node_index, diags)
                 } else {
                     //没有label的话，从子节点获取类型，从 buffer 推出 right.len 个子节点
                     let len = node.children.len();
                     if len == 1 {
-                        return self.child_type(node.children[0]);
+                        return self.child_type(ctx, node.children[0]);
                     }
                     TypeId::UNKNOWN
                 }
@@ -818,21 +854,22 @@ impl TypeLinter {
             }
         };
         //没有产生式只出的类型也登记
-        self.register_value(node_index, typeid);
+        self.register_value(ctx, node_index, typeid);
         typeid
     }
 
     fn resolve_prod(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         prod: &Prod,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         match prod {
             // ---- 运算。参数是操作符 token 所在的孩子下标 ----
-            Prod::BinOp => self.resolve_operator(ast, node_index, 1, log),
-            Prod::UnOp => self.resolve_operator(ast, node_index, 0, log),
+            Prod::BinOp => self.resolve_operator(ctx, ast, node_index, 1, diags),
+            Prod::UnOp => self.resolve_operator(ctx, ast, node_index, 0, diags),
 
             // ARROW retspec
             // '(' multilist ')'
@@ -844,60 +881,60 @@ impl TypeLinter {
             | Prod::RetMulti
             | Prod::Args
             | Prod::ParenType
-            | Prod::TypeAnnotation => self.pass_through(ast, node_index, 1),
+            | Prod::TypeAnnotation => self.pass_through(ctx, ast, node_index, 1),
             // ELLIPSIS type —— 产出的是只有 vararg 槽的 Pack，不是裸元素类型：
             // `parlist : vararg` / `multilist : vararg` 都是单孩子折叠，这个节点
             // 会直接当参数表 / 返回列表用，形状得自带「变长」这一位
-            Prod::VarargTyped => self.vararg_pack(ast, node_index),
+            Prod::VarargTyped => self.vararg_pack(ctx, ast, node_index),
             // NAME ':' type，名字纯文档
             // cast_exp AS type
             // NAME '=' exp
             Prod::ArgTypeNamed | Prod::Cast | Prod::FieldNamed => {
-                self.pass_through(ast, node_index, 2)
+                self.pass_through(ctx, ast, node_index, 2)
             }
-            Prod::FieldKV => self.pass_through(ast, node_index, 4), // '[' exp ']' '=' exp
+            Prod::FieldKV => self.pass_through(ctx, ast, node_index, 4), // '[' exp ']' '=' exp
 
             Prod::RetVoid | Prod::ArgsEmpty => TypeId::VOID,
             // 表达式位的 `{}` 和类型位的 `{}` 是同一个东西，intern 后同一个 TypeId
             Prod::TableEmpty | Prod::RecordEmpty => self.session.type_arenas.record(vec![]),
             // 非空的那两个同理：`'{' fieldlist '}'` 与 `'{' classfieldlist '}'`
-            Prod::Table => self.resolve_fields(ast, node_index, FieldSite::Literal, log),
-            Prod::Record => self.resolve_fields(ast, node_index, FieldSite::Record, log),
+            Prod::Table => self.resolve_fields(ctx, ast, node_index, FieldSite::Literal, diags),
+            Prod::Record => self.resolve_fields(ctx, ast, node_index, FieldSite::Record, diags),
 
             // ---- 类型位 ----
             // `basictype : NAME` / `extendtype : NAME`：折叠前它和变量位的裸 NAME
             // 形状一样，靠标签才分得开该查 type_names 还是 variables
-            Prod::TypeName => self.resolve_type_name(ast, node_index, log),
-            Prod::FuncType => self.func_sig_type(ast, node_index),
-            Prod::Union => self.resolve_union(ast, node_index),
-            Prod::Intersect => self.resolve_intersect(ast, node_index),
-            Prod::GenericType => self.resolve_generic_type(ast, node_index, log),
+            Prod::TypeName => self.resolve_type_name(ctx, ast, node_index, diags),
+            Prod::FuncType => self.func_sig_type(ctx, ast, node_index),
+            Prod::Union => self.resolve_union(ctx, ast, node_index),
+            Prod::Intersect => self.resolve_intersect(ctx, ast, node_index),
+            Prod::GenericType => self.resolve_generic_type(ctx, ast, node_index, diags),
             // `X ',' vararg`：两处形状和语义都一样
-            Prod::ParamsVararg | Prod::RetVararg => self.pack_vararg(ast, node_index),
-            Prod::RetFixed => self.pack_fixed(ast, node_index),
+            Prod::ParamsVararg | Prod::RetVararg => self.pack_vararg(ctx, ast, node_index),
+            Prod::RetFixed => self.pack_fixed(ctx, ast, node_index),
 
             // ---- 表达式 ----
             // `prefixexp : NAME`，全 linter 唯一查变量的地方
-            Prod::VarRef => self.resolve_var_ref(ast, node_index, log),
-            Prod::Call => self.resolve_call(ast, node_index, log),
-            Prod::MethodCall => self.resolve_method_call(ast, node_index, log),
-            Prod::Paren => self.resolve_paren(ast, node_index),
-            Prod::Index => self.resolve_index(ast, node_index, log),
-            Prod::Dot => self.resolve_dot(ast, node_index, log),
-            Prod::DottedName => self.resolve_dotted_name(ast, node_index, log),
-            Prod::TurboFish => self.resolve_turbo_fish(ast, node_index, log),
-            Prod::FuncExpr => self.resolve_func_expr(ast, node_index),
-            Prod::FuncBody => self.func_sig_type(ast, node_index),
+            Prod::VarRef => self.resolve_var_ref(ctx, ast, node_index, diags),
+            Prod::Call => self.resolve_call(ctx, ast, node_index, diags),
+            Prod::MethodCall => self.resolve_method_call(ctx, ast, node_index, diags),
+            Prod::Paren => self.resolve_paren(ctx, ast, node_index),
+            Prod::Index => self.resolve_index(ctx, ast, node_index, diags),
+            Prod::Dot => self.resolve_dot(ctx, ast, node_index, diags),
+            Prod::DottedName => self.resolve_dotted_name(ctx, ast, node_index, diags),
+            Prod::TurboFish => self.resolve_turbo_fish(ctx, ast, node_index, diags),
+            Prod::FuncExpr => self.resolve_func_expr(ctx, ast, node_index),
+            Prod::FuncBody => self.func_sig_type(ctx, ast, node_index),
 
             // ---- 声明与绑定 ----
-            Prod::Var => self.resolve_var(ast, node_index),
-            Prod::Param => self.resolve_param(ast, node_index, log),
-            Prod::MethodDef => self.resolve_method_def(ast, node_index, log),
-            Prod::MethodSig => self.func_sig_type(ast, node_index),
-            Prod::Generics => self.resolve_generics(ast, node_index, log),
-            Prod::TypeParamBound => self.resolve_type_param_bound(ast, node_index, log),
-            Prod::ListTail => self.resolve_list(ast, node_index, log),
-            Prod::DeclFirst | Prod::DeclRest => self.resolve_decl_list(ast, node_index, log),
+            Prod::Var => self.resolve_var(ctx, ast, node_index),
+            Prod::Param => self.resolve_param(ctx, ast, node_index, diags),
+            Prod::MethodDef => self.resolve_method_def(ctx, ast, node_index, diags),
+            Prod::MethodSig => self.func_sig_type(ctx, ast, node_index),
+            Prod::Generics => self.resolve_generics(ast, node_index, diags),
+            Prod::TypeParamBound => self.resolve_type_param_bound(ctx, ast, node_index, diags),
+            Prod::ListTail => self.resolve_list(ctx, ast, node_index, diags),
+            Prod::DeclFirst | Prod::DeclRest => self.resolve_decl_list(ast, node_index, diags),
 
             // ---- 名字位：贴标签只为了不被当成变量读，名字由拥有者去取 ----
             // @TypeParam 归 @Generics（形参声明）、@ImportItem 归 @Import、
@@ -908,19 +945,19 @@ impl TypeLinter {
 
             // ---- 语句：不产出类型，给 UNKNOWN（它**不是** VOID）----
             Prod::Import => {
-                self.check_import(ast, node_index, log);
+                self.check_import(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::ImportAlias => {
-                self.check_import_alias(ast, node_index, log);
+                self.check_import_alias(ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::Pub => {
-                self.check_pub(ast, node_index, log);
+                self.check_pub(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::Block => {
-                self.check_block(ast, node_index, log);
+                self.check_block(ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::Do
@@ -932,60 +969,60 @@ impl TypeLinter {
             | Prod::ForNum
             | Prod::ForNumStep
             | Prod::ForIn => {
-                self.check_control_flow(ast, node_index, log);
+                self.check_control_flow(ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::Assign => {
-                self.check_assign(ast, node_index, log);
+                self.check_assign(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::ExprStat => {
-                self.check_expr_stat(ast, node_index, log);
+                self.check_expr_stat(ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::Goto | Prod::Label => {
-                self.check_jump(ast, node_index, log);
+                self.check_jump(ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::Return | Prod::ReturnVoid => {
-                self.check_return(ast, node_index, log);
+                self.check_return(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::LocalDecl => {
-                self.check_local_decl(ast, node_index, log);
+                self.check_local_decl(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::LocalDeclInit => {
-                self.check_local_decl_init(ast, node_index, log);
+                self.check_local_decl_init(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::Extern => {
-                self.check_extern(ast, node_index, log);
+                self.check_extern(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::ClassDecl => {
-                self.check_class_decl(ast, node_index, log);
+                self.check_class_decl(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::ClassDeclExtends => {
-                self.check_class_decl_extends(ast, node_index, log);
+                self.check_class_decl_extends(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::TypeDef => {
-                self.check_type_def(ast, node_index, log);
+                self.check_type_def(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::FuncDecl => {
-                self.check_func_decl(ast, node_index, log);
+                self.check_func_decl(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
-            Prod::MethodName => self.resolve_method_name(ast, node_index),
+            Prod::MethodName => self.resolve_method_name(ctx, ast, node_index),
             Prod::ClassBody => {
-                self.check_class_body(ast, node_index, log);
+                self.check_class_body(ast, node_index, diags);
                 TypeId::UNKNOWN
             }
             Prod::FieldDecl => {
-                self.check_field_decl(ast, node_index, log);
+                self.check_field_decl(ctx, ast, node_index, diags);
                 TypeId::UNKNOWN
             }
         }
@@ -1005,7 +1042,7 @@ impl TypeLinter {
         &mut self,
         _ast: &Tree<NodeSyntax<'_>>,
         _node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         TypeId::UNKNOWN
     }
@@ -1018,43 +1055,45 @@ impl TypeLinter {
         &mut self,
         _ast: &Tree<NodeSyntax<'_>>,
         _node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         TypeId::UNKNOWN
     }
 }
 
-impl Linter for TypeLinter {
-    fn name(&self) -> &'static str {
-        "type"
-    }
-
+impl DFS<Context> for TypeLinter {
     /// 换文件就重置局部状态；全局在 Session 里，不用管
-    fn prepare(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str, _log: &mut Vec<Logger>) {
+    fn prepare(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        module: &str,
+        _diags: &mut Vec<Diagnostic>,
+    ) {
         // 当前模块名：pub 登记导出、hoist 登记 module_types 都要用，
         // 得赶在两趟 hoist 之前定好
-        self.current_module = self.session.names.intern(module);
+        ctx.current_module = self.session.names.intern(module);
         // 节点下标是每棵树自己从 0 数的，不清就会让 register_value 报重入
-        self.node_values.clear();
-        self.scope_stack.clear();
-        self.file_decls.clear();
-        self.class_stack.clear();
-        self.ret_stack.clear();
+        ctx.node_values.clear();
+        ctx.scope_stack.clear();
+        ctx.file_decls.clear();
+        ctx.class_stack.clear();
+        ctx.ret_stack.clear();
         // 文件级作用域：它是 flow_reset 记 scope_depth 的基准，得先压。
         // chunk 的 @Block 还会自己再压一格，顶层 local 落在那一格里
-        self.scope_stack.push(Scope::new());
-        self.flow_reset();
+        ctx.scope_stack.push(Scope::new());
+        self.flow_reset(ctx);
         // 变量名与类型名两条独立的抬升：函数名进 variables，class/typedef 名进
         // type_names。互不相干，先后无所谓
         self.hoist_top_level(ast);
-        self.hoist_top_level_types(ast);
+        self.hoist_top_level_types(ctx, ast);
         // 名字占好了再把 class / typedef 的体提前填上：内联方法体里的 `self.x`
         // 要在主遍历里就查得到本类字段，而 P1 的 check_* 填体在各自 leave（方法体
         // 之后）才发生 —— 这一趟抢在主遍历之前把字段/父类/别名目标灌进 ClassInfo
-        self.hoist_class_bodies(ast);
+        self.hoist_class_bodies(ctx, ast);
         // 最后把顶层全局函数的签名补给抬升过的名字：签名里引得到 class /
         // typedef，所以得等名字和体都填好（前三趟）之后才算
-        self.hoist_func_signatures(ast);
+        self.hoist_func_signatures(ctx, ast);
     }
 
     /// 前序：作用域与流帧的「进」、以及两条非前序不可的诊断。
@@ -1063,15 +1102,21 @@ impl Linter for TypeLinter {
     ///   - 作用域/流帧得包住子树，开在后序就来不及了
     ///   - @VarRef 的两条诊断：看 resolve_var_ref 的注释
     ///   - `local function f` 得先声明名字才递归得了
-    fn enter(&mut self, ast: &Tree<NodeSyntax<'_>>, node: usize, log: &mut Vec<Logger>) {
+    fn enter(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node: usize,
+        diags: &mut Vec<Diagnostic>,
+    ) {
         // label 得在可达性检查之前处理：它是跳转的落点，前一条 `goto` / `return`
         // 终结不了它。降级也放在这里 —— 向前跳的那一段代码在 label 之前就走过了，
         // 但从 label 往后的 inited 结论全是那一跳污染出来的
         if self.get_production(ast, node) == Some(Prod::Label) {
-            self.flow_untrust();
-            self.flow_revive();
+            self.flow_untrust(ctx);
+            self.flow_revive(ctx);
         }
-        self.check_reachable(ast, node, log);
+        self.check_reachable(ctx, ast, node, diags);
         let NodeSyntax::Prod(Some(prod)) = ast.get_node(node).get_data() else {
             return;
         };
@@ -1080,60 +1125,67 @@ impl Linter for TypeLinter {
                 // 先开帧再压作用域：反了的话本块自己那格会被当成外层，
                 // 内层遮蔽同名变量时回滚就打错人（见定值分析那节的注释）
                 if self.block_is_branch(ast, node) {
-                    self.flow_enter_branch();
+                    self.flow_enter_branch(ctx);
                 }
-                self.scope_stack.push(Scope::new());
-                self.bind_loop_vars(ast, node);
+                ctx.scope_stack.push(Scope::new());
+                self.bind_loop_vars(ctx, ast, node);
                 // 收窄得在作用域压完之后：它就放在本块那一格里，
                 // 出块一弹就失效
-                self.bind_narrowing(ast, node);
+                self.bind_narrowing(ctx, ast, node);
             }
             // 帧开在这里而不是体的 block 上：这一格多带一个边界位（return 不终结
             // 外层、goto 的降级到此为止），而且形参要比帧晚一步进作用域
             Prod::FuncBody => {
-                self.flow_open();
-                self.flow_enter_body();
+                self.flow_open(ctx);
+                self.flow_enter_body(ctx);
                 // rettype 槽就在本节点上；名字取得到才有（函数表达式没名字）
-                self.push_ret_frame(ast, node, node);
+                self.push_ret_frame(ctx, ast, node, node);
                 // 泛型形参和形参共用这一格：两者的可见范围都是整个 funcbody，
                 // 比体的 block 大一圈（rettype 也得看得见泛型形参）
-                self.scope_stack.push(Scope::new());
+                ctx.scope_stack.push(Scope::new());
                 // 形参标注 / 返回类型 / 体里的 `T` 要解析成 Generic，泛型形参得先挂进这格。
                 // 每进一次现铸现挂：funcbody 不是名义声明，没有 DeclId 存身份
-                self.scope_func_generics(ast, node);
+                self.scope_func_generics(ctx, ast, node);
                 // 类体外方法的 funcname 是前一个兄弟节点，此时已经后序求值完、接收者
                 // TypeId 正挂在 node_values 上。':' 形式才注入隐式 self；'.' 形式写出的
                 // self 由 resolve_param 经同一颗 funcname 节点取默认类型
-                if let Some((ty, true)) = self.funcbody_receiver(ast, node) {
-                    self.declare_variable("self", ty, ast.span_of(node), VarScope::Local, true);
+                if let Some((ty, true)) = self.funcbody_receiver(ctx, ast, node) {
+                    self.declare_variable(
+                        ctx,
+                        "self",
+                        ty,
+                        ast.span_of(node),
+                        VarScope::Local,
+                        true,
+                    );
                 }
             }
             // 方法体和函数体同款：多带一个边界位（体内 return 不终结类体外的流），
             // 形参比体的 block 早一步进这一格 —— methodsig 在文法上先于 block
             Prod::MethodDef => {
-                self.flow_open();
-                self.flow_enter_body();
+                self.flow_open(ctx);
+                self.flow_enter_body(ctx);
                 // 方法的 rettype 槽在 methodsig（children[0]）上，不在体这个节点上
                 let sig = ast.get_node(node).children[0];
-                self.push_ret_frame(ast, node, sig);
-                self.scope_stack.push(Scope::new());
+                self.push_ret_frame(ctx, ast, node, sig);
+                ctx.scope_stack.push(Scope::new());
             }
             // 进类体：把本类的 Ref 押上，methodsig 里不标注的 self 靠它取默认类型。
             // 再单开一格把泛型形参挂进去 —— 字段/方法签名/extendtype 里的 `T` 都在
             // 这棵子树内解析，得让它们查得到（P0a 已铸好身份，这里只按名字挂上）
             Prod::ClassDecl | Prod::ClassDeclExtends => {
-                let ty = self.class_ref_of(ast, node);
-                self.class_stack.push(ty);
-                self.scope_stack.push(Scope::new());
-                self.scope_decl_generics(ast, node);
+                let ty = self.class_ref_of(ctx, ast, node);
+                ctx.class_stack.push(ty);
+                ctx.scope_stack.push(Scope::new());
+                self.scope_decl_generics(ctx, ast, node);
             }
             // typedef 的目标类型里也能引用自己的泛型形参（`typedef Box<T> = {v:T}`），
             // 同样单开一格挂形参；没有 self、不进 class_stack
             Prod::TypeDef => {
-                self.scope_stack.push(Scope::new());
-                self.scope_decl_generics(ast, node);
+                ctx.scope_stack.push(Scope::new());
+                self.scope_decl_generics(ctx, ast, node);
             }
-            Prod::VarRef => self.check_var_read(ast, node, log),
+            Prod::VarRef => self.check_var_read(ctx, ast, node, diags),
             // `local function f` = `local f; f = function...`，名字得在体之前就在，
             // 否则递归调用自己会报未声明。类型等 leave 里覆
             Prod::FuncDecl if ast.get_node(node).children.len() == 4 => {
@@ -1141,14 +1193,14 @@ impl Linter for TypeLinter {
                     let span = ast.span_of(node);
                     // `local function f` 的名字也是局部变量，同层重名照拦。这里是它
                     // 唯一的声明点（leave 只补类型、不再 insert），所以不会自撞
-                    self.reject_same_scope_redecl(name, span, log);
-                    self.declare_variable(name, TypeId::UNKNOWN, span, VarScope::Local, true);
+                    self.reject_same_scope_redecl(ctx, name, span, diags);
+                    self.declare_variable(ctx, name, TypeId::UNKNOWN, span, VarScope::Local, true);
                 }
             }
             // 带分支的语句：开一格 join 帧，各分支由它们自己的 block 去填
             p => {
                 if Self::join_mode(p).is_some() {
-                    self.flow_open();
+                    self.flow_open(ctx);
                 }
             }
         }
@@ -1158,8 +1210,14 @@ impl Linter for TypeLinter {
     ///
     /// 顺序不能反：`resolve` 里的声明动作（形参、local）得落在当前还没弹的
     /// 那格作用域里，而 `is_noreturn_stat` 更是非后序不可
-    fn leave(&mut self, ast: &Tree<NodeSyntax<'_>>, node: usize, log: &mut Vec<Logger>) {
-        self.resolve(ast, node, log);
+    fn leave(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node: usize,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        self.resolve(ctx, ast, node, diags);
         match ast.get_node(node).get_data() {
             NodeSyntax::Prod(Some(prod)) => match prod {
                 Prod::Block => {
@@ -1168,61 +1226,61 @@ impl Linter for TypeLinter {
                         .parent
                         .is_some_and(|p| self.get_production(ast, p) == Some(Prod::Repeat));
                     if self.block_is_branch(ast, node) {
-                        self.flow_leave_branch();
+                        self.flow_leave_branch(ctx);
                     }
                     if repeat_body {
                         // `repeat local x = 1 until x == 1` 在 Lua 里合法：until 条件
                         // 看得见体内的局部。所以这格作用域留给 @Repeat 去弹，
                         // 而合并提到条件之前做（体必执行，本来就该先生效），
                         // 否则条件里读体内赋过的外层变量会误报「可能尚未赋值」
-                        self.flow_close(JoinMode::Always);
+                        self.flow_close(ctx, JoinMode::Always);
                     } else {
-                        self.scope_stack.pop();
+                        ctx.scope_stack.pop();
                     }
                 }
                 // 方法体收口和函数体一模一样
                 Prod::FuncBody | Prod::MethodDef => {
-                    self.scope_stack.pop();
+                    ctx.scope_stack.pop();
                     // 弹得比 resolve 晚：本节点的类型就是那个函数类型，没标注时
                     // 它的返回列表要用帧上攒的 return 推出来
-                    self.pop_ret_frame(node);
-                    self.flow_leave_branch();
-                    self.flow_close(JoinMode::Skippable);
+                    self.pop_ret_frame(ctx, node);
+                    self.flow_leave_branch(ctx);
+                    self.flow_close(ctx, JoinMode::Skippable);
                 }
                 // 出类体：弹掉泛型形参那格作用域，再弹本类的 Ref
                 Prod::ClassDecl | Prod::ClassDeclExtends => {
-                    self.scope_stack.pop();
-                    self.class_stack.pop();
+                    ctx.scope_stack.pop();
+                    ctx.class_stack.pop();
                 }
                 // 出 typedef：弹掉泛型形参那格
                 Prod::TypeDef => {
-                    self.scope_stack.pop();
+                    ctx.scope_stack.pop();
                 }
                 // 合并已经在体的 block 里做完了，这里只补那一次没弹的作用域
                 Prod::Repeat => {
-                    self.scope_stack.pop();
+                    ctx.scope_stack.pop();
                 }
                 Prod::ExprStat => {
-                    if self.is_noreturn_stat(ast, node) {
-                        self.flow_terminate();
+                    if self.is_noreturn_stat(ctx, ast, node) {
+                        self.flow_terminate(ctx);
                     }
                 }
-                Prod::Return | Prod::ReturnVoid => self.flow_terminate(),
+                Prod::Return | Prod::ReturnVoid => self.flow_terminate(ctx),
                 // 向后跳让一遍前序合并失效，两头都降级：向后跳的 label 必先于 goto
                 // 被看到，向前跳的 goto 必先于它跳过的代码，合起来盖得住
                 Prod::Goto => {
-                    self.flow_untrust();
-                    self.flow_terminate();
+                    self.flow_untrust(ctx);
+                    self.flow_terminate(ctx);
                 }
                 p => {
                     if let Some(mode) = Self::join_mode(p) {
-                        self.flow_close(mode);
+                        self.flow_close(ctx, mode);
                     }
                 }
             },
             // `stat : BREAK` 是无标签单孩子，被折叠成了这个 token 节点本身。
             // BREAK 在整张文法里只出现在这一处，所以认 token 就够
-            NodeSyntax::Token(Token::RESERVED(Reserved::BREAK)) => self.flow_terminate(),
+            NodeSyntax::Token(Token::RESERVED(Reserved::BREAK)) => self.flow_terminate(ctx),
             _ => {}
         }
     }
@@ -1230,14 +1288,55 @@ impl Linter for TypeLinter {
     /// 驱动点配对的自检。走完一棵树，栈上只该剩 flow_reset 压的文件帧和
     /// prepare 压的文件作用域。不平就是某条语句的 enter/leave 漏了一半，
     /// 而那种错不会当场爆，只会让后面的诊断莫名其妙地少一条多一条
-    fn finish(&mut self, log: &mut Vec<Logger>) {
+    fn finish(&mut self, ctx: &mut Context, diags: &mut Vec<Diagnostic>) {
         // 字段覆盖的收口留到这里：extends 的父类可能声明在子类后面（前向继承），
         // 子类 leave 时父类体还没填，只有全走完才查得准
-        self.check_field_overrides(log);
-        debug_assert_eq!(self.flow_stack.len(), 1, "流帧栈没配平");
-        debug_assert!(self.join_stack.is_empty(), "join 帧没配平");
-        debug_assert!(self.ret_stack.is_empty(), "函数体栈没配平");
-        debug_assert_eq!(self.scope_stack.len(), 1, "作用域栈没配平");
+        self.check_field_overrides(ctx, diags);
+        debug_assert_eq!(ctx.flow_stack.len(), 1, "流帧栈没配平");
+        debug_assert!(ctx.join_stack.is_empty(), "join 帧没配平");
+        debug_assert!(ctx.ret_stack.is_empty(), "函数体栈没配平");
+        debug_assert_eq!(ctx.scope_stack.len(), 1, "作用域栈没配平");
+    }
+}
+
+impl Linter for TypeLinter {
+    fn name(&self) -> &str {
+        "Type"
+    }
+
+    /// 把工程里每个模块的顶层类型——名字、module_types、泛型身份、**体**、以及
+    /// pub 出的导出——全灌进 Session。于是 import 端 CHECK 时无论文件顺序如何，
+    /// lookup_export 都查得到，且导出类型的体已填好，跨模块的字段访问 / 赋值才核得准。
+    ///
+    /// 只碰类型声明面（顶层 class / typedef 及其体子树），不进函数体、不做流分析
+    /// —— 那些是 CHECK 的事。不发诊断：重名 / 空体 / 继承环 / 重复导出仍由主遍历的
+    /// check_* 报，这里静默避免报两遍。幂等性：hoist_top_level_types 已按
+    /// (module,name,span) 复用已有 DeclId，prepare 再跑一遍不会重铸；export /
+    /// declare_module_type 本就幂等，所以单文件测试不走 prefill、只调 run 也照常
+    fn warm_up(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        module: &str,
+        _diags: &mut Vec<Diagnostic>,
+    ) {
+        // 标记进入 BUILD 趟：prepare 的复用守卫据此才生效（见 hoist_top_level_types）
+        self.warmed = true;
+        // 和 prepare 同款的 per-file 重置：warm_up 要依次驱过工程里每个文件，
+        // 上一个文件的作用域 / node_values 不清就会串到下一个
+        ctx.current_module = self.session.names.intern(module);
+        ctx.node_values.clear();
+        ctx.scope_stack.clear();
+        ctx.file_decls.clear();
+        ctx.class_stack.clear();
+        ctx.ret_stack.clear();
+        ctx.scope_stack.push(Scope::new());
+        self.flow_reset(ctx);
+        // 名字 + module_types + 泛型身份，再把体填上（两趟和 prepare 共用，幂等）
+        self.hoist_top_level_types(ctx, ast);
+        self.hoist_class_bodies(ctx, ast);
+        // 顶层 pub 的类型登记进 Session::export：搬到这里，import 端才不吃文件顺序
+        self.hoist_exports(ctx, ast);
     }
 }
 

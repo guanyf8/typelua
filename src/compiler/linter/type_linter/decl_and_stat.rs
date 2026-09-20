@@ -12,25 +12,33 @@ impl TypeLinter {
     /// `local` 遮蔽 —— 和 Lua 一致
     pub(super) fn resolve_param(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let optype = ast.get_node(node_index).children[1];
         // 形参写 self 又不标注：类型默认为接收者那个类（README：self 是显式的
         // 普通形参，只是类型可以省）。标了就按标注；接收者从哪里来、哪些位置
         // 算得上接收者，统一由 self_default_type 定
-        let ty = match self.type_annotation(ast, optype) {
+        let ty = match self.type_annotation(ctx, ast, optype) {
             Some(t) => t,
             None if self.get_child_name(ast, node_index, 0) == Some("self") => self
-                .self_default_type(ast, node_index)
+                .self_default_type(ctx, ast, node_index)
                 .unwrap_or(TypeId::UNKNOWN),
             None => TypeId::UNKNOWN,
         };
         if let Some(name) = self.get_child_name(ast, node_index, 0) {
             // 形参一律算已赋值。调用点少给的实参是 nil，那是调用点的事，
             // 在这儿把形参当成未赋值会让每个函数开头都报一屏
-            self.declare_variable(name, ty, ast.span_of(node_index), VarScope::Local, true);
+            self.declare_variable(
+                ctx,
+                name,
+                ty,
+                ast.span_of(node_index),
+                VarScope::Local,
+                true,
+            );
         }
         ty
     }
@@ -40,23 +48,31 @@ impl TypeLinter {
     /// `new_slot` 里「容得下 nil 的类型声明出来就是诚实的」那一条说了算
     pub(super) fn check_local_decl(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let decl = ast.get_node(node_index).children[1];
         for (name_node, optype) in self.decl_items(ast, decl) {
-            let annot = self.type_annotation(ast, optype);
+            let annot = self.type_annotation(ctx, ast, optype);
             if annot.is_none() {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span: ast.span_of(name_node),
                     msg: "无初值的 local 必须带类型标注".to_string(),
                 });
             }
             let ty = annot.unwrap_or(TypeId::UNKNOWN);
             if let Some(name) = self.get_name(ast, name_node) {
-                self.reject_same_scope_redecl(name, ast.span_of(name_node), log);
-                self.declare_variable(name, ty, ast.span_of(name_node), VarScope::Local, false);
+                self.reject_same_scope_redecl(ctx, name, ast.span_of(name_node), diags);
+                self.declare_variable(
+                    ctx,
+                    name,
+                    ty,
+                    ast.span_of(name_node),
+                    VarScope::Local,
+                    false,
+                );
             }
         }
     }
@@ -67,22 +83,23 @@ impl TypeLinter {
     /// 提前到 enter 里声明就会变成自己读自己
     pub(super) fn check_local_decl_init(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = &ast.get_node(node_index).children;
         let values_node = children[3];
-        let (decl, values) = (children[1], self.child_type(values_node));
+        let (decl, values) = (children[1], self.child_type(ctx, values_node));
         for (i, (name_node, optype)) in self.decl_items(ast, decl).into_iter().enumerate() {
             let value = self.listnode_value_at(values, i);
-            let annot = self.type_annotation(ast, optype);
-            self.require_annot_for_empty_table(ast, values_node, i, annot, log);
+            let annot = self.type_annotation(ctx, ast, optype);
+            self.require_annot_for_empty_table(ast, values_node, i, annot, diags);
             // 有标注又有初值：初值得塞得进标注位，可赋值性不过就报。没标注不查 ——
             // 那是把初值的类型直接当声明类型，谈不上「塞不塞得进」
             if let (Some(want), Some(got)) = (annot, value) {
                 if !self.session.assignable(got, want) {
-                    log.push(Logger {
+                    diags.push(Diagnostic {
                         span: ast.span_of(name_node),
                         msg: format!(
                             "不能把 {} 赋给标注的 {} 位",
@@ -96,10 +113,11 @@ impl TypeLinter {
             // 能认出 never、从而算作终结，靠的就是这一步
             let ty = annot.or(value).unwrap_or(TypeId::UNKNOWN);
             if let Some(name) = self.get_name(ast, name_node) {
-                self.reject_same_scope_redecl(name, ast.span_of(name_node), log);
+                self.reject_same_scope_redecl(ctx, name, ast.span_of(name_node), diags);
                 // 名字比值多（`local a, b = 1`）：多出来的那些拿到的是 nil，
                 // 算不算已赋值交给 new_slot 按类型定
                 self.declare_variable(
+                    ctx,
                     name,
                     ty,
                     ast.span_of(name_node),
@@ -121,7 +139,7 @@ impl TypeLinter {
         values: usize,
         i: usize,
         annot: Option<TypeId>,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         if annot.is_some() {
             return;
@@ -132,7 +150,7 @@ impl TypeLinter {
         if self.get_production(ast, value) != Some(Prod::TableEmpty) {
             return;
         }
-        log.push(Logger {
+        diags.push(Diagnostic {
             span: ast.span_of(value),
             msg: "空表 `{}` 推不出形状，必须带类型标注".to_string(),
         });
@@ -140,13 +158,14 @@ impl TypeLinter {
 
     pub(super) fn check_assign(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let node = ast.get_node(node_index);
         let values_node = node.children[2];
-        let (targets, values) = (node.children[0], self.child_type(values_node));
+        let (targets, values) = (node.children[0], self.child_type(ctx, values_node));
         for (i, var) in self.spine(ast, targets).into_iter().enumerate() {
             // var : prefixexp optype。只有 prefixexp 恰好是裸名字时才谈得上声明；
             // `t.k = v` / `t[i] = v` 只是写字段，那个 `t` 已经当成读查过了
@@ -154,19 +173,19 @@ impl TypeLinter {
             let (prefix, optype) = (children[0], children[1]);
             let got = self.listnode_value_at(values, i);
             if self.get_production(ast, prefix) != Some(Prod::VarRef) {
-                self.check_write_target(ast, var, got, log);
+                self.check_write_target(ctx, ast, var, got, diags);
                 continue;
             }
             let Some(name) = self.get_child_name(ast, prefix, 0) else {
                 continue;
             };
-            if let Some(slot) = self.lookup_declared(name) {
+            if let Some(slot) = self.lookup_declared(ctx, name) {
                 // 赋值：inited 置上。声明处的类型是唯一权威，赋进来的值得塞得进它 ——
                 // 再标注一次也只是又走这条，冲突的标注会体现在值的类型上
-                self.mark_inited(name);
+                self.mark_inited(ctx, name);
                 if let Some(got) = got {
                     if !self.session.assignable(got, slot.ty) {
-                        log.push(Logger {
+                        diags.push(Diagnostic {
                             span: ast.span_of(prefix),
                             msg: format!(
                                 "不能把 {} 赋给 {}（声明为 {}）",
@@ -181,14 +200,14 @@ impl TypeLinter {
             }
             // 没声明过：这里就是全局的声明点，而声明点只认顶层
             if !self.is_chunk_top(ast, node_index) {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span: ast.span_of(prefix),
                     msg: format!("未声明的变量 {name}；全局变量的声明点只能在文件顶层"),
                 });
             }
             // 声明点上的空表和 local 同一条规矩：裸 `a = {}` 也推不出形状
-            let annot = self.type_annotation(ast, optype);
-            self.require_annot_for_empty_table(ast, values_node, i, annot, log);
+            let annot = self.type_annotation(ctx, ast, optype);
+            self.require_annot_for_empty_table(ast, values_node, i, annot, diags);
             // 报完照样登记：不登的话同一个名字后面每出现一次就再报一道
             let ty = annot.or(got).unwrap_or(TypeId::UNKNOWN);
             self.declare_global(name, ty, ast.span_of(prefix), VarScope::Global, true);
@@ -204,32 +223,33 @@ impl TypeLinter {
     ///     `resolve_index` 里做过了，而节点类型就是它算出的元素类型
     pub(super) fn check_write_target(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         var: usize,
         got: Option<TypeId>,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = ast.get_node(var).children.clone();
         let (prefix, optype) = (children[0], children[1]);
         let span = ast.span_of(prefix);
-        if self.type_annotation(ast, optype).is_some() {
-            log.push(Logger {
+        if self.type_annotation(ctx, ast, optype).is_some() {
+            diags.push(Diagnostic {
                 span,
                 msg: "类型标注只能贴在裸变量名上：字段和元素的类型由它所属的 class / record / 容器给出"
                     .to_string(),
             });
         }
         match self.get_production(ast, prefix) {
-            Some(Prod::Dot) => self.check_field_write(ast, prefix, got, log),
+            Some(Prod::Dot) => self.check_field_write(ctx, ast, prefix, got, diags),
             Some(Prod::Index) => {
                 // 不是容器时 resolve_index 给的是 ANY，assignable 自然放过
                 if let Some(got) = got {
-                    let want = self.child_type(prefix);
-                    self.expect_assignable(got, want, span, "元素", log);
+                    let want = self.child_type(ctx, prefix);
+                    self.expect_assignable(got, want, span, "元素", diags);
                 }
             }
             Some(Prod::Call | Prod::MethodCall | Prod::Paren | Prod::TurboFish) => {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span,
                     msg: "赋值目标只能是变量、字段或表元素".to_string(),
                 });
@@ -249,10 +269,11 @@ impl TypeLinter {
     ///   - 值得塞得进字段的类型
     pub(super) fn check_field_write(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         prefix: usize,
         got: Option<TypeId>,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         // `prefixexp '.' NAME`：基在 0、字段名在 2
         let dot = ast.get_node(prefix).children.clone();
@@ -261,12 +282,12 @@ impl TypeLinter {
             return;
         };
         let fname = fname.to_string();
-        if self.bare_class_ref(ast, dot[0]).is_some() {
+        if self.bare_class_ref(ctx, ast, dot[0]).is_some() {
             let cname = self
                 .get_child_name(ast, dot[0], 0)
                 .unwrap_or("")
                 .to_string();
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!(
                     "{cname} 是类名而不是变量：方法请写 function {cname}:{fname}(…) 重定义，字段是实例上的东西"
@@ -274,10 +295,10 @@ impl TypeLinter {
             });
             return;
         }
-        let owner = self.child_type(dot[0]);
+        let owner = self.child_type(ctx, dot[0]);
         let id = self.session.names.intern(&fname);
         if let Some((_, true)) = self.lookup_class_field(owner, id) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!(
                     "{fname} 是方法，不能赋值覆盖；要一个能每个实例不同的函数成员就把它声明成 {fname} : function(…)"
@@ -288,16 +309,16 @@ impl TypeLinter {
         // 已有字段：只核值。字段类型是声明处给的，写不改它
         if let Some(want) = self.lookup_field(owner, id) {
             if let Some(got) = got {
-                self.expect_assignable(got, want, span, &format!("字段 {fname}"), log);
+                self.expect_assignable(got, want, span, &format!("字段 {fname}"), diags);
             }
             return;
         }
         // 容器按键写：`t.k` 就是键为 "k" 那一项，所以键得是 string
         let shape = self.resolve_alias(owner);
         if let Some((k, v)) = self.session.type_arenas.as_map(shape) {
-            self.expect_key(TypeId::STRING, k, span, log, "表键");
+            self.expect_key(TypeId::STRING, k, span, diags, "表键");
             if let Some(got) = got {
-                self.expect_assignable(got, v, span, "表值", log);
+                self.expect_assignable(got, v, span, "表值", diags);
             }
             return;
         }
@@ -305,7 +326,7 @@ impl TypeLinter {
         if !self.is_known_shape(shape) {
             return;
         }
-        log.push(Logger {
+        diags.push(Diagnostic {
             span,
             msg: format!(
                 "{} 上没有字段 {fname}：形状一次定死，运行时不能新增字段",
@@ -320,23 +341,24 @@ impl TypeLinter {
     /// 「只许顶层」文法里表达不了（参见 table.rs 里这条产生式的注释），归这里拦
     pub(super) fn check_extern(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
-        let ty = self.pass_through(ast, node_index, 3);
+        let ty = self.pass_through(ctx, ast, node_index, 3);
         let span = ast.span_of(node_index);
         let Some(name) = self.get_child_name(ast, node_index, 1) else {
             return;
         };
         if !self.is_chunk_top(ast, node_index) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: "extern 只能写在文件顶层".to_string(),
             });
         }
         if !self.declare_global(name, ty, span, VarScope::Extern, true) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("{name} 已经声明过了"),
             });
@@ -353,24 +375,32 @@ impl TypeLinter {
     /// 接收者是类名的那一支要校方法签名，转给 check_external_method
     pub(super) fn check_func_decl(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = &ast.get_node(node_index).children;
         if children.len() == 4 {
-            let ty = self.child_type(children[3]);
+            let ty = self.child_type(ctx, children[3]);
             if let Some(name) = self.get_child_name(ast, node_index, 2) {
-                self.declare_variable(name, ty, ast.span_of(node_index), VarScope::Local, true);
+                self.declare_variable(
+                    ctx,
+                    name,
+                    ty,
+                    ast.span_of(node_index),
+                    VarScope::Local,
+                    true,
+                );
             }
             return;
         }
-        let (fname, ty) = (children[1], self.child_type(children[2]));
+        let (fname, ty) = (children[1], self.child_type(ctx, children[2]));
         match self.get_production(ast, fname) {
             Some(Prod::FuncName) => {}
             // `function A:m` / `function A.m`：类体外重定义类里声明的方法
             Some(Prod::MethodName | Prod::DottedName) => {
-                self.check_external_method(ast, fname, ty, log);
+                self.check_external_method(ctx, ast, fname, ty, diags);
                 return;
             }
             _ => return,
@@ -383,10 +413,10 @@ impl TypeLinter {
             // prepare 里抬升时已经登记过名字，这里只补类型、并把 inited 置上：
             // 声明语句真的执行到了，从这句起立即位置也读得了
             self.session.patch_hoisted_type(name, ty);
-            self.mark_inited(name);
+            self.mark_inited(ctx, name);
             return;
         }
-        log.push(Logger {
+        diags.push(Diagnostic {
             span,
             msg: format!(
                 "未声明的变量 {name}；`function {name}` 写的是全局变量，声明点只能在文件顶层"
@@ -475,7 +505,7 @@ impl TypeLinter {
     /// 只认顶层（见 top_level_stats）：嵌在 if / do 里的 class 不是顶层声明点，
     /// 那种情形归各自的 check_* 去拦。
     /// 非 pub 的名字只落在文件级作用域（跨文件导出是 P5 的 Session::export）
-    pub(super) fn hoist_top_level_types(&mut self, ast: &Tree<NodeSyntax<'_>>) {
+    pub(super) fn hoist_top_level_types(&mut self, ctx: &mut Context, ast: &Tree<NodeSyntax<'_>>) {
         for stat in self.top_level_stats(ast) {
             let Some(is_class) = self.type_decl_is_class(ast, stat) else {
                 continue;
@@ -488,23 +518,47 @@ impl TypeLinter {
             };
             let span = ast.span_of(name_node);
             let name_id = self.session.names.intern(name);
-            let decl = if is_class {
-                self.session.decls.declare_class(name_id, span)
+            // 跨文件 BUILD 趟（warm_up）已经给这条声明铸过 DeclId 了 —— 同一棵树、
+            // 同一处 NAME span。prepare 再跑一遍时得复用那条，不能 declare_* 铸第二个：
+            // 否则导出 / import 绑到 warm_up 那条，主遍历填体却填进新的一条，取回来
+            // 的是空体。只认 span 一致的「同一处声明」—— 同模块跨文件的同名声明 span
+            // 不同，那是重名冲突，仍旧各铸各的、交给诊断去报（module_types or_insert
+            // 只认第一条，所以这里 lookup 到的可能是别的文件那条，span 对不上就不复用）
+            // 未走 prefill 的纯 run（单文件测 / lint_modules）没铸过那一趟，复用守卫不能
+            // 生效：否则同模块两个文件的同名声明 span 碰巧相同时（都是文件局部偏移），
+            // 后一个会复用前一个的 DeclId，导出就变成同一条、重复导出的冲突报不出来
+            let reused = if self.warmed {
+                self.session
+                    .lookup_module_type(ctx.current_module, name_id)
+                    .filter(|&d| self.session.decls.get(d).span() == span)
             } else {
-                self.session.decls.declare_typedef(name_id, span)
+                None
+            };
+            let decl = match reused {
+                Some(d) => d,
+                None => {
+                    let d = if is_class {
+                        self.session.decls.declare_class(name_id, span)
+                    } else {
+                        self.session.decls.declare_typedef(name_id, span)
+                    };
+                    // 同时登记进模块级的 module_types（不管 pub 与否）：别的文件 import
+                    // 这个名字但查不到导出时，靠它分辨「没 pub」与「根本没这个类型」
+                    self.session
+                        .declare_module_type(ctx.current_module, name_id, d);
+                    // 泛型形参一次性铸好身份、押进 decl.generics：实例化处（arity 校验、
+                    // subst_ref_args 的代入）在任何体被遍历之前就得能问到，所以放 P0a。
+                    // 只在头一次铸：复用那条时 warm_up 早铸好了，再 fresh 一遍会顶掉旧
+                    // 身份、让 warm_up 期填进体的泛型引用悬空
+                    self.hoist_decl_generics(ast, d, stat);
+                    d
+                }
             };
             // 同一文件里两条同名声明：declare_type 返回 false，重名诊断留给
             // check_class_decl / check_type_def（那里才知道是 class 撞 typedef 还是别的）
-            self.declare_type(name, TypeRef::Decl(decl));
-            // 同时登记进模块级的 module_types（不管 pub 与否）：别的文件 import 这个
-            // 名字但查不到导出时，靠它分辨「没 pub」与「根本没这个类型」
-            self.session
-                .declare_module_type(self.current_module, name_id, decl);
+            self.declare_type(ctx, name, TypeRef::Decl(decl));
             // 本文件的这几条留个底：字段覆盖的收口要在 finish 里回头扫它们
-            self.file_decls.push(decl);
-            // 泛型形参在这里一次性铸好身份、押进 decl.generics：实例化处（arity 校验、
-            // subst_ref_args 的代入）在任何体被遍历之前就得能问到，所以放 P0a
-            self.hoist_decl_generics(ast, decl, stat);
+            ctx.file_decls.push(decl);
         }
     }
 
@@ -557,11 +611,16 @@ impl TypeLinter {
     /// 于是体里的 `T` 查 type_names 查得到、解析成 Types::Generic。形参身份 P0a 已铸好，
     /// 这里只按名字挂上、不再 fresh（否则每趟遍历都会重铸、身份对不上）。P0a 没抬升的
     /// （嵌套声明）拿不到 decl，直接跳过 —— 名义类型只认顶层
-    pub(super) fn scope_decl_generics(&mut self, ast: &Tree<NodeSyntax<'_>>, decl_node: usize) {
+    pub(super) fn scope_decl_generics(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        decl_node: usize,
+    ) {
         let Some(name) = self.get_child_name(ast, decl_node, 2) else {
             return;
         };
-        let Some(decl) = self.hoisted_decl(ast, decl_node, name) else {
+        let Some(decl) = self.hoisted_decl(ctx, ast, decl_node, name) else {
             return;
         };
         for gid in self.session.decls.get(decl).generics.clone() {
@@ -570,7 +629,7 @@ impl TypeLinter {
                 .names
                 .resolve(self.session.decls.generic(gid).name())
                 .to_string();
-            self.declare_type(&s, TypeRef::Generic(gid));
+            self.declare_type(ctx, &s, TypeRef::Generic(gid));
         }
     }
 
@@ -578,13 +637,18 @@ impl TypeLinter {
     /// 返回类型 / 体里的 `T` 都解析成 Types::Generic。和 class/typedef 不同：函数不是
     /// 名义声明、没有 DeclId 存形参身份，所以每次进体现铸现挂 —— 每个 funcbody 主遍历
     /// 只进一次，GenericId 也只是个匿名标识，不必像 class 那样在 P0a 预铸再复用
-    pub(super) fn scope_func_generics(&mut self, ast: &Tree<NodeSyntax<'_>>, funcbody: usize) {
+    pub(super) fn scope_func_generics(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        funcbody: usize,
+    ) {
         // generics 恒在 funcbody 的 children[0]
         let generics_node = ast.get_node(funcbody).children[0];
         for (nm, span) in self.generic_param_names(ast, generics_node) {
             let name_id = self.session.names.intern(nm);
             let gid = self.session.decls.fresh_generic(name_id, span);
-            self.declare_type(nm, TypeRef::Generic(gid));
+            self.declare_type(ctx, nm, TypeRef::Generic(gid));
         }
     }
 
@@ -597,32 +661,32 @@ impl TypeLinter {
     /// 体要留给主遍历正经检查。诊断也不在这发（用 sink 吞掉）—— 重名/空体/继承环
     /// 仍由主遍历里的 check_* 报，避免报两遍。node_values 是主遍历的地盘，这趟只借
     /// 它中转类型，末尾清空交还给主遍历重算
-    pub(super) fn hoist_class_bodies(&mut self, ast: &Tree<NodeSyntax<'_>>) {
+    pub(super) fn hoist_class_bodies(&mut self, ctx: &mut Context, ast: &Tree<NodeSyntax<'_>>) {
         // 这趟不发诊断：check_* 里的重名/空体/继承环都报进这个 sink 然后丢掉，
         // 真正的那一份由主遍历的 leave 报，不能重复
-        let mut sink: Vec<Logger> = Vec::new();
+        let mut sink: Vec<Diagnostic> = Vec::new();
         for stat in self.top_level_stats(ast) {
             let Some(is_class) = self.type_decl_is_class(ast, stat) else {
                 continue;
             };
             // 类体内不标注的 self 默认取本类：进体先把 Ref 押上（typedef 不需要）
             if is_class {
-                let ty = self.class_ref_of(ast, stat);
-                self.class_stack.push(ty);
+                let ty = self.class_ref_of(ctx, ast, stat);
+                ctx.class_stack.push(ty);
             }
             // 形参（含字段默认值闭包的形参）求签名时会 declare，收进这格用完即弃
-            self.scope_stack.push(Scope::new());
+            ctx.scope_stack.push(Scope::new());
             // 体里的 `T` 要解成 Generic，泛型形参得先挂进这格（P0a 已铸好身份）
-            self.scope_decl_generics(ast, stat);
-            self.eager_resolve_sig(ast, stat, &mut sink);
-            self.scope_stack.pop();
+            self.scope_decl_generics(ctx, ast, stat);
+            self.eager_resolve_sig(ctx, ast, stat, &mut sink);
+            ctx.scope_stack.pop();
             if is_class {
-                self.class_stack.pop();
+                ctx.class_stack.pop();
             }
         }
         // node_values 是主遍历的地盘：这趟只借它把类型中转给 collect_*，清掉重来，
         // 否则主遍历重求这些子树时 register_value 会撞重入
-        self.node_values.clear();
+        ctx.node_values.clear();
     }
 
     /// 按后序把一棵子树求值，但**不进函数体**（MethodDef / funcbody 的 block）：
@@ -639,8 +703,8 @@ impl TypeLinter {
     /// 和 hoist_class_bodies 一个路子：只求签名不进体、诊断扔进 sink、末尾清空
     /// node_values 交还主遍历重算。`local function f` 不在此列：它不抬升，
     /// 声明点就在主遍历里，提前求它的签名会和主遍历撞重入
-    pub(super) fn hoist_func_signatures(&mut self, ast: &Tree<NodeSyntax<'_>>) {
-        let mut sink: Vec<Logger> = Vec::new();
+    pub(super) fn hoist_func_signatures(&mut self, ctx: &mut Context, ast: &Tree<NodeSyntax<'_>>) {
+        let mut sink: Vec<Diagnostic> = Vec::new();
         for stat in self.top_level_stats(ast) {
             let children = ast.get_node(stat).children.clone();
             if self.get_production(ast, stat) != Some(Prod::FuncDecl) || children.len() != 3 {
@@ -654,18 +718,18 @@ impl TypeLinter {
                 continue;
             };
             // 形参与泛型形参求签名时会 declare，收进这格用完即弃
-            self.scope_stack.push(Scope::new());
+            ctx.scope_stack.push(Scope::new());
             // 泛型形参得先挂进这格：eager 那趟不走 enter，`scope_func_generics`
             // 没人替它调，`function map<T,U>(t:array<T>, …)` 的 T 就会解析成
             // unknown，抬升上去的全局签名从此既认不出形参也核不对实参
-            self.scope_func_generics(ast, children[2]);
-            self.eager_resolve_sig(ast, children[2], &mut sink);
-            let ty = self.child_type(children[2]);
-            self.scope_stack.pop();
+            self.scope_func_generics(ctx, ast, children[2]);
+            self.eager_resolve_sig(ctx, ast, children[2], &mut sink);
+            let ty = self.child_type(ctx, children[2]);
+            ctx.scope_stack.pop();
             self.session.patch_hoisted_type(&name, ty);
         }
         // node_values 是主遍历的地盘：这趟只借它中转类型，清掉重来
-        self.node_values.clear();
+        ctx.node_values.clear();
     }
 
     /// 按后序把一棵子树求值，但**不进函数体**（MethodDef / funcbody 的 block）：
@@ -674,9 +738,10 @@ impl TypeLinter {
     /// 的闭包体同理，只取它的签名、体留给主遍历
     pub(super) fn eager_resolve_sig(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let node_prod = self.get_production(ast, node);
         for c in ast.get_node(node).children.clone() {
@@ -685,9 +750,9 @@ impl TypeLinter {
             {
                 continue;
             }
-            self.eager_resolve_sig(ast, c, log);
+            self.eager_resolve_sig(ctx, ast, c, diags);
         }
-        self.resolve(ast, node, log);
+        self.resolve(ctx, ast, node, diags);
     }
 
     /// 分支入口处的 nil 收窄。`local s:string|nil` 之后 `if s ~= nil then print(#s) end`
@@ -697,7 +762,12 @@ impl TypeLinter {
     /// 只认裸名字的测试（`s`、`s ~= nil`、`nil == s`）。字段路径（`a.b ~= nil`）
     /// 不收：那得按路径整个认同，而中间任何一段被写过就得作废，
     /// 不是这一层让得起的代价
-    pub(super) fn bind_narrowing(&mut self, ast: &Tree<NodeSyntax<'_>>, block: usize) {
+    pub(super) fn bind_narrowing(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        block: usize,
+    ) {
         let Some((cond, then_branch)) = self.branch_guard(ast, block) else {
             return;
         };
@@ -713,13 +783,13 @@ impl TypeLinter {
         if !drops_nil {
             return;
         }
-        let Some(slot) = self.lookup_variable(&name) else {
+        let Some(slot) = self.lookup_variable(ctx, &name) else {
             return;
         };
         let Some(ty) = self.without_nil(slot.ty) else {
             return;
         };
-        if let Some(scope) = self.scope_stack.last_mut() {
+        if let Some(scope) = ctx.scope_stack.last_mut() {
             scope.narrowed.insert(name, ty);
         }
     }
@@ -800,7 +870,12 @@ impl TypeLinter {
 
     /// for 的控制变量。它们在文法上是 for 语句的孩子，可见范围却是循环体，
     /// 所以在体的 block 刚压好作用域时声明。那时标注（在 block 之前）已经算好了
-    pub(super) fn bind_loop_vars(&mut self, ast: &Tree<NodeSyntax<'_>>, block: usize) {
+    pub(super) fn bind_loop_vars(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        block: usize,
+    ) {
         let Some(parent) = ast.get_node(block).parent else {
             return;
         };
@@ -810,21 +885,23 @@ impl TypeLinter {
             NodeSyntax::Prod(Some(Prod::ForNum | Prod::ForNumStep)) => {
                 // 数值 for 的控制变量必然是 number，标注只是写着顺手
                 let ty = self
-                    .type_annotation(ast, children[2])
+                    .type_annotation(ctx, ast, children[2])
                     .unwrap_or(TypeId::NUMBER);
                 let span = ast.span_of(children[1]);
                 if let Some(name) = self.get_child_name(ast, parent, 1) {
-                    self.declare_variable(name, ty, span, VarScope::Local, true);
+                    self.declare_variable(ctx, name, ty, span, VarScope::Local, true);
                 }
             }
             // FOR decllist IN explist DO block END。迭代器给什么类型还算不出来，
             // 没标注就是 UNKNOWN；控制变量一律算已赋值
             NodeSyntax::Prod(Some(Prod::ForIn)) => {
                 for (name_node, optype) in self.decl_items(ast, children[1]) {
-                    let ty = self.type_annotation(ast, optype).unwrap_or(TypeId::UNKNOWN);
+                    let ty = self
+                        .type_annotation(ctx, ast, optype)
+                        .unwrap_or(TypeId::UNKNOWN);
                     if let Some(name) = self.get_name(ast, name_node) {
                         let span = ast.span_of(name_node);
-                        self.declare_variable(name, ty, span, VarScope::Local, true);
+                        self.declare_variable(ctx, name, ty, span, VarScope::Local, true);
                     }
                 }
             }
@@ -835,9 +912,10 @@ impl TypeLinter {
     /// @VarRef 的两条诊断。为何在前序：看 resolve_var_ref 的注释
     pub(super) fn check_var_read(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         // 写位既可能是声明点又可能是赋值点，两条都不适用，归 check_assign
         if self.is_writing(ast, node) {
@@ -849,22 +927,22 @@ impl TypeLinter {
         };
         // 体里读自己的名字：没标返回类型的话这一读就让推断依赖自己。
         // 报不报和名字查得到查不到无关，所以在查表之前
-        self.check_recursive_ret(name, span, log);
-        let Some((scope, slot)) = self.lookup_variable_at(name) else {
+        self.check_recursive_ret(ctx, name, span, diags);
+        let Some((scope, slot)) = self.lookup_variable_at(ctx, name) else {
             // 类名不在变量表里（hoist_top_level_types 只登记类型名），但它确实能
             // 写在值位：`A{…}` 构造、`A.m(…)` 静态方法。那两条各自有钩子，
             // 这里不该再按「未声明的变量」报一道
-            if self.class_ref_by_name(name).is_some() {
+            if self.class_ref_by_name(ctx, name).is_some() {
                 return;
             }
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("未声明的变量 {name}"),
             });
             return;
         };
-        if !slot.inited && self.init_checkable(scope) {
-            log.push(Logger {
+        if !slot.inited && self.init_checkable(ctx, scope) {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("变量 {name} 可能尚未赋值"),
             });
@@ -876,21 +954,22 @@ impl TypeLinter {
     /// 死代码是成段的，逐条报就是一屏
     pub(super) fn check_reachable(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
-        if !self.flow_terminated() || !self.follows_stat(ast, node) {
+        if !self.flow_terminated(ctx) || !self.follows_stat(ast, node) {
             return;
         }
-        let Some(frame) = self.flow_stack.last_mut() else {
+        let Some(frame) = ctx.flow_stack.last_mut() else {
             return;
         };
         if frame.dead_reported {
             return;
         }
         frame.dead_reported = true;
-        log.push(Logger {
+        diags.push(Diagnostic {
             span: ast.span_of(node),
             msg: "这条语句到不了：上一条已经 return / break / goto，或者调了个不返回的函数"
                 .to_string(),
@@ -909,7 +988,7 @@ impl TypeLinter {
         &mut self,
         _ast: &Tree<NodeSyntax<'_>>,
         _node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) {
     }
     /// 带分支的语句（if / 循环 / do）：流帧按 `join_mode` 在驱动点配对开合
@@ -917,7 +996,7 @@ impl TypeLinter {
         &mut self,
         _ast: &Tree<NodeSyntax<'_>>,
         _node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) {
     }
     /// @ExprStat：「调了不返回的函数」这条终结在 leave 里问 `is_noreturn_stat`
@@ -925,7 +1004,7 @@ impl TypeLinter {
         &mut self,
         _ast: &Tree<NodeSyntax<'_>>,
         _node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) {
     }
     /// @Goto / @Label：降级（`flow_untrust`）与终结 / 救活都在 enter/leave 里
@@ -933,7 +1012,7 @@ impl TypeLinter {
         &mut self,
         _ast: &Tree<NodeSyntax<'_>>,
         _node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) {
     }
 
@@ -948,23 +1027,24 @@ impl TypeLinter {
     /// 顶层 chunk 的 `return` 在 Lua 里合法，而它没签名可核，直接跳过
     pub(super) fn check_return(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         // @Return 是 `RETURN explist [';']`，@ReturnVoid 根本没值那一格
         let got = match self.get_production(ast, node_index) {
-            Some(Prod::Return) => self.pass_through(ast, node_index, 1),
+            Some(Prod::Return) => self.pass_through(ctx, ast, node_index, 1),
             _ => TypeId::VOID,
         };
-        let Some(&RetFrame { sig, annotated, .. }) = self.ret_stack.last() else {
+        let Some(&RetFrame { sig, annotated, .. }) = ctx.ret_stack.last() else {
             return;
         };
         if !annotated {
-            self.ret_stack.last_mut().unwrap().seen.push(got);
+            ctx.ret_stack.last_mut().unwrap().seen.push(got);
             return;
         }
-        let want = self.declared_ret(ast, sig).unwrap_or(TypeId::VOID);
+        let want = self.declared_ret(ctx, ast, sig).unwrap_or(TypeId::VOID);
         // `-> never` 说的是「这个函数不返回」，不是一个返回值位子，
         // 逐位核对对它无意（`return` 不算「少给了一个 never」）
         if want == TypeId::NEVER {
@@ -974,7 +1054,7 @@ impl TypeLinter {
         let (items, spread) = self.value_items(got, span);
         let want = self.session.type_arenas.as_list(want);
         let want = self.session.type_arenas.list(want).clone();
-        self.check_positional(&items, &want, spread, span, "返回值", log);
+        self.check_positional(&items, &want, spread, span, "返回值", diags);
     }
 
     /// 一个多值摊成逐位的 `(报错落点, 类型)`，外加一位「末位摊不摊得开」。
@@ -995,12 +1075,17 @@ impl TypeLinter {
     /// 标注的返回类型。`sig` 是带 rettype 槽的那个节点（funcbody / methodsig /
     /// functype）：rettype 在文法上是单独的候选式，所以「没写 `->`」就是没这个孩子，
     /// 和 `-> ()`（有孩子、类型是空 Pack）分得开
-    pub(super) fn declared_ret(&self, ast: &Tree<NodeSyntax<'_>>, sig: usize) -> Option<TypeId> {
+    pub(super) fn declared_ret(
+        &self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        sig: usize,
+    ) -> Option<TypeId> {
         ast.get_node(sig)
             .children
             .iter()
             .find(|&&c| self.get_production(ast, c) == Some(Prod::ReturnType))
-            .map(|&c| self.child_type(c))
+            .map(|&c| self.child_type(ctx, c))
     }
 
     /// 没写 `->` 时的返回列表：体里各条 return 攒在帧上，这里合成一张列表。
@@ -1009,8 +1094,8 @@ impl TypeLinter {
     /// `if c then return 1 end return nil` 推出 `number|nil`。位数不齐的那几位补 nil ——
     /// 少给的那条路真的就是返 nil。只认栈顶那格：开参数位的 functype
     /// （`function(number)`）没体也没帧，对不上就算 void
-    pub(super) fn inferred_ret(&mut self, body: usize) -> ListId {
-        let seen = match self.ret_stack.last() {
+    pub(super) fn inferred_ret(&mut self, ctx: &Context, body: usize) -> ListId {
+        let seen = match ctx.ret_stack.last() {
             Some(frame) if frame.node == body => frame.seen.clone(),
             _ => return ListId::EMPTY,
         };
@@ -1042,9 +1127,15 @@ impl TypeLinter {
     /// 局部互递归得写前向声明（否则“可能尚未赋值”）、而前向声明必带类型；
     /// 全局互递归靠抬升，抬升的名字拿到的是另一条的声明类型、不经过本帧的推断。
     /// 方法不在此列：`self:m()` 不是裸名字读，走的是字段查找
-    pub(super) fn check_recursive_ret(&mut self, name: &str, span: Span, log: &mut Vec<Logger>) {
+    pub(super) fn check_recursive_ret(
+        &mut self,
+        ctx: &mut Context,
+        name: &str,
+        span: Span,
+        diags: &mut Vec<Diagnostic>,
+    ) {
         // 快路：没一格帧带名字（或都标了返回类型）时不必 intern
-        if self
+        if ctx
             .ret_stack
             .iter()
             .all(|f| f.annotated || f.name.is_none())
@@ -1052,7 +1143,7 @@ impl TypeLinter {
             return;
         }
         let id = self.session.names.intern(name);
-        let Some(frame) = self
+        let Some(frame) = ctx
             .ret_stack
             .iter_mut()
             .find(|f| !f.annotated && f.name == Some(id) && !f.reported)
@@ -1060,7 +1151,7 @@ impl TypeLinter {
             return;
         };
         frame.reported = true;
-        log.push(Logger {
+        diags.push(Diagnostic {
             span,
             msg: format!("递归函数 {name} 必须标注返回类型：不标的话返回类型要靠体里的 return 推，而它又依赖自己"),
         });
@@ -1068,12 +1159,18 @@ impl TypeLinter {
 
     /// 进一个函数体：压一格 `RetFrame`。`sig` 是带 rettype 槽的节点（funcbody 是
     /// 它自己，@MethodDef 是 methodsig）；名字只为「递归须标注」那一条而记
-    pub(super) fn push_ret_frame(&mut self, ast: &Tree<NodeSyntax<'_>>, body: usize, sig: usize) {
-        let annotated = self.declared_ret(ast, sig).is_some();
+    pub(super) fn push_ret_frame(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        body: usize,
+        sig: usize,
+    ) {
+        let annotated = self.declared_ret(ctx, ast, sig).is_some();
         let name = self
             .own_name_of(ast, body)
             .map(|nm| self.session.names.intern(nm));
-        self.ret_stack.push(RetFrame {
+        ctx.ret_stack.push(RetFrame {
             node: body,
             sig,
             annotated,
@@ -1084,9 +1181,9 @@ impl TypeLinter {
     }
 
     /// 出函数体。认下标才弹：不是本体那格就是开合没配对，宁可不弹也不能弹错人
-    pub(super) fn pop_ret_frame(&mut self, body: usize) {
-        if self.ret_stack.last().is_some_and(|f| f.node == body) {
-            self.ret_stack.pop();
+    pub(super) fn pop_ret_frame(&mut self, ctx: &mut Context, body: usize) {
+        if ctx.ret_stack.last().is_some_and(|f| f.node == body) {
+            ctx.ret_stack.pop();
         }
     }
 

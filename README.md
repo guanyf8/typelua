@@ -645,7 +645,7 @@ methodsig      ::= Name ‘(’ [parlist] ‘)’ [rettype]
      `uniontype : intertype ·` 遇 ‘&’ —— `x as A&B` 的 ‘&’ 也可以是按位与
    三者都落在没声明优先级的产生式上，优先级消解不介入，bison 一律默认移进，
    结果与阶梯版一致（阶梯里 cast_exp 在最外层，强转结果当不了二元运算的左操作数，
-   那三个根本不存在）。两份都实测能解析 README 全部 sample 与 examples/*.tlua。
+   那三个根本不存在）。两份都实测能解析 README 全部 sample 与 examples/*.tua。
    `extern`（宿主声明）已落地到 src/parser/table.rs；加上它两版冲突数均不变，
    已实测（阶梯 2、扁平 5）。它只能出现在顶层这条靠 checker，不在本文法里。 */
 

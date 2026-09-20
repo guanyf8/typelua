@@ -119,8 +119,9 @@ impl GenericId {
     }
 }
 
-/// 一个被 intern 的标识符
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// 一个被 intern 的标识符。`Default`（NameId(0)）只是 `Context::new` 的占位：
+/// current_module 在 prepare / warm_up 里总会被真正的模块名覆写后才被读
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NameId(u32);
 impl NameId {
     #[inline]

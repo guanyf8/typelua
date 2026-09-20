@@ -23,18 +23,18 @@ impl TypeLinter {
 
     /// per-file 重置。`prepare` 里**先压文件级作用域、再调这个**；
     /// 栈底那格「文件帧」是所有 `flow_*` 的地基，不压就会 `expect` 响
-    pub(super) fn flow_reset(&mut self) {
-        self.init_record.clear();
-        self.join_stack.clear();
-        self.flow_stack.clear();
+    pub(super) fn flow_reset(&mut self, ctx: &mut Context) {
+        ctx.init_record.clear();
+        ctx.join_stack.clear();
+        ctx.flow_stack.clear();
         // 文件 chunk 在 Lua 里就是个函数，所以它是边界
-        self.push_frame(true);
+        self.push_frame(ctx, true);
     }
 
-    pub(super) fn push_frame(&mut self, is_fn_body: bool) {
-        self.flow_stack.push(FlowFrame {
-            record_mark: self.init_record.len(),
-            scope_depth: self.scope_stack.len(),
+    pub(super) fn push_frame(&mut self, ctx: &mut Context, is_fn_body: bool) {
+        ctx.flow_stack.push(FlowFrame {
+            record_mark: ctx.init_record.len(),
+            scope_depth: ctx.scope_stack.len(),
             terminated: false,
             dead_reported: false,
             untrusted: false,
@@ -43,28 +43,28 @@ impl TypeLinter {
     }
 
     /// 进一条带分支的语句（`if` / 循环 / `do` / funcbody）
-    pub(super) fn flow_open(&mut self) {
-        self.join_stack.push(Vec::new());
+    pub(super) fn flow_open(&mut self, ctx: &mut Context) {
+        ctx.join_stack.push(Vec::new());
     }
 
     /// 进一个分支块
-    pub(super) fn flow_enter_branch(&mut self) {
-        self.push_frame(false);
+    pub(super) fn flow_enter_branch(&mut self, ctx: &mut Context) {
+        self.push_frame(ctx, false);
     }
 
     /// 进一个函数体。和普通分支块差在两处：体内的 `return` 不能终结外层
     /// （`local f = function() return end` 之后外层照样往下跑），`goto` 的降级
     /// 也到这里为止。两件事共用 `is_fn_body` 一位
-    pub(super) fn flow_enter_body(&mut self) {
-        self.push_frame(true);
+    pub(super) fn flow_enter_body(&mut self, ctx: &mut Context) {
+        self.push_frame(ctx, true);
     }
 
     /// 离开分支块：把本分支的翻转全回滚，结果攒进当前语句。
     /// 回滚是必需的：分支里赋了值不代表跑到外面也赋了，得等所有
     /// 分支跑完取完交集才能定
-    pub(super) fn flow_leave_branch(&mut self) {
-        let frame = self.flow_stack.pop().expect("分支块得先 flow_enter_branch");
-        let flips: Vec<InitFlip> = self
+    pub(super) fn flow_leave_branch(&mut self, ctx: &mut Context) {
+        let frame = ctx.flow_stack.pop().expect("分支块得先 flow_enter_branch");
+        let flips: Vec<InitFlip> = ctx
             .init_record
             .split_off(frame.record_mark)
             .into_iter()
@@ -73,9 +73,9 @@ impl TypeLinter {
             .filter(|f| f.scope.is_none_or(|d| d < frame.scope_depth))
             .collect();
         for flip in &flips {
-            self.set_inited(flip, false);
+            self.set_inited(ctx, flip, false);
         }
-        self.join_stack
+        ctx.join_stack
             .last_mut()
             .expect("分支块得在 flow_open 之内")
             .push(BranchExit {
@@ -85,8 +85,8 @@ impl TypeLinter {
     }
 
     /// 离开这条语句，按 mode 把各分支的结果合进外层帧
-    pub(super) fn flow_close(&mut self, mode: JoinMode) {
-        let branches = self
+    pub(super) fn flow_close(&mut self, ctx: &mut Context, mode: JoinMode) {
+        let branches = ctx
             .join_stack
             .pop()
             .expect("flow_close 得和 flow_open 配对");
@@ -99,7 +99,7 @@ impl TypeLinter {
             let Some(first) = live.next() else {
                 // 一条分支都走不出来（`if c then return else error("x") end`）：
                 // 外层从这条语句起也到不了下一句
-                self.flow_terminate();
+                self.flow_terminate(ctx);
                 return;
             };
             let mut acc = first.flips.clone();
@@ -108,24 +108,24 @@ impl TypeLinter {
             }
             acc
         };
-        self.flow_apply(joined);
+        self.flow_apply(ctx, joined);
     }
 
     /// 把合并出来的置位写进外层帧。**必须再记一遍日志**：外层要是
     /// 自己也是个分支（嵌套的 `if`），它退出时还得能把这些一起回滚
-    pub(super) fn flow_apply(&mut self, flips: Vec<InitFlip>) {
+    pub(super) fn flow_apply(&mut self, ctx: &mut Context, flips: Vec<InitFlip>) {
         for flip in flips {
-            self.set_inited(&flip, true);
-            self.init_record.push(flip);
+            self.set_inited(ctx, &flip, true);
+            ctx.init_record.push(flip);
         }
     }
 
     /// 按记录的位置就地写 `inited`。**不按名字重新查表**：当时那次置位
     /// 打的是哪一格，回滚 / 应用就必须打回同一格
-    pub(super) fn set_inited(&mut self, flip: &InitFlip, inited: bool) {
+    pub(super) fn set_inited(&mut self, ctx: &mut Context, flip: &InitFlip, inited: bool) {
         match flip.scope {
             Some(depth) => {
-                if let Some(slot) = self
+                if let Some(slot) = ctx
                     .scope_stack
                     .get_mut(depth)
                     .and_then(|s| s.variables.get_mut(&flip.name))
@@ -138,15 +138,15 @@ impl TypeLinter {
     }
 
     /// 当前帧走不下去了：`return` / `break` / `goto` / 调了不返回的函数
-    pub(super) fn flow_terminate(&mut self) {
-        if let Some(frame) = self.flow_stack.last_mut() {
+    pub(super) fn flow_terminate(&mut self, ctx: &mut Context) {
+        if let Some(frame) = ctx.flow_stack.last_mut() {
             frame.terminated = true;
         }
     }
 
     /// 当前帧已经终结 —— 后面的语句是死代码
-    pub(super) fn flow_terminated(&self) -> bool {
-        self.flow_stack.last().is_some_and(|f| f.terminated)
+    pub(super) fn flow_terminated(&self, ctx: &Context) -> bool {
+        ctx.flow_stack.last().is_some_and(|f| f.terminated)
     }
 
     /// 帧又活了：碰上 label。`goto skip` 把帧终结掉，可 `::skip::` 恰恰是那一跳
@@ -154,8 +154,8 @@ impl TypeLinter {
     ///
     /// 只清 `terminated` 不清 `dead_reported`：既然这一段的可达性已经不可靠，
     /// 就别在同一帧里第二次开口
-    pub(super) fn flow_revive(&mut self) {
-        if let Some(frame) = self.flow_stack.last_mut() {
+    pub(super) fn flow_revive(&mut self, ctx: &mut Context) {
+        if let Some(frame) = ctx.flow_stack.last_mut() {
             frame.terminated = false;
         }
     }
@@ -166,8 +166,8 @@ impl TypeLinter {
     /// 它只能降级 `goto` **之后**看到的语句 —— 前序遍历还没走到后面那个
     /// `goto` 时它无从得知。要全程降级得在进函数体时浅扫一遍找 `goto`；
     /// Lua 本身禁止 goto 跳进 local 的作用域，漏的那一小块很窄
-    pub(super) fn flow_untrust(&mut self) {
-        for frame in self.flow_stack.iter_mut().rev() {
+    pub(super) fn flow_untrust(&mut self, ctx: &mut Context) {
+        for frame in ctx.flow_stack.iter_mut().rev() {
             frame.untrusted = true;
             if frame.is_fn_body {
                 break;
@@ -177,8 +177,8 @@ impl TypeLinter {
 
     /// 当前函数里的 inited 结论还信得过。返回 false 时该把「可能尚未赋值」
     /// 一律放过（类型推导不受影响，只关掉这一条诊断）
-    pub(super) fn flow_trusted(&self) -> bool {
-        for frame in self.flow_stack.iter().rev() {
+    pub(super) fn flow_trusted(&self, ctx: &Context) -> bool {
+        for frame in ctx.flow_stack.iter().rev() {
             if frame.untrusted {
                 return false;
             }
@@ -191,8 +191,8 @@ impl TypeLinter {
 
     /// 最内层的函数体那格帧，返回（它在栈里的下标, 它进来时的作用域深度）。
     /// 下标 0 就是 `flow_reset` 压的文件帧，也就是「立即执行位置」的判据
-    pub(super) fn fn_frame(&self) -> (usize, usize) {
-        self.flow_stack
+    pub(super) fn fn_frame(&self, ctx: &Context) -> (usize, usize) {
+        ctx.flow_stack
             .iter()
             .enumerate()
             .rev()
@@ -209,12 +209,12 @@ impl TypeLinter {
     ///   - 外层函数的局部（upvalue）与全局：不是 —— 闭包可能等到赋值之后才被
     ///     调用，所以只有最内层的函数帧就是文件本体（立即执行）时才敢查。
     ///     `a = function() b() end` 这种互递归前向声明靠的就是这一条
-    pub(super) fn init_checkable(&self, scope: Option<usize>) -> bool {
+    pub(super) fn init_checkable(&self, ctx: &Context, scope: Option<usize>) -> bool {
         // 段内有 goto：结论本身不可信，不论变量归谁都放过
-        if !self.flow_trusted() {
+        if !self.flow_trusted(ctx) {
             return false;
         }
-        let (frame_index, base) = self.fn_frame();
+        let (frame_index, base) = self.fn_frame(ctx);
         match scope {
             Some(depth) => depth >= base,
             None => frame_index == 0,
@@ -234,13 +234,18 @@ impl TypeLinter {
     /// `node_values` 里还没有它。这不影响正确性 —— 语句执行完才谈得上终结。
     ///
     /// 另外：`assert` 不能声明成 `-> never`。条件为真时它原样返回第一个实参
-    pub(super) fn is_noreturn_stat(&self, ast: &Tree<NodeSyntax<'_>>, node_index: usize) -> bool {
+    pub(super) fn is_noreturn_stat(
+        &self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node_index: usize,
+    ) -> bool {
         // stat : prefixexp @ExprStat —— 带标签的单孩子不折叠，底下才是那个调用
         let Some(&call) = ast.get_node(node_index).children.first() else {
             return false;
         };
         // 截成单值再比：`-> never` 的 ret 本来就折叠成 never 自己，
         // 走一趟 truncate_ret 只是为了不假设它一定没被包进 Pack
-        self.truncate_ret(self.child_type(call)) == TypeId::NEVER
+        self.truncate_ret(self.child_type(ctx, call)) == TypeId::NEVER
     }
 }

@@ -13,10 +13,11 @@ impl TypeLinter {
     /// class 查 fields、table 查交进来的元表 record，两者是 `lookup_field` 的同一条路
     pub(super) fn resolve_operator(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
         op_child: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let op = ast.get_node(node_index).children[op_child];
         let unary = op_child == 0;
@@ -39,18 +40,19 @@ impl TypeLinter {
             return builtin;
         };
         // 操作数位可能是多值（`f() + 1`），截到一个
-        let lhs = self.truncate_ret(self.pass_through(ast, node_index, if unary { 1 } else { 0 }));
+        let lhs =
+            self.truncate_ret(self.pass_through(ctx, ast, node_index, if unary { 1 } else { 0 }));
         let span = ast.span_of(node_index);
         let operand = if unary {
             lhs
         } else {
-            let rhs = self.truncate_ret(self.pass_through(ast, node_index, 2));
+            let rhs = self.truncate_ret(self.pass_through(ctx, ast, node_index, 2));
             // 两侧都是标量就不必同类型：`1 .. "a"`、`"2" * 3` 在 Lua 里都合法
             if self.is_primitive_operand(lhs) && self.is_primitive_operand(rhs) {
                 return builtin;
             }
             if lhs != rhs {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span,
                     msg: format!(
                         "{} 运算要求两侧同类型，实际是 {} 和 {}",
@@ -71,7 +73,7 @@ impl TypeLinter {
         // 同一条路，不用分开写
         let name = self.session.names.intern(mm);
         if self.lookup_field(operand, name).is_none() {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!(
                     "{} 上没有 {} 元方法，不支持这个运算",
@@ -104,27 +106,28 @@ impl TypeLinter {
     /// 所以它们和 any 一样给 ANY：渐进类型的逃逸口，不是 UNKNOWN
     pub(super) fn resolve_index(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         // 别名透明：`typedef Xs = array<number>` 上的 `xs[1]` 和直接写 array 一样
-        let base = self.resolve_alias(self.pass_through(ast, node_index, 0));
+        let base = self.resolve_alias(self.pass_through(ctx, ast, node_index, 0));
         // `t[f()]`：键位不是末位，多值要截到一个
-        let key = self.truncate_ret(self.pass_through(ast, node_index, 2));
+        let key = self.truncate_ret(self.pass_through(ctx, ast, node_index, 2));
         let span = ast.span_of(node_index);
         if let Some(elem) = self.session.type_arenas.as_array(base) {
-            self.expect_key(key, TypeId::NUMBER, span, log, "数组下标");
+            self.expect_key(key, TypeId::NUMBER, span, diags, "数组下标");
             return elem;
         }
         if let Some((k, v)) = self.session.type_arenas.as_map(base) {
-            self.expect_key(key, k, span, log, "表键");
+            self.expect_key(key, k, span, diags, "表键");
             return v;
         }
         // 剩下的里面有确定不是表的：索引 nil / number / boolean 在 Lua 里是运行时错误
         // （string 不拦 —— 它有元表，`s[1]` 只是 nil 而不报错）
         if matches!(base, TypeId::NIL | TypeId::NUMBER | TypeId::BOOLEAN) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("不能索引 {} 类型的值", self.session.show(base)),
             });
@@ -140,7 +143,7 @@ impl TypeLinter {
         got: TypeId,
         want: TypeId,
         span: Span,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
         what: &str,
     ) {
         if got == want || matches!(got, TypeId::ANY | TypeId::UNKNOWN) {
@@ -149,7 +152,7 @@ impl TypeLinter {
         if matches!(self.session.type_arenas.get_type(got), Types::Generic(_)) {
             return;
         }
-        log.push(Logger {
+        diags.push(Diagnostic {
             span,
             msg: format!(
                 "{}应为 {}，实际是 {}",
@@ -167,12 +170,12 @@ impl TypeLinter {
         want: TypeId,
         span: Span,
         what: &str,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         if self.session.assignable(got, want) {
             return;
         }
-        log.push(Logger {
+        diags.push(Diagnostic {
             span,
             msg: format!(
                 "不能把 {} 赋给{}的 {} 位",
@@ -368,13 +371,14 @@ impl TypeLinter {
     /// 和字段读同一条规矩
     pub(super) fn resolve_method_call(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let children = ast.get_node(node_index).children.clone();
         //prefix是class/table/array(后两者都是class)没跑了
-        let recv = self.child_type(children[0]);
+        let recv = self.child_type(ctx, children[0]);
         let mname = self
             .name_or_panic(ast, children[2], "method name")
             .to_string();
@@ -382,7 +386,7 @@ impl TypeLinter {
         let Some(m) = self.member_type(recv, name) else {
             let shape = self.resolve_alias(recv);
             if self.is_known_shape(shape) {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span: ast.span_of(node_index),
                     msg: format!("{} 上没有方法 {mname}", self.session.show(shape)),
                 });
@@ -390,9 +394,9 @@ impl TypeLinter {
             return TypeId::UNKNOWN;
         };
         let mut args = vec![(ast.span_of(children[0]), recv)];
-        let (rest, spread) = self.call_args(ast, children[3]);
+        let (rest, spread) = self.call_args(ctx, ast, children[3]);
         args.extend(rest);
-        self.check_call_shape(m, &args, spread, ast.span_of(node_index), log);
+        self.check_call_shape(m, &args, spread, ast.span_of(node_index), diags);
         self.ret_of(m)
     }
 
@@ -408,12 +412,13 @@ impl TypeLinter {
     ///     的进出只有前序遍历数得清
     pub(super) fn resolve_var_ref(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let name = self.name_or_panic(ast, ast.get_node(node_index).children[0], "variable");
-        self.lookup_variable(name)
+        self.lookup_variable(ctx, name)
             .map_or(TypeId::UNKNOWN, |slot| slot.ty)
     }
 
@@ -422,10 +427,11 @@ impl TypeLinter {
     /// `local e = (error)` 之后 `e("x")` 能认出 never，就靠这一步不把类型丢成 UNKNOWN
     pub(super) fn resolve_paren(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
     ) -> TypeId {
-        self.truncate_ret(self.pass_through(ast, node_index, 1))
+        self.truncate_ret(self.pass_through(ctx, ast, node_index, 1))
     }
 
     /// `prefixexp '.' NAME` —— 字段读。走 `lookup_field`（class 查 fields、record
@@ -437,18 +443,19 @@ impl TypeLinter {
     /// 读一个不存在的字段永远只能拿到 nil，那就不是「还没算出来」而是写错了
     pub(super) fn resolve_dot(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let children = ast.get_node(node_index).children.clone();
         let fname = self
             .name_or_panic(ast, children[2], "field name")
             .to_string();
         let name = self.session.names.intern(&fname);
-        let base = match self.bare_class_ref(ast, children[0]) {
+        let base = match self.bare_class_ref(ctx, ast, children[0]) {
             Some((_, class)) => class,
-            None => self.child_type(children[0]),
+            None => self.child_type(ctx, children[0]),
         };
         if let Some(ty) = self.lookup_field(base, name) {
             return ty;
@@ -460,14 +467,14 @@ impl TypeLinter {
         let writing = self.is_writing(ast, node_index);
         if let Some((k, v)) = self.session.type_arenas.as_map(shape) {
             if !writing {
-                self.expect_key(TypeId::STRING, k, ast.span_of(node_index), log, "表键");
+                self.expect_key(TypeId::STRING, k, ast.span_of(node_index), diags, "表键");
             }
             return v;
         }
         if writing || !self.is_known_shape(shape) {
             return TypeId::UNKNOWN;
         }
-        log.push(Logger {
+        diags.push(Diagnostic {
             span: ast.span_of(node_index),
             msg: format!("{} 上没有字段 {fname}", self.session.show(shape)),
         });
@@ -477,7 +484,12 @@ impl TypeLinter {
     /// `var : prefixexp optype` —— 赋值目标。它的类型就是被赋的那个 prefixexp；
     /// optype 只是贴在裸名字上的标注（`G:Config = …`），归 `check_assign` 处理，
     /// 不进这里的类型
-    pub(super) fn resolve_var(&mut self, ast: &Tree<NodeSyntax<'_>>, node_index: usize) -> TypeId {
-        self.pass_through(ast, node_index, 0)
+    pub(super) fn resolve_var(
+        &mut self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node_index: usize,
+    ) -> TypeId {
+        self.pass_through(ctx, ast, node_index, 0)
     }
 }

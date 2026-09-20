@@ -16,13 +16,14 @@ impl TypeLinter {
     /// 所以 check_import_alias 无事
     pub(super) fn check_import(
         &mut self,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = ast.get_node(node_index).children.clone();
         if !self.is_chunk_top(ast, node_index) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span: ast.span_of(node_index),
                 msg: "import 只能写在文件顶层".to_string(),
             });
@@ -62,24 +63,24 @@ impl TypeLinter {
                 // 碰名得问 lookup_type：顶层类型是 prepare 里 hoist 进**文件级**作用域的，
                 // import 的 declare_type 却落在上层 chunk 块那格，只看顶格的 declare_type 拓不到它
                 Some(decl) => {
-                    if self.lookup_type(local).is_some() {
-                        log.push(Logger {
+                    if self.lookup_type(ctx, local).is_some() {
+                        diags.push(Diagnostic {
                             span,
                             msg: format!("{local} 已经声明过了"),
                         });
                     } else {
-                        self.declare_type(local, TypeRef::Decl(decl));
+                        self.declare_type(ctx, local, TypeRef::Decl(decl));
                     }
                 }
                 // 查不到导出：模块里真有这类型只是没 pub，跟压根没这类型，报不同的错
                 None => {
                     if self.session.module_has_type(module_id, orig_id) {
-                        log.push(Logger {
+                        diags.push(Diagnostic {
                             span,
                             msg: format!("类型 {orig} 没有 pub，不能 import"),
                         });
                     } else {
-                        log.push(Logger {
+                        diags.push(Diagnostic {
                             span,
                             msg: format!("模块 {module_str} 没有导出类型 {orig}"),
                         });
@@ -95,17 +96,49 @@ impl TypeLinter {
         &mut self,
         _ast: &Tree<NodeSyntax<'_>>,
         _node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) {
+    }
+
+    /// warm_up 的导出登记趟：扫顶层 class / typedef，把带 `pub` 的那些写进
+    /// Session::export。逻辑和 check_pub 完全一致（同一条 Decl、同一张导出表），
+    /// 只是挪到跨文件 BUILD 趟里、且不发诊断 —— import 端 CHECK 时无论文件顺序
+    /// 如何都查得到导出。重复导出 / 非顶层 pub 的诊断仍由主遍历的 check_pub 报
+    /// （export 对同一条 Decl 幂等，这趟先登记了也不会让 check_pub 误判重复）
+    pub(super) fn hoist_exports(&mut self, ctx: &Context, ast: &Tree<NodeSyntax<'_>>) {
+        for stat in self.top_level_stats(ast) {
+            if self.type_decl_is_class(ast, stat).is_none() {
+                continue;
+            }
+            // optpub 恒在 children[0]：是 @Pub 节点才算导出，空槽折成 Prod(None)
+            let Some(&pub_node) = ast.get_node(stat).children.first() else {
+                continue;
+            };
+            if self.get_production(ast, pub_node) != Some(Prod::Pub) {
+                continue;
+            }
+            // NAME 恒在 children[2]；hoisted_decl 顺着文件级作用域拿到 hoist 出的 DeclId
+            let Some(name) = self.get_child_name(ast, stat, 2) else {
+                continue;
+            };
+            let Some(decl) = self.hoisted_decl(ctx, ast, stat, name) else {
+                continue;
+            };
+            let name_id = self.session.names.intern(name);
+            self.session.decls.get_mut(decl).exported = true;
+            // 返回值忽略：跨文件重复导出的诊断留给主遍历的 check_pub，这趟静默
+            self.session.export(ctx.current_module, name_id, decl);
+        }
     }
 
     /// `pub` —— 导出修饰，只贴在顶层 class / typedef 前。把被修饰的那个
     /// 类型名写进 Session::export；【只许顶层】文法表达不了，跟 extern 一样得在这里拦
     pub(super) fn check_pub(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         // @Pub 的父节点就是被修饰的 class / typedef 声明：文法只在这三条里
         // 开了 optpub 槽，所以父必是其一，NAME 恒在 children[2]
@@ -113,7 +146,7 @@ impl TypeLinter {
             return;
         };
         if !self.is_chunk_top(ast, decl_node) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span: ast.span_of(node_index),
                 msg: "pub 只能修饰顶层的 class / typedef".to_string(),
             });
@@ -126,7 +159,7 @@ impl TypeLinter {
             return;
         };
         let name_span = ast.span_of(name_node);
-        let Some(decl) = self.hoisted_decl(ast, decl_node, name) else {
+        let Some(decl) = self.hoisted_decl(ctx, ast, decl_node, name) else {
             return;
         };
         // 重复声明的第二条：名字归第一条所有，导出也只该按第一条。重名诊断
@@ -138,8 +171,8 @@ impl TypeLinter {
         self.session.decls.get_mut(decl).exported = true;
         // 同模块同名重复导出（两个文件都 pub 了同名类型）：export 返回 false。
         // 同文件内的重名早被上面的 is_dup_decl 挡掉，走到这儿的都是跨文件撞名
-        if !self.session.export(self.current_module, name_id, decl) {
-            log.push(Logger {
+        if !self.session.export(ctx.current_module, name_id, decl) {
+            diags.push(Diagnostic {
                 span: name_span,
                 msg: format!("类型 {name} 已经被导出过了"),
             });

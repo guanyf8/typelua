@@ -23,6 +23,7 @@ impl TypeLinter {
     /// 比不填更糟，所以这些直接跳过 —— 名义类型只认顶层，和全局声明点一个道理
     pub(super) fn hoisted_decl(
         &self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         decl_node: usize,
         name: &str,
@@ -30,7 +31,7 @@ impl TypeLinter {
         if !self.is_chunk_top(ast, decl_node) {
             return None;
         }
-        match self.lookup_type(name) {
+        match self.lookup_type(ctx, name) {
             Some(TypeRef::Decl(decl)) => Some(decl),
             _ => None,
         }
@@ -49,11 +50,12 @@ impl TypeLinter {
     /// 名字一并带回来 —— 后面的诊断消息都要用
     pub(super) fn decl_to_fill<'t>(
         &self,
+        ctx: &Context,
         ast: &'t Tree<NodeSyntax<'t>>,
         node_index: usize,
         name_node: usize,
         what: &str,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> Option<(DeclId, &'t str)> {
         let name = self.name_or_panic(ast, name_node, what);
         // 嵌在 do / if / 函数体里的 class/typedef 不是声明点：P0a 没抬升它，名义类型
@@ -62,15 +64,24 @@ impl TypeLinter {
         // 错得不知所以 —— 现在就地报一条明确诊断。注意别下沉到 hoisted_decl：它还被
         // scope_decl_generics 复用，那条路径对非顶层就该静默，报在这里才不会重出
         if !self.is_chunk_top(ast, node_index) {
-            log.push(Logger {
-                span: ast.span_of(name_node),
-                msg: "class / typedef 只能写在文件顶层".to_string(),
-            });
+            // 带 pub 的非顶层声明由 check_pub 报「pub 只能修饰顶层的 class / typedef」，
+            // 这里再报一条就重了 —— optpub 恒在 children[0]，是 @Pub 才算带 pub
+            let has_pub = ast
+                .get_node(node_index)
+                .children
+                .first()
+                .is_some_and(|&c| self.get_production(ast, c) == Some(Prod::Pub));
+            if !has_pub {
+                diags.push(Diagnostic {
+                    span: ast.span_of(name_node),
+                    msg: "class / typedef 只能写在文件顶层".to_string(),
+                });
+            }
             return None;
         }
-        let decl = self.hoisted_decl(ast, node_index, name)?;
+        let decl = self.hoisted_decl(ctx, ast, node_index, name)?;
         if self.is_dup_decl(decl, ast.span_of(name_node)) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span: ast.span_of(name_node),
                 msg: format!("类型名 {name} 重复声明"),
             });
@@ -88,9 +99,10 @@ impl TypeLinter {
     /// 类体外定义、字段写入三处都要靠它分路
     pub(super) fn collect_class_fields(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         classbody: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> Vec<ClassField> {
         let children = ast.get_node(classbody).children.clone();
         // `'{' '}'`：空体，len == 2；`'{' classfieldlist '}'`：list 在 children[1]
@@ -101,7 +113,7 @@ impl TypeLinter {
         let mut out: Vec<ClassField> = Vec::new();
         for item in self.spine(ast, children[1]) {
             let method = self.get_production(ast, item) == Some(Prod::MethodDef);
-            let Some(field) = self.collect_field(ast, item) else {
+            let Some(field) = self.collect_field(ctx, ast, item) else {
                 continue;
             };
             let cf = ClassField {
@@ -111,7 +123,7 @@ impl TypeLinter {
             };
             match at.get(&field.name) {
                 Some(&i) => {
-                    log.push(Logger {
+                    diags.push(Diagnostic {
                         span: ast.span_of(item),
                         msg: format!("字段 {} 重复声明", self.session.names.resolve(field.name)),
                     });
@@ -171,20 +183,22 @@ impl TypeLinter {
     /// `optpub CLASS NAME generics classbody`
     pub(super) fn check_class_decl(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = ast.get_node(node_index).children.clone();
-        let Some((decl, name)) = self.decl_to_fill(ast, node_index, children[2], "class name", log)
+        let Some((decl, name)) =
+            self.decl_to_fill(ctx, ast, node_index, children[2], "class name", diags)
         else {
             return;
         };
-        let fields = self.collect_class_fields(ast, children[4], log);
+        let fields = self.collect_class_fields(ctx, ast, children[4], diags);
         // 非空体规则：没有父类可继承形状时，空 class 是个没有形状的名义类型，
         // 只能由 `A{}` 造却又造不出任何字段 —— 拒掉。带 extends 的空体合法
         if fields.is_empty() {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span: ast.span_of(children[2]),
                 msg: format!("class {name} 的类型体不能为空"),
             });
@@ -197,25 +211,27 @@ impl TypeLinter {
     /// `optpub CLASS NAME generics ':' extendtype classbody`
     pub(super) fn check_class_decl_extends(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = ast.get_node(node_index).children.clone();
-        let Some((decl, name)) = self.decl_to_fill(ast, node_index, children[2], "class name", log)
+        let Some((decl, name)) =
+            self.decl_to_fill(ctx, ast, node_index, children[2], "class name", diags)
         else {
             return;
         };
         // extendtype 在遍历里已解析成 Ref；不是 class 就不认这条继承
-        let extends_ty = self.child_type(children[5]);
+        let extends_ty = self.child_type(ctx, children[5]);
         let parent_ok = self.extends_is_class(extends_ty);
         if !parent_ok {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span: ast.span_of(children[5]),
                 msg: format!("class {name} 只能继承 class"),
             });
         }
-        let fields = self.collect_class_fields(ast, children[6], log);
+        let fields = self.collect_class_fields(ctx, ast, children[6], diags);
         if let Some(c) = self.session.decls.get_mut(decl).as_class_mut() {
             c.fields = fields;
             c.extends = parent_ok.then_some(extends_ty);
@@ -224,7 +240,7 @@ impl TypeLinter {
         // 闭合那条（`class B:A`）填上才绕得回来。查到就把这条 extends 掐掉，
         // 免得 lookup_field / assignable 沿链上溯时只能靠深度上限兜底
         if parent_ok && self.extends_has_cycle(decl) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span: ast.span_of(children[2]),
                 msg: format!("class {name} 的继承出现环"),
             });
@@ -237,18 +253,20 @@ impl TypeLinter {
     /// `optpub TYPEDEF NAME generics '=' type`
     pub(super) fn check_type_def(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = ast.get_node(node_index).children.clone();
-        let Some((decl, _)) = self.decl_to_fill(ast, node_index, children[2], "typedef name", log)
+        let Some((decl, _)) =
+            self.decl_to_fill(ctx, ast, node_index, children[2], "typedef name", diags)
         else {
             return;
         };
         // 目标类型遍历里已解析；递归 typedef 里对自己的引用是 Ref、不展开，所以
         // `typedef Node = {next:Node|nil}` 到这里 target 就是那个 record，不会打转
-        let target = self.child_type(children[5]);
+        let target = self.child_type(ctx, children[5]);
         if let Some(t) = self.session.decls.get_mut(decl).as_typedef_mut() {
             t.target = target;
         }
@@ -261,7 +279,7 @@ impl TypeLinter {
         &mut self,
         _ast: &Tree<NodeSyntax<'_>>,
         _node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) {
     }
     /// 「既标注又带默认值」的字段（`NAME ':' type '=' exp`）：默认值得塞得进标注位，
@@ -272,19 +290,20 @@ impl TypeLinter {
     /// 形状判定走 field_decl_shape，和 collect_field_decl 同源
     pub(super) fn check_field_decl(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = ast.get_node(node_index).children.clone();
         let (annotated, default) = self.field_decl_shape(ast, node_index);
         if !annotated || !default {
             return;
         }
-        let want = self.child_type(children[2]);
-        let got = self.child_type(children[4]);
+        let want = self.child_type(ctx, children[2]);
+        let got = self.child_type(ctx, children[4]);
         if !self.session.assignable(got, want) {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span: ast.span_of(children[4]),
                 msg: format!(
                     "不能把 {} 赋给字段标注的 {} 位",
@@ -298,8 +317,8 @@ impl TypeLinter {
     /// 字段覆盖：class 不允许声明一个父类（含更上层）已经有的同名字段。
     /// 在 finish 里做 —— 那时本文件所有 class 体都填好了，前向继承的父类也在。
     /// 只扫本文件 hoist 的 decl：DeclTable 跨文件累积，别的文件的 class 不重报
-    pub(super) fn check_field_overrides(&mut self, log: &mut Vec<Logger>) {
-        let decls = self.file_decls.clone();
+    pub(super) fn check_field_overrides(&mut self, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+        let decls = ctx.file_decls.clone();
         for decl in decls {
             // 取父类型和本类自己的字段（名字 + 位置），拷成 owned 后再放开借用，
             // 好接着用 &mut self 的 lookup_field 沿 extends 链查
@@ -319,7 +338,7 @@ impl TypeLinter {
             };
             for (name, span) in own {
                 if self.lookup_field(parent, name).is_some() {
-                    log.push(Logger {
+                    diags.push(Diagnostic {
                         span,
                         msg: format!(
                             "字段 {} 覆盖了继承来的同名字段",
@@ -349,13 +368,14 @@ impl TypeLinter {
     /// 体里的 return 一条都还没见过。所以推断拖到这里（体已跑完）重拼一份
     pub(super) fn resolve_method_def(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let sig_node = ast.get_node(node_index).children[0];
-        let sig = self.child_type(sig_node);
-        if self.declared_ret(ast, sig_node).is_some() {
+        let sig = self.child_type(ctx, sig_node);
+        if self.declared_ret(ctx, ast, sig_node).is_some() {
             return sig;
         }
         let Types::Func {
@@ -364,7 +384,7 @@ impl TypeLinter {
         else {
             return sig;
         };
-        let ret = self.inferred_ret(node_index);
+        let ret = self.inferred_ret(ctx, node_index);
         self.session.type_arenas.func(generics, params, ret)
     }
     /// `funcname : dotted_name ':' NAME @MethodName` —— 类体外的冒号形式方法名。
@@ -372,11 +392,12 @@ impl TypeLinter {
     /// 不再借 TypeLinter 上的一格临时状态跨兄弟节点传值。
     pub(super) fn resolve_method_name(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
     ) -> TypeId {
         let base = ast.get_node(node_index).children[0];
-        self.method_receiver_type(ast, base)
+        self.method_receiver_type(ctx, ast, base)
     }
 
     /// `dotted_name : dotted_name '.' NAME @DottedName`。直接的 `A.m` 把 A 的类型作为
@@ -384,13 +405,14 @@ impl TypeLinter {
     /// 成最终函数的接收者。点形式不注入 self，这个类型只给显式 self 的默认类型用。
     pub(super) fn resolve_dotted_name(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let base = ast.get_node(node_index).children[0];
         if self.get_production(ast, base) == Some(Prod::FuncName) {
-            self.method_receiver_type(ast, base)
+            self.method_receiver_type(ctx, ast, base)
         } else {
             TypeId::UNKNOWN
         }
@@ -402,6 +424,7 @@ impl TypeLinter {
     /// 局部函数和函数表达式没有这种接收者关系。
     pub(super) fn funcbody_receiver(
         &self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         funcbody: usize,
     ) -> Option<(TypeId, bool)> {
@@ -419,7 +442,7 @@ impl TypeLinter {
             Some(Prod::DottedName) => false,
             _ => return None,
         };
-        Some((self.child_type(fname), colon))
+        Some((self.child_type(ctx, fname), colon))
     }
 
     /// 类体外的方法定义：`function A:m(…)` 与 `function A.m(self, …)`。
@@ -437,15 +460,16 @@ impl TypeLinter {
     /// 那是「声明形式给表定形」那一套的事，不归这条管
     pub(super) fn check_external_method(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         fname: usize,
         written: TypeId,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let children = ast.get_node(fname).children.clone();
         let colon = self.get_production(ast, fname) == Some(Prod::MethodName);
         let span = ast.span_of(fname);
-        let class = self.method_receiver_type(ast, children[0]);
+        let class = self.method_receiver_type(ctx, ast, children[0]);
         if class == TypeId::UNKNOWN {
             return;
         }
@@ -455,14 +479,14 @@ impl TypeLinter {
             .to_string();
         let name_id = self.session.names.intern(&mname);
         let Some((want, is_method)) = self.lookup_class_field(class, name_id) else {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("class {cname} 里没有声明方法 {mname}，类体外只能重定义已声明的方法"),
             });
             return;
         };
         if !is_method {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!(
                     "{cname}.{mname} 是函数变量字段而不是方法，不能用 function 定义；它只能在构造里给或整体赋值"
@@ -476,7 +500,7 @@ impl TypeLinter {
             written
         };
         if got != want {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!(
                     "方法 {mname} 的定义和 class {cname} 里的声明不一致：声明为 {}，这里是 {}",
@@ -512,6 +536,7 @@ impl TypeLinter {
     /// 或名字不是 class 的，一律 UNKNOWN —— self 落成 UNKNOWN，体内 self.x 不误报
     pub(super) fn method_receiver_type(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         base: usize,
     ) -> TypeId {
@@ -521,7 +546,7 @@ impl TypeLinter {
         let Some(name) = self.get_child_name(ast, base, 0) else {
             return TypeId::UNKNOWN;
         };
-        self.class_ref_by_name(name)
+        self.class_ref_by_name(ctx, name)
             .map_or(TypeId::UNKNOWN, |(_, class)| class)
     }
     /// 不标注的 `self` 形参该默认成什么类型，`None` = 这个位置没有接收者。
@@ -533,16 +558,17 @@ impl TypeLinter {
     ///   - functype：纯类型位，没有接收者
     pub(super) fn self_default_type(
         &self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         param_node: usize,
     ) -> Option<TypeId> {
         let mut cur = ast.get_node(param_node).parent;
         while let Some(p) = cur {
             match self.get_production(ast, p) {
-                Some(Prod::MethodSig) => return self.class_stack.last().copied(),
+                Some(Prod::MethodSig) => return ctx.class_stack.last().copied(),
                 Some(Prod::FuncBody) => {
                     return self
-                        .funcbody_receiver(ast, p)
+                        .funcbody_receiver(ctx, ast, p)
                         .and_then(|(ty, colon)| (!colon).then_some(ty));
                 }
                 Some(Prod::FuncType) => return None,
@@ -554,11 +580,16 @@ impl TypeLinter {
 
     /// class 声明节点 -> 它的 Ref 类型（无实参）。self 默认取本类用它。
     /// 只认顶层抬升过、且确实是 class 的名字；typedef / 标量 / 查不到一律 UNKNOWN
-    pub(super) fn class_ref_of(&mut self, ast: &Tree<NodeSyntax<'_>>, decl_node: usize) -> TypeId {
+    pub(super) fn class_ref_of(
+        &mut self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        decl_node: usize,
+    ) -> TypeId {
         let Some(name) = self.get_child_name(ast, decl_node, 2) else {
             return TypeId::UNKNOWN;
         };
-        self.class_ref_by_name(name)
+        self.class_ref_by_name(ctx, name)
             .map_or(TypeId::UNKNOWN, |(_, class)| class)
     }
 }

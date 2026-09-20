@@ -18,6 +18,22 @@ impl NodeData for NodeSyntax<'_> {
     }
 }
 
+/// 一条语法诊断：字节区间 + 人读信息。词法错误（`next_terminal` 跳过坏字符时）
+/// 与文法错误（`Action::Error`）共用这个壳，`main` 按模块名逐条报。
+pub struct SyntaxError {
+    pub span: Span,
+    pub msg: String,
+}
+
+/// `parse` 的完整产物。注释与错误**分列两处** —— 从前 `parse` 只返回注释、
+/// 却被 `main` 当错误报（源里每条注释都成了「语法错误」），这里把两者彻底分开。
+/// 出错时 `tree` 可能不完整；调用方据 `errors` 非空跳过后续阶段，不来读这棵半成品。
+pub struct Parsed<'p, 'a> {
+    pub tree: &'p Tree<NodeSyntax<'a>>,
+    pub comments: Vec<Span>,
+    pub errors: Vec<SyntaxError>,
+}
+
 pub struct Parser<'a> {
     node_stack: Vec<usize>, //指示node的指针
     ast: Tree<NodeSyntax<'a>>,
@@ -36,16 +52,35 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 已建好的语法树，原样借出。并行解析时 `parse()` 返回的 `&Tree` 借着
+    /// Parser、跨不了线程边界，只能先在各自线程里建好树、join 后再回来
+    /// 按着这个口取，免得重跑一遍 parse。未 parse 过时拿到的是刚初始化的空树
+    pub fn tree(&self) -> &Tree<NodeSyntax<'a>> {
+        &self.ast
+    }
+
     //传state是为了判断当前是否 >> 或 >=
-    fn next_terminal(&mut self, lexer: &mut Lexer<'a>, state: u32) -> Option<(Token<'a>, Span)> {
+    fn next_terminal(
+        &mut self,
+        lexer: &mut Lexer<'a>,
+        state: u32,
+        errors: &mut Vec<SyntaxError>,
+    ) -> Option<(Token<'a>, Span)> {
         //上一次拆出来的后半个优先。它已经是单字符，不可能再需要拆
         if let Some(half) = self.pending.take() {
             return Some(half);
         }
 
-        let (token, span) = match lexer.next_token()? {
-            (Ok(token), span) => (token, span),
-            (Err(e), span) => panic!("lexical error at {}..{}: {e}", span.start, span.end),
+        //词法错误不再中断：记一条诊断，跳过坏区间接着取。lexer 每次至少前进一个
+        //字符，循环必然收敛到 EOF（None），不会卡死
+        let (token, span) = loop {
+            match lexer.next_token()? {
+                (Ok(token), span) => break (token, span),
+                (Err(e), span) => errors.push(SyntaxError {
+                    span,
+                    msg: format!("词法错误：{e}"),
+                }),
+            }
         };
 
         //泛型闭合处的 '>>' / '>=' 拆回单个 '>'，当前parser状态下：
@@ -82,11 +117,12 @@ impl<'a> Parser<'a> {
     }
 
     //build tree
-    pub fn parse(&mut self) -> (&Tree<NodeSyntax<'a>>, Vec<Span>) {
+    pub fn parse(&mut self) -> Parsed<'_, 'a> {
         let mut lexer = Lexer::new(self.input);
         let mut state_stack: Vec<u32> = vec![0]; // state 0 初始化
+        let mut errors: Vec<SyntaxError> = Vec::new();
 
-        let mut lookahead = self.next_terminal(&mut lexer, 0);
+        let mut lookahead = self.next_terminal(&mut lexer, 0, &mut errors);
 
         loop {
             let symbol_col = match &lookahead {
@@ -109,7 +145,7 @@ impl<'a> Parser<'a> {
                     self.node_stack.push(index);
 
                     // 仅shift才更新输入
-                    lookahead = self.next_terminal(&mut lexer, state);
+                    lookahead = self.next_terminal(&mut lexer, state, &mut errors);
                 }
                 Action::Reduce(rule) => {
                     let rule_len = RULE_RHS_LEN[rule as usize];
@@ -161,29 +197,41 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Action::Error => {
+                    //不再 panic：记一条错误就地收尾。走 fail-fast —— 报第一个错、
+                    //位置最准；错误恢复（跳到同步符接着报）留到确实要多错时再做。
                     let mut expected = expected_terminals(*state_stack.last().unwrap());
                     expected.sort_unstable();
-                    match &lookahead {
-                        Some((token, span)) => panic!(
-                            "syntax error at {}..{}: unexpected {token:?}, expected one of {expected:?}",
-                            span.start, span.end
-                        ),
-                        None => {
-                            panic!("syntax error at end of input: expected one of {expected:?}")
+                    let (span, msg) = match &lookahead {
+                        Some((token, span)) => {
+                            (*span, format!("非预期的 {token}，期望 {expected:?} 之一"))
                         }
-                    }
+                        None => {
+                            let at = self.input.len();
+                            (
+                                Span { start: at, end: at },
+                                format!("输入意外结束，期望 {expected:?} 之一"),
+                            )
+                        }
+                    };
+                    errors.push(SyntaxError { span, msg });
+                    break;
                 }
             }
         }
 
-        // 此时栈顶节点即为根节点
-        if self.node_stack.len() != 1 {
-            panic!("Invalid AST, stack length should be 1");
-        } else {
+        // 正常收尾：栈顶就是根。出错时栈未必归一，这时别强求根 —— 调用方看
+        // errors 非空会跳过后续阶段，不会来读这棵半成品
+        if self.node_stack.len() == 1 {
             let node = self.node_stack.pop().unwrap();
             self.ast.set_root(node);
+        } else if errors.is_empty() {
+            panic!("Invalid AST, stack length should be 1");
         }
 
-        (&self.ast, lexer.comments().to_vec())
+        Parsed {
+            tree: &self.ast,
+            comments: lexer.comments().to_vec(),
+            errors,
+        }
     }
 }

@@ -18,6 +18,98 @@
 /// （UTF-8）。小于 0x80 完全准确，大于等于 0x80 按 Latin-1 映成码点 —— 要做到字节精确
 /// 得先有一个按字节存的 interner。将来字符串**值**也要参与拼接和输出时得回头解决，
 /// 到那时值位和名字位共用这一份
+use crate::lexer::type_def::Span;
+use crate::parser::ast::Tree;
+use crate::parser::parser::*;
+
+pub struct Diagnostic {
+    pub span: Span,
+    pub msg: String,
+}
+
+/// 遍历访问者。`C` 是随遍历一路带下去的上下文（per-file 的临时状态），
+/// 由驱动在遍历开始前建好、贯穿 prepare / enter / leave / finish 四个钩子 ——
+/// 「像 ast 一样」当参数传，而不是长在访问者自己身上。utils 不认识 `C` 具体
+/// 是什么（那会把类型系统的内部结构倒灌进公共模块），只把它透传
+pub trait DFS<C> {
+    /// 换文件了。per-file 的状态在这里清。`module` 是当前文件所属模块名，
+    /// 跨模块的 pub / import 靠它认「谁导出的、往哪儿导」——只关心类型阶段的
+    /// linter 会用到，其余的忽略即可
+    fn prepare(
+        &mut self,
+        _data: &mut C,
+        _ast: &Tree<NodeSyntax<'_>>,
+        _module: &str,
+        _diags: &mut Vec<Diagnostic>,
+    ) {
+    }
+
+    /// 前序：子节点还没走。只适合「进作用域」这类必须先于子树的动作
+    fn enter(
+        &mut self,
+        _data: &mut C,
+        _ast: &Tree<NodeSyntax<'_>>,
+        _node: usize,
+        _diags: &mut Vec<Diagnostic>,
+    ) {
+    }
+
+    /// 后序：子节点都走完了。综合属性的求值该在这里
+    fn leave(
+        &mut self,
+        _data: &mut C,
+        _ast: &Tree<NodeSyntax<'_>>,
+        _node: usize,
+        _diags: &mut Vec<Diagnostic>,
+    ) {
+    }
+
+    /// 整棵树走完。跨节点攒起来的诊断（未初始化、未使用之类）在这里收口
+    fn finish(&mut self, _data: &mut C, _diags: &mut Vec<Diagnostic>) {}
+}
+
+/// 通用的非递归 DFS：前序 enter、后序 leave，驱动任意 `DFS` 访问者走一棵树。
+/// 从 linter 里抽出来放这儿，emitter 等别的遍历器照用同一套遍历，不必各写一遍栓。
+/// warm_up / prepare / finish 这些「阶段」钩子由各自的驱动去调，这里只管纯遍历。
+/// `V: ?Sized` 是为了能收 `&mut dyn DFS`（驱动拿的是 `Box<dyn DFS>`）
+pub fn walk<C, V: DFS<C> + ?Sized>(
+    visitor: &mut V,
+    _data: &mut C,
+    ast: &Tree<NodeSyntax<'_>>,
+    root: usize,
+    diags: &mut Vec<Diagnostic>,
+) {
+    //   Enter: 刚进入节点，还没处理子节点
+    //   Leave: 所有子节点已处理完，即将离开
+    enum Phase {
+        Enter,
+        Leave,
+    }
+    let mut stack: Vec<(usize, Phase)> = vec![(root, Phase::Enter)];
+
+    while let Some((node, phase)) = stack.pop() {
+        match phase {
+            Phase::Enter => {
+                visitor.enter(_data, ast, node, diags);
+
+                // 准备处理子节点
+                let children = ast.get_node(node).children.clone();
+                if children.is_empty() {
+                    // 没有子节点，直接 leave
+                    visitor.leave(_data, ast, node, diags);
+                } else {
+                    // 先压 (node, Leave)，再逆序压子节点：栓是 LIFO，逆序才能按原顺序遍历
+                    stack.push((node, Phase::Leave));
+                    for child in children.into_iter().rev() {
+                        stack.push((child, Phase::Enter));
+                    }
+                }
+            }
+            Phase::Leave => visitor.leave(_data, ast, node, diags),
+        }
+    }
+}
+
 pub fn string_literal(raw: &str) -> String {
     let b = raw.as_bytes();
     if b.first() == Some(&b'[') {

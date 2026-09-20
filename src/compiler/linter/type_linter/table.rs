@@ -25,10 +25,11 @@ impl TypeLinter {
     /// `array & record`；`table<number|K,V>`；`record & table<number|K,V>`
     pub(super) fn resolve_fields(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
         site: FieldSite,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let list = ast.get_node(node_index).children[1];
         // 具名字段带上元素节点：重名诊断要报到出问题的那一项上，而不是整个表
@@ -42,12 +43,12 @@ impl TypeLinter {
             // 要一个函数成员就写成属性 `m : function(…)`
             if site == FieldSite::Record && self.get_production(ast, item) == Some(Prod::MethodDef)
             {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span: ast.span_of(item),
                     msg: "类型位的 record 不能定义方法，函数成员请写成 m : function(…)".to_string(),
                 });
             }
-            match self.classify_field(ast, item) {
+            match self.classify_field(ctx, ast, item) {
                 Elem::Named(f) => named.push((f, item)),
                 Elem::Positional(ty) => positional.push(ty),
                 Elem::Dynamic { key, val } => {
@@ -56,7 +57,7 @@ impl TypeLinter {
                 }
             }
         }
-        let fields = self.dedup_named(ast, named, site, log);
+        let fields = self.dedup_named(ast, named, site, diags);
         let mut parts = Vec::with_capacity(2);
         if !fields.is_empty() {
             parts.push(self.session.type_arenas.record(fields));
@@ -107,7 +108,7 @@ impl TypeLinter {
         ast: &Tree<NodeSyntax<'_>>,
         named: Vec<(Field, usize)>,
         site: FieldSite,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> Vec<Field> {
         let mut at: HashMap<NameId, usize> = HashMap::new();
         let mut out: Vec<Field> = Vec::new();
@@ -115,7 +116,7 @@ impl TypeLinter {
             match at.get(&f.name) {
                 Some(&i) => {
                     if site == FieldSite::Record {
-                        log.push(Logger {
+                        diags.push(Diagnostic {
                             span: ast.span_of(item),
                             msg: format!("字段 {} 重复声明", self.session.names.resolve(f.name)),
                         });
@@ -137,21 +138,26 @@ impl TypeLinter {
     ///
     /// 剩下那条就是位置字段：文法上 fields 侧只剩裸 exp（单元素那条被折叠所以
     /// 没标签），classfields 侧四种形式 collect_field 全接得住
-    pub(super) fn classify_field(&mut self, ast: &Tree<NodeSyntax<'_>>, node: usize) -> Elem {
-        if let Some(f) = self.collect_field(ast, node) {
+    pub(super) fn classify_field(
+        &mut self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node: usize,
+    ) -> Elem {
+        if let Some(f) = self.collect_field(ctx, ast, node) {
             return Elem::Named(f);
         }
         if self.get_production(ast, node) == Some(Prod::FieldKV) {
             // '[' exp ']' '=' exp：键在 1、值在 4
-            let key = self.child_type(ast.get_node(node).children[1]);
-            let val = self.pass_through(ast, node, 4);
+            let key = self.child_type(ctx, ast.get_node(node).children[1]);
+            let val = self.pass_through(ctx, ast, node, 4);
             return if key == TypeId::NUMBER {
                 Elem::Positional(val)
             } else {
                 Elem::Dynamic { key, val }
             };
         }
-        Elem::Positional(self.child_type(node))
+        Elem::Positional(self.child_type(ctx, node))
     }
 
     /// 列表的一项 -> record 字段。返回 None **只**表示「这不是一个具名字段」（动态键，
@@ -166,13 +172,14 @@ impl TypeLinter {
     /// match 没有死分支，也不会让类型位放进本该被文法拦掉的形式
     pub(super) fn collect_field(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node: usize,
     ) -> Option<Field> {
         match self.get_production(ast, node) {
             // NAME '=' exp：类型从 exp 推（@FieldNamed 已经把 children[2] 透上来了）
             Some(Prod::FieldNamed) => {
-                let ty = self.child_type(node);
+                let ty = self.child_type(ctx, node);
                 let n = self.name_or_panic(ast, ast.get_node(node).children[0], "field name");
                 let name = self.session.names.intern(n);
                 // default 说的是**声明**有没有默认值，字面量里没这个概念。必须填 false：
@@ -184,7 +191,7 @@ impl TypeLinter {
                     default: false,
                 })
             }
-            Some(Prod::FieldDecl) => Some(self.collect_field_decl(ast, node)),
+            Some(Prod::FieldDecl) => Some(self.collect_field_decl(ctx, ast, node)),
             Some(Prod::FieldKV) => {
                 // '[' exp ']' '=' exp：键在 children[1]、值在 children[4]
                 let key_node = ast.get_node(node).children[1];
@@ -194,7 +201,7 @@ impl TypeLinter {
                         name: self.session.names.intern(&string_literal(s)),
                         // 字段类型取**值**。取键节点的类型是错的 —— 字面量 string 键
                         // 的类型恒为 string，`{["a"] = 5}` 会推成 `a: string`
-                        ty: self.pass_through(ast, node, 4),
+                        ty: self.pass_through(ctx, ast, node, 4),
                         default: false,
                     }),
                     //动态字段：键不是字面量（`[k] = v`），没有静态名字就成不了具名
@@ -209,7 +216,7 @@ impl TypeLinter {
                 // 取 @MethodDef 自己的类型而不是 methodsig 那一格：不标 `->` 时
                 // 返回类型要拿体里的 return 推，而体比 methodsig 晚才跑完 ——
                 // `resolve_method_def` 就是在这个节点上把推出来的返回列表装回签名的
-                let ty = self.child_type(node);
+                let ty = self.child_type(ctx, node);
                 Some(Field {
                     name,
                     ty,
@@ -244,6 +251,7 @@ impl TypeLinter {
     /// '{' classfieldlist '}' 的字段收集已并入 resolve_fields，这里只管单条 @FieldDecl
     pub(super) fn collect_field_decl(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
     ) -> Field {
@@ -253,7 +261,7 @@ impl TypeLinter {
         let name = self.name_or_panic(ast, children[0], "field name");
         let name = self.session.names.intern(name);
         let (_, default) = self.field_decl_shape(ast, node_index);
-        let ty = self.child_type(children[2]);
+        let ty = self.child_type(ctx, children[2]);
         Field { name, ty, default }
     }
 
@@ -278,8 +286,12 @@ impl TypeLinter {
 
     /// 名字 -> 它命名的那个 class（DeclId + 无实参的 Ref）。typedef / 标量 /
     /// 内建容器（array、table 没有值侧的那张表）/ 查不到，一律 None
-    pub(super) fn class_ref_by_name(&mut self, name: &str) -> Option<(DeclId, TypeId)> {
-        match self.lookup_type(name) {
+    pub(super) fn class_ref_by_name(
+        &mut self,
+        ctx: &Context,
+        name: &str,
+    ) -> Option<(DeclId, TypeId)> {
+        match self.lookup_type(ctx, name) {
             Some(TypeRef::Decl(decl))
                 if !decl.is_builtin_container()
                     && self.session.decls.get(decl).kind() == DeclKind::Class =>
@@ -298,6 +310,7 @@ impl TypeLinter {
     /// 局部变量遮蔽类名和它遮蔽全局是同一回事
     pub(super) fn bare_class_ref(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node: usize,
     ) -> Option<(DeclId, TypeId)> {
@@ -305,17 +318,17 @@ impl TypeLinter {
             return None;
         }
         let name = self.get_child_name(ast, node, 0)?;
-        if self.lookup_variable(name).is_some() {
+        if self.lookup_variable(ctx, name).is_some() {
             return None;
         }
-        self.class_ref_by_name(name)
+        self.class_ref_by_name(ctx, name)
     }
 
     /// 这条 class 声明是不是本模块自己写的。import 进来的类名只有类型：
     /// 对面那条 class 语句在别的文件里执行，本文件压根没那张表可以构造
-    pub(super) fn class_is_local(&self, decl: DeclId) -> bool {
+    pub(super) fn class_is_local(&self, ctx: &Context, decl: DeclId) -> bool {
         let name = self.session.decls.get(decl).name();
-        self.session.lookup_module_type(self.current_module, name) == Some(decl)
+        self.session.lookup_module_type(ctx.current_module, name) == Some(decl)
     }
 
     /// Ref 上那个 class 的名字，只进诊断文案
@@ -335,20 +348,21 @@ impl TypeLinter {
     /// 两条路靠 callee 分：裸类名 ⇒ 构造，其余一律当函数调
     pub(super) fn resolve_call(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let children = ast.get_node(node_index).children.clone();
-        if let Some((decl, class)) = self.bare_class_ref(ast, children[0]) {
-            return self.check_construction(ast, node_index, decl, class, log);
+        if let Some((decl, class)) = self.bare_class_ref(ctx, ast, children[0]) {
+            return self.check_construction(ctx, ast, node_index, decl, class, diags);
         }
-        let f = self.child_type(children[0]);
-        let (args, spread) = self.call_args(ast, children[1]);
+        let f = self.child_type(ctx, children[0]);
+        let (args, spread) = self.call_args(ctx, ast, children[1]);
         let span = ast.span_of(node_index);
         // 推断得在核对之前：形参表里还挂着 `T` 的时候逐位比类型只会报假错
-        let f = self.infer_call_generics(f, &args, span, log);
-        self.check_call_shape(f, &args, spread, span, log);
+        let f = self.infer_call_generics(f, &args, span, diags);
+        self.check_call_shape(f, &args, spread, span, diags);
         self.ret_of(f)
     }
 
@@ -359,6 +373,7 @@ impl TypeLinter {
     /// 全都摊进实参表，Pack 带 vararg 时摊出几个算不出来，那一位就置上 spread
     pub(super) fn call_args(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         args: usize,
     ) -> (Vec<(Span, TypeId)>, bool) {
@@ -366,13 +381,13 @@ impl TypeLinter {
             Some(Prod::ArgsEmpty) => return (Vec::new(), false),
             Some(Prod::Args) => ast.get_node(args).children[1],
             // `f{…}` / `f"…"`：一个实参，就是这个节点自己
-            _ => return (vec![(ast.span_of(args), self.child_type(args))], false),
+            _ => return (vec![(ast.span_of(args), self.child_type(ctx, args))], false),
         };
         let nodes = self.spine(ast, list);
         let mut out = Vec::new();
         let mut spread = false;
         for (i, &node) in nodes.iter().enumerate() {
-            let ty = self.child_type(node);
+            let ty = self.child_type(ctx, node);
             let at = ast.span_of(node);
             // 非末位一律截成一个值；末位才摊
             if i + 1 < nodes.len() {
@@ -401,7 +416,7 @@ impl TypeLinter {
         callee: TypeId,
         args: &[(Span, TypeId)],
         span: Span,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let Types::Func {
             generics, params, ..
@@ -441,7 +456,7 @@ impl TypeLinter {
             return callee;
         }
         // 上界照样管推出来的实参：`<T : number>` 传了 string，错在调用点
-        self.check_generic_bounds(&ps, &tys, span, log);
+        self.check_generic_bounds(&ps, &tys, span, diags);
         let s = self.session.type_arenas.intern_subst(&ps, &tys);
         self.session.type_arenas.subst(callee, s)
     }
@@ -539,14 +554,14 @@ impl TypeLinter {
         args: &[(Span, TypeId)],
         spread: bool,
         span: Span,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         let Types::Func { params, .. } = self.session.type_arenas.get_type(callee) else {
             if matches!(
                 callee,
                 TypeId::NIL | TypeId::NUMBER | TypeId::BOOLEAN | TypeId::STRING
             ) {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span,
                     msg: format!("不能调用 {} 类型的值", self.session.show(callee)),
                 });
@@ -554,7 +569,7 @@ impl TypeLinter {
             return;
         };
         let params = self.session.type_arenas.list(params).clone();
-        self.check_positional(args, &params, spread, span, "实参", log);
+        self.check_positional(args, &params, spread, span, "实参", diags);
     }
 
     /// 一串值逐位塞进一串位子。实参和 return 值共用 —— 形参表和返回列表
@@ -571,13 +586,13 @@ impl TypeLinter {
         spread: bool,
         span: Span,
         kind: &str,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         for (i, &(at, g)) in got.iter().enumerate() {
             let Some(w) = want.fixed.get(i).copied().or(want.vararg) else {
                 break;
             };
-            self.expect_assignable(g, w, at, &format!("第 {} 个{kind}", i + 1), log);
+            self.expect_assignable(g, w, at, &format!("第 {} 个{kind}", i + 1), diags);
         }
         if spread {
             return;
@@ -589,7 +604,7 @@ impl TypeLinter {
             .skip(got.len())
             .any(|&w| !self.param_takes_nil(w));
         if (got.len() > wanted && want.vararg.is_none()) || missing_needs_value {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("{kind}个数不对：要 {wanted} 个，给了 {} 个", got.len()),
             });
@@ -618,16 +633,17 @@ impl TypeLinter {
     /// 回 UNKNOWN 只会让后续每一处用它的地方再堆一堆假错
     pub(super) fn check_construction(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         call: usize,
         decl: DeclId,
         class: TypeId,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let span = ast.span_of(call);
         let cname = self.class_name(class);
-        if !self.class_is_local(decl) {
-            log.push(Logger {
+        if !self.class_is_local(ctx, decl) {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("{cname} 是 import 来的类，只有类型没有值，不能用它构造"),
             });
@@ -640,7 +656,7 @@ impl TypeLinter {
             Some(Prod::Table) => Some(ast.get_node(arg).children[1]),
             // `A(…)` / `A"…"`：类名不是函数，只有表形式算构造
             _ => {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span,
                     msg: format!("class {cname} 只能用 {cname}{{…}} 构造"),
                 });
@@ -651,8 +667,8 @@ impl TypeLinter {
         let mut given: Vec<NameId> = Vec::new();
         for item in list.map(|l| self.spine(ast, l)).unwrap_or_default() {
             let item_span = ast.span_of(item);
-            let Elem::Named(f) = self.classify_field(ast, item) else {
-                log.push(Logger {
+            let Elem::Named(f) = self.classify_field(ctx, ast, item) else {
+                diags.push(Diagnostic {
                     span: item_span,
                     msg: format!("构造 {cname} 只能用 字段名 = 值，位置元素和动态键都给不出字段名"),
                 });
@@ -661,17 +677,17 @@ impl TypeLinter {
             given.push(f.name);
             let shown = self.session.names.resolve(f.name).to_string();
             match fields.iter().find(|e| e.name == f.name).copied() {
-                None => log.push(Logger {
+                None => diags.push(Diagnostic {
                     span: item_span,
                     msg: format!("{shown} 不是 {cname} 的字段"),
                 }),
-                Some(hit) if hit.method => log.push(Logger {
+                Some(hit) if hit.method => diags.push(Diagnostic {
                     span: item_span,
                     msg: format!("{shown} 是方法，方法只能在类体里定义，不能在构造里给"),
                 }),
                 Some(hit) => {
                     if !self.session.assignable(f.ty, hit.ty) {
-                        log.push(Logger {
+                        diags.push(Diagnostic {
                             span: item_span,
                             msg: format!(
                                 "不能把 {} 赋给字段 {shown} 标注的 {} 位",
@@ -689,7 +705,7 @@ impl TypeLinter {
                 continue;
             }
             let shown = self.session.names.resolve(hit.name).to_string();
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("构造 {cname} 缺少字段 {shown}：它没有默认值"),
             });

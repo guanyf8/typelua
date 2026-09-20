@@ -15,29 +15,31 @@ impl TypeLinter {
     /// 能把「查 type_names」和「查 variables」分开
     pub(super) fn resolve_type_name(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let name = self.name_or_panic(ast, ast.get_node(node_index).children[0], "type name");
         let span = ast.span_of(node_index);
-        self.instantiate_type_name(name, ListId::EMPTY, span, log)
+        self.instantiate_type_name(ctx, name, ListId::EMPTY, span, diags)
     }
 
     /// NAME '<' typeargs '>'
     pub(super) fn resolve_generic_type(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let children = ast.get_node(node_index).children.clone();
         let name = self.name_or_panic(ast, children[0], "generic type");
         // 单实参折叠成裸类型、多实参是 Pack，as_list 都能收成 ListId
-        let arg_ty = self.child_type(children[2]);
+        let arg_ty = self.child_type(ctx, children[2]);
         let args = self.session.type_arenas.as_list(arg_ty);
         let span = ast.span_of(node_index);
-        self.instantiate_type_name(name, args, span, log)
+        self.instantiate_type_name(ctx, name, args, span, diags)
     }
 
     /// 名义类型名 -> TypeId。`@TypeName`（不带实参，args 是 EMPTY）和
@@ -49,14 +51,15 @@ impl TypeLinter {
     /// 变成编译器崩溃。名字取不到才 panic —— 那是文法保证的不变式
     pub(super) fn instantiate_type_name(
         &mut self,
+        ctx: &Context,
         name: &str,
         args: ListId,
         span: Span,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let na = self.session.type_arenas.list(args).len();
-        let Some(found) = self.lookup_type(name) else {
-            log.push(Logger {
+        let Some(found) = self.lookup_type(ctx, name) else {
+            diags.push(Diagnostic {
                 span,
                 msg: format!("未声明的类型 {}", name),
             });
@@ -65,7 +68,7 @@ impl TypeLinter {
         match found {
             // 标量和泛型形参都不接受实参：`number<string>` / `T<number>`
             TypeRef::Prim(_) | TypeRef::Generic(_) if na != 0 => {
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span,
                     msg: format!("{} 不是 class 或 typedef，不能带类型实参", name),
                 });
@@ -79,7 +82,7 @@ impl TypeLinter {
             TypeRef::Decl(decl) => {
                 let ng = self.session.decls.get(decl).generics.len();
                 if ng != na {
-                    log.push(Logger {
+                    diags.push(Diagnostic {
                         span,
                         msg: format!("{} 需要 {} 个类型实参，实际给了 {}", name, ng, na),
                     });
@@ -89,7 +92,7 @@ impl TypeLinter {
                 // 上界本身不进类型值：它只是实例化处的一道门槛，Ref 里存的仍是实参
                 let gids = self.session.decls.get(decl).generics.clone();
                 let argtys = self.session.type_arenas.list(args).fixed.clone();
-                self.check_generic_bounds(&gids, &argtys, span, log);
+                self.check_generic_bounds(&gids, &argtys, span, diags);
                 self.session.type_arenas.reference(decl, args)
             }
         }
@@ -104,7 +107,7 @@ impl TypeLinter {
         gids: &[GenericId],
         args: &[TypeId],
         span: Span,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) {
         for (&g, &arg) in gids.iter().zip(args) {
             let Some(bound) = self.session.decls.generic(g).constraint else {
@@ -112,7 +115,7 @@ impl TypeLinter {
             };
             if !self.session.assignable(arg, bound) {
                 let param = self.session.decls.generic(g).name();
-                log.push(Logger {
+                diags.push(Diagnostic {
                     span,
                     msg: format!(
                         "类型实参 {} 越过了形参 {} 的上界 {}",
@@ -137,14 +140,15 @@ impl TypeLinter {
     /// 也校得动。节点本身没类型可给（形参位是个名字，不是个类型表达式）
     pub(super) fn resolve_type_param_bound(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         if let Some(name) = self.get_child_name(ast, node_index, 0) {
             // 上界自己就是个类型，它得先被求出来（写错的名字由 resolve_type_name 报）
-            let bound = self.pass_through(ast, node_index, 2);
-            if let Some(TypeRef::Generic(g)) = self.lookup_type(name) {
+            let bound = self.pass_through(ctx, ast, node_index, 2);
+            if let Some(TypeRef::Generic(g)) = self.lookup_type(ctx, name) {
                 self.session.decls.generic_mut(g).constraint = Some(bound);
             }
         }
@@ -162,19 +166,23 @@ impl TypeLinter {
     /// 自然报「不是泛型函数」。结果就是代入后的 Func，外层 @Call 照常 ret_of
     pub(super) fn resolve_turbo_fish(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        log: &mut Vec<Logger>,
+        diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let children = &ast.get_node(node_index).children;
-        let (callee, args_ty) = (self.child_type(children[0]), self.child_type(children[2]));
+        let (callee, args_ty) = (
+            self.child_type(ctx, children[0]),
+            self.child_type(ctx, children[2]),
+        );
         let span = ast.span_of(node_index);
         // 前面已经错过了（未声明的名字之类）：不再堆一层假错
         if callee == TypeId::UNKNOWN {
             return TypeId::UNKNOWN;
         }
         let Types::Func { generics, .. } = self.session.type_arenas.get_type(callee) else {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!(
                     "{} 不是函数，不能用 ::<> 给类型实参",
@@ -198,14 +206,14 @@ impl TypeLinter {
         let args = self.session.type_arenas.as_list(args_ty);
         let argtys = self.session.type_arenas.list(args).fixed.clone();
         if gids.is_empty() {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: "这个函数没有泛型形参，不能给类型实参".to_string(),
             });
             return TypeId::UNKNOWN;
         }
         if gids.len() != argtys.len() {
-            log.push(Logger {
+            diags.push(Diagnostic {
                 span,
                 msg: format!(
                     "这个函数需要 {} 个类型实参，实际给了 {}",
@@ -215,7 +223,7 @@ impl TypeLinter {
             });
             return TypeId::UNKNOWN;
         }
-        self.check_generic_bounds(&gids, &argtys, span, log);
+        self.check_generic_bounds(&gids, &argtys, span, diags);
         let s = self.session.type_arenas.intern_subst(&gids, &argtys);
         self.session.type_arenas.subst(callee, s)
     }
@@ -239,6 +247,7 @@ impl TypeLinter {
     /// register_value 登记成 UNKNOWN，跳不掉，末尾那个 `')'` 反把 params 冲成 [unknown]
     pub(super) fn func_sig_type(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
     ) -> TypeId {
@@ -252,20 +261,20 @@ impl TypeLinter {
             NodeSyntax::Token(Token::OPERATOR(OpType::SIMPLE(')')))
         );
         if !is_close {
-            let ty = self.child_type(after_paren);
+            let ty = self.child_type(ctx, after_paren);
             params = self.session.type_arenas.as_list(ty);
         }
-        match self.declared_ret(ast, node_index) {
+        match self.declared_ret(ctx, ast, node_index) {
             Some(ty) => ret = self.session.type_arenas.as_list(ty),
             // 没写 `->`：拿体里的 return 推。funcbody 才有体—— functype /
             // methodsig 对不上帧，`inferred_ret` 会给空列表（即 void），
             // 方法那一路由 `resolve_method_def` 在体跑完之后装回去
-            None => ret = self.inferred_ret(node_index),
+            None => ret = self.inferred_ret(ctx, node_index),
         }
         // 只有 funcbody 那一条的 children[0] 是 generics（functype 那格是 FUNCTION、
         // methodsig 是 NAME），generic_list_of 认 @Generics 标签，不是就算空，
         // 所以三条产生式仍能共用这一句
-        let generics = self.generic_list_of(ast, children[0]);
+        let generics = self.generic_list_of(ctx, ast, children[0]);
         self.session.type_arenas.func(generics, params, ret)
     }
 
@@ -278,6 +287,7 @@ impl TypeLinter {
     /// funcbody、没挂过函数级泛型）：那趟只借类型中转，主遍历会重算
     pub(super) fn generic_list_of(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         generics_node: usize,
     ) -> ListId {
@@ -287,7 +297,7 @@ impl TypeLinter {
         }
         let mut tys = Vec::with_capacity(names.len());
         for (nm, _) in names {
-            if let Some(TypeRef::Generic(g)) = self.lookup_type(nm) {
+            if let Some(TypeRef::Generic(g)) = self.lookup_type(ctx, nm) {
                 tys.push(self.session.type_arenas.generic(g));
             }
         }
@@ -297,21 +307,23 @@ impl TypeLinter {
     /// `functiondef : FUNCTION funcbody` —— 函数表达式的值就是函数体的类型
     pub(super) fn resolve_func_expr(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
     ) -> TypeId {
-        self.pass_through(ast, node_index, 1)
+        self.pass_through(ctx, ast, node_index, 1)
     }
 
     /// uniontype : uniontype '|' basictype —— union() 自带扁平化/排序/去重，
     /// 左边是不是 Union 都无所谓，收齐两侧类型丢进去即可
     pub(super) fn resolve_union(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
     ) -> TypeId {
-        let left = self.pass_through(ast, node_index, 0);
-        let right = self.pass_through(ast, node_index, 2);
+        let left = self.pass_through(ctx, ast, node_index, 0);
+        let right = self.pass_through(ctx, ast, node_index, 2);
         self.session.type_arenas.union(vec![left, right])
     }
 
@@ -320,11 +332,12 @@ impl TypeLinter {
     /// 等 assignable / 声明处用 intersection_conflict 去查
     pub(super) fn resolve_intersect(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
     ) -> TypeId {
-        let left = self.pass_through(ast, node_index, 0);
-        let right = self.pass_through(ast, node_index, 2);
+        let left = self.pass_through(ctx, ast, node_index, 0);
+        let right = self.pass_through(ctx, ast, node_index, 2);
         self.session.type_arenas.intersect(vec![left, right])
     }
 
@@ -341,9 +354,10 @@ impl TypeLinter {
     /// 时两者都是恒等变换，不必分叉
     pub(super) fn resolve_list(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
-        _log: &mut Vec<Logger>,
+        _diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         // `stat_list stat` 是十一条 @ListTail 里唯一没有分隔符的（len == 2）：串的是
         // 语句、不产出类型，形状本身就分得开，不用为它单开一个标签
@@ -361,11 +375,11 @@ impl TypeLinter {
         };
         let mut fixed = Vec::with_capacity(items.len());
         for &item in head {
-            let ty = self.child_type(item);
+            let ty = self.child_type(ctx, item);
             fixed.push(self.truncate_ret(ty));
         }
         let mut vararg = None;
-        let last = self.child_type(tail);
+        let last = self.child_type(ctx, tail);
         match self.session.type_arenas.get_type(last) {
             // 末位的多值原样铺开：定长接到后面，vararg 继续当 vararg
             Types::Pack(l) => {
@@ -380,24 +394,39 @@ impl TypeLinter {
 
     /// `typelist ',' type` —— 末位类型追加到定长部分。multilist 不左递归，
     /// 所以它自己一层就够，不必走 resolve_list 那套脊顶收集
-    pub(super) fn pack_fixed(&mut self, ast: &Tree<NodeSyntax<'_>>, node_index: usize) -> TypeId {
-        let mut fixed = self.fixed_of(ast, node_index);
-        fixed.push(self.pass_through(ast, node_index, 2));
+    pub(super) fn pack_fixed(
+        &mut self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node_index: usize,
+    ) -> TypeId {
+        let mut fixed = self.fixed_of(ctx, ast, node_index);
+        fixed.push(self.pass_through(ctx, ast, node_index, 2));
         self.session.type_arenas.pack(fixed, None)
     }
 
     /// `list ',' vararg` —— 末位是变长，进 vararg 槽。
     /// vararg 非 None，pack_of 的「长度 1 就折叠」不会触发，Pack 保得住
-    pub(super) fn pack_vararg(&mut self, ast: &Tree<NodeSyntax<'_>>, node_index: usize) -> TypeId {
-        let fixed = self.fixed_of(ast, node_index);
-        let elem = self.vararg_elem(ast, node_index, 2);
+    pub(super) fn pack_vararg(
+        &mut self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node_index: usize,
+    ) -> TypeId {
+        let fixed = self.fixed_of(ctx, ast, node_index);
+        let elem = self.vararg_elem(ctx, ast, node_index, 2);
         self.session.type_arenas.pack(fixed, Some(elem))
     }
 
     /// `'...' type` —— 一格 vararg 自己就是一张「零个定长 + 变长」的列表。
     /// 折成裸类型不行：`-> (...number)` 那样单独成表时会被看成一个定长返回值
-    pub(super) fn vararg_pack(&mut self, ast: &Tree<NodeSyntax<'_>>, node_index: usize) -> TypeId {
-        let elem = self.pass_through(ast, node_index, 1);
+    pub(super) fn vararg_pack(
+        &mut self,
+        ctx: &Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        node_index: usize,
+    ) -> TypeId {
+        let elem = self.pass_through(ctx, ast, node_index, 1);
         self.session.type_arenas.pack(vec![], Some(elem))
     }
 
@@ -405,11 +434,12 @@ impl TypeLinter {
     /// 折叠后的 token，两者产出的都是只有 vararg 槽的 Pack，这里把元素取回来
     pub(super) fn vararg_elem(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
         i: usize,
     ) -> TypeId {
-        let ty = self.pass_through(ast, node_index, i);
+        let ty = self.pass_through(ctx, ast, node_index, i);
         match self.session.type_arenas.get_type(ty) {
             Types::Pack(l) => self
                 .session
@@ -425,10 +455,11 @@ impl TypeLinter {
     /// clone 是必须的：list() 借着 session，而 pack() 要 &mut
     pub(super) fn fixed_of(
         &mut self,
+        ctx: &Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
     ) -> Vec<TypeId> {
-        let head = self.pass_through(ast, node_index, 0);
+        let head = self.pass_through(ctx, ast, node_index, 0);
         let l = self.session.type_arenas.as_list(head);
         self.session.type_arenas.list(l).fixed.clone()
     }

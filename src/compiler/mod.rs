@@ -1,3 +1,3 @@
-mod emitter;
-mod linter;
+pub mod emitter;
+pub mod linter;
 mod utils;
