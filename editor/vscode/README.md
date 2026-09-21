@@ -40,6 +40,31 @@ and jumps update after you save.
 
 Command: **TypeLua: Re-analyze workspace** (`typelua.reanalyze`).
 
+## Project configuration (`typelua.json`)
+
+You can control which directories the extension analyzes and compiles by
+creating `.vscode/typelua.json` at the root of your workspace:
+
+```json
+{
+  "search_path": ["./src", "./examples"]
+}
+```
+
+- `search_path` is an array of paths **relative to the workspace folder**.
+- If the file is missing, empty, or does not contain `search_path`, the
+  extension falls back to analyzing the entire workspace folder.
+- The paths are passed to `typelua plugin` and `typelua compile` as the search
+  roots.
+
+For example, to analyze only the `examples` directory:
+
+```json
+{
+  "search_path": ["./examples"]
+}
+```
+
 ## The bundled binary
 
 A release build of `typelua` ships under `bin/`. If it does not match your
