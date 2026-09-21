@@ -430,6 +430,26 @@ fn render_plugin_json(
                 ));
             }
         }
+        out.push_str("],");
+
+        // completions：highlight_linter 收集的补全候选（名字 + 种类），编辑器拿去
+        // 做 Tab 代码提示。补全只从 highlight 来、诊断只从 type 来，但都走同一份
+        // output_project，这里照旧按来源合并
+        out.push_str("\"completions\":[");
+        let mut first = true;
+        for output in outputs {
+            for completion in &output.completions {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&format!(
+                    "{{\"label\":\"{}\",\"kind\":\"{}\"}}",
+                    json_escape(&completion.label),
+                    completion.kind.as_str()
+                ));
+            }
+        }
         out.push_str("]}");
     }
     out.push_str("\n]");

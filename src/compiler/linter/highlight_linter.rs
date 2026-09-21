@@ -26,7 +26,7 @@ use std::collections::HashMap;
 /// 语义 token 的种类。对齐 LSP 的 semantic token 常见枚举，编辑器那侧照名字
 /// 建 legend 即可。标点 / 结构符不产出（编辑器用 TextMate 兜），语义高亮只管
 /// 关键字、字面量、注释，以及按角色分好类的标识符
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TokenKind {
     Keyword,
     String,
@@ -79,10 +79,20 @@ pub struct DefLink {
     pub target: Span,
 }
 
+/// 一条补全候选：名字 + 种类。编辑器拿去做 Tab 代码提示，`kind` 只用来选图标
+/// （映射到 LSP 的 CompletionItemKind）。位置无关 —— 整份文件的可见符号铺平给
+/// 编辑器，光标处过滤交给 VSCode 自己
+#[derive(Debug)]
+pub struct Completion {
+    pub label: String,
+    pub kind: TokenKind,
+}
+
 /// 单个文件分析完的内部产物，最终并入公共的 `LinterOutput`。
 struct HighlightAnalysis {
     tokens: Vec<SemToken>,
     links: Vec<DefLink>,
+    completions: Vec<Completion>,
 }
 
 // ================== 工程级入口 ==================
@@ -153,6 +163,7 @@ impl HighlightLinter {
             var_scopes: vec![HashMap::new()],
             type_scopes: vec![HashMap::new()],
             current_import: None,
+            completions: std::collections::HashSet::new(),
         };
 
         // 注释先铺上，顺序无所谓 —— 消费端自己按位置排
@@ -169,9 +180,20 @@ impl HighlightLinter {
             walk(&mut a, &mut (), ast, root, &mut diags);
         }
 
+        // 去重后 HashSet 顺序不稳，排一下让输出可复现（消费端也好做增量对比）
+        let mut completions: Vec<Completion> = a
+            .completions
+            .into_iter()
+            .map(|(label, kind)| Completion { label, kind })
+            .collect();
+        completions.sort_by(|x, y| {
+            x.label.cmp(&y.label).then(x.kind.as_str().cmp(y.kind.as_str()))
+        });
+
         HighlightAnalysis {
             tokens: a.tokens,
             links: a.links,
+            completions,
         }
     }
 }
@@ -203,6 +225,7 @@ impl Linter for HighlightLinter {
             diagnostics: Vec::new(),
             tokens: analysis.tokens,
             links: analysis.links,
+            completions: analysis.completions,
         }
     }
 }
@@ -224,6 +247,9 @@ struct Analysis<'e> {
     /// 正在处理的 import 语句的目标模块名（`in "mod"` 那个）。进 @Import 置上、
     /// 出 @Import 清掉，中间的 importitem 靠它连回导出索引
     current_import: Option<String>,
+    /// 补全候选：(名字, 种类) 去重收集。只收「能写进代码」的符号（变量/形参/
+    /// 函数/方法/属性/类型），关键字与字面量不进 —— 那些不该由补全来提示
+    completions: std::collections::HashSet<(String, TokenKind)>,
 }
 
 impl<'e> Analysis<'e> {
@@ -265,6 +291,7 @@ impl<'e> Analysis<'e> {
     }
 
     fn declare_var(&mut self, name: &str, sym: VarSym) {
+        self.note(name, sym.kind);
         self.var_scopes
             .last_mut()
             .unwrap()
@@ -272,10 +299,28 @@ impl<'e> Analysis<'e> {
     }
 
     fn declare_type(&mut self, name: &str, target: Target) {
+        self.note(name, TokenKind::Type);
         self.type_scopes
             .last_mut()
             .unwrap()
             .insert(name.to_string(), target);
+    }
+
+    /// 收一个补全候选。只留能写进代码的符号种类，关键字/字面量/注释/label 略过
+    /// —— 那些不是补全该提示的东西
+    fn note(&mut self, name: &str, kind: TokenKind) {
+        if matches!(
+            kind,
+            TokenKind::Type
+                | TokenKind::TypeParameter
+                | TokenKind::Function
+                | TokenKind::Method
+                | TokenKind::Property
+                | TokenKind::Parameter
+                | TokenKind::Variable
+        ) {
+            self.completions.insert((name.to_string(), kind));
+        }
     }
 
     /// 预扫：把顶层 class/typedef（类型名）与顶层函数 / extern（变量名）灌进最外层
@@ -379,6 +424,7 @@ impl<'e> Analysis<'e> {
                 } else if let Some(name) = get_name(ast, nn) {
                     let span = self.emit_node(ast, nn, TokenKind::Function);
                     // `function f` 是全局赋值，登记进最外层，全文件可见
+                    self.note(name, TokenKind::Function);
                     self.var_scopes[0].insert(
                         name.to_string(),
                         VarSym {
@@ -481,6 +527,7 @@ impl<'e> Analysis<'e> {
         self.emit(span, TokenKind::Variable);
         // 没声明过的写位：第一次赋值就当它的定义点，后面的引用连到这儿
         if is_write(ast, ref_node) {
+            self.note(name, TokenKind::Variable);
             self.var_scopes[0].insert(
                 name.to_string(),
                 VarSym {
@@ -517,6 +564,10 @@ impl<'e> Analysis<'e> {
     ) {
         if let Some(nn) = children.get(i).copied() {
             self.emit_node(ast, nn, kind);
+            // 字段/方法/属性名没有身份可查，但作为「见过的名字」照样是有用的补全
+            if let Some(name) = get_name(ast, nn) {
+                self.note(name, kind);
+            }
         }
     }
 

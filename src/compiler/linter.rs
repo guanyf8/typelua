@@ -6,7 +6,7 @@ use crate::lexer::type_def::Span;
 use crate::parser::ast::*;
 use crate::parser::parser::*;
 #[allow(unused_imports)]
-pub use highlight_linter::{DefLink, SemToken, TokenKind};
+pub use highlight_linter::{Completion, DefLink, SemToken, TokenKind};
 
 /// 一个 linter 对一个文件的统一产物。诊断、高亮与跳转都从这里出来；不产某类
 /// 数据的 linter 留空即可，调用方无需再知道具体实现。
@@ -16,6 +16,7 @@ pub struct LinterOutput {
     pub diagnostics: Vec<Diagnostic>,
     pub tokens: Vec<SemToken>,
     pub links: Vec<DefLink>,
+    pub completions: Vec<Completion>,
 }
 
 impl LinterOutput {
@@ -25,6 +26,7 @@ impl LinterOutput {
             diagnostics: Vec::new(),
             tokens: Vec::new(),
             links: Vec::new(),
+            completions: Vec::new(),
         }
     }
 }
@@ -154,7 +156,9 @@ mod tests {
             vec!["Highlight", "Type"]
         );
         assert!(!outputs[0].tokens.is_empty());
+        assert!(!outputs[0].completions.is_empty());
         assert!(outputs[0].diagnostics.is_empty());
         assert!(outputs[1].tokens.is_empty());
+        assert!(outputs[1].completions.is_empty());
     }
 }

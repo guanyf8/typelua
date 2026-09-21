@@ -8,6 +8,7 @@
 //   - DocumentSemanticTokensProvider  (tokens[]      -> colored identifiers)
 //   - DefinitionProvider              (links[]       -> go to definition)
 //   - DiagnosticCollection            (diagnostics[] -> editor squiggles)
+//   - CompletionItemProvider          (completions[] -> Tab code hints)
 //
 // The CLI reports byte offsets (UTF-8). VSCode positions are UTF-16. All the
 // fiddly work here is converting between the two against the live document text.
@@ -38,7 +39,7 @@ const LEGEND = new vscode.SemanticTokensLegend(TOKEN_TYPES, []);
 const TYPE_INDEX = new Map(TOKEN_TYPES.map((name, i) => [name, i]));
 
 // module state
-/** @type {Map<string, {tokens: any[], links: any[], diagnostics: any[]}>} keyed by resolved fs path */
+/** @type {Map<string, {tokens: any[], links: any[], diagnostics: any[], completions: any[]}>} keyed by resolved fs path */
 const cache = new Map();
 /** @type {Map<string, Set<string>>} workspace folder -> files returned by its last analysis */
 const analyzedFiles = new Map();
@@ -150,6 +151,7 @@ function analyzeFolder(binary, folderPath) {
             tokens: Array.isArray(fa.tokens) ? fa.tokens : [],
             links: Array.isArray(fa.links) ? fa.links : [],
             diagnostics,
+            completions: Array.isArray(fa.completions) ? fa.completions : [],
           });
           currentFiles.add(filePath);
           publishDiagnostics(filePath, diagnostics);
@@ -309,6 +311,26 @@ function diagnosticSeverity(severity) {
   }
 }
 
+// Map an analyzer TokenKind name to the CompletionItemKind that picks the icon.
+function completionKind(kind) {
+  switch (kind) {
+    case "type":
+      return vscode.CompletionItemKind.Class;
+    case "typeParameter":
+      return vscode.CompletionItemKind.TypeParameter;
+    case "function":
+      return vscode.CompletionItemKind.Function;
+    case "method":
+      return vscode.CompletionItemKind.Method;
+    case "property":
+      return vscode.CompletionItemKind.Field;
+    case "parameter":
+    case "variable":
+    default:
+      return vscode.CompletionItemKind.Variable;
+  }
+}
+
 function publishDiagnostics(filePath, entries) {
   if (!diagnosticCollection) return;
   const uri = vscode.Uri.file(filePath);
@@ -433,6 +455,26 @@ const definitionProvider = {
   },
 };
 
+// Flat identifier hints from the highlight linter's last analysis of the file.
+// No position awareness (no type info in the highlight linter) — VSCode filters
+// by the current prefix and accepts with Tab/Enter.
+const completionProvider = {
+  provideCompletionItems(document) {
+    const entry = cache.get(normPath(document.uri.fsPath));
+    if (!entry || !Array.isArray(entry.completions) || entry.completions.length === 0) {
+      return undefined;
+    }
+    const items = [];
+    for (const c of entry.completions) {
+      if (!c || typeof c.label !== "string" || !c.label.length) {
+        continue;
+      }
+      items.push(new vscode.CompletionItem(c.label, completionKind(c.kind)));
+    }
+    return items;
+  },
+};
+
 function activate(context) {
   output = vscode.window.createOutputChannel("TypeLua");
   diagnosticCollection = vscode.languages.createDiagnosticCollection("typelua");
@@ -443,7 +485,8 @@ function activate(context) {
   const selector = { language: "typelua", scheme: "file" };
   context.subscriptions.push(
     vscode.languages.registerDocumentSemanticTokensProvider(selector, semanticTokensProvider, LEGEND),
-    vscode.languages.registerDefinitionProvider(selector, definitionProvider)
+    vscode.languages.registerDefinitionProvider(selector, definitionProvider),
+    vscode.languages.registerCompletionItemProvider(selector, completionProvider)
   );
 
   // Refresh triggers: open + save (byte offsets always match on-disk bytes).
