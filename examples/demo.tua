@@ -1,0 +1,136 @@
+-- 这个文件是拿来看插件效果的：上半部分应当零波浪线，
+-- 下半部分每一处 ERROR 注释都应当有一条诊断。
+
+-- ========================= 高亮：注释不该染色 =========================
+-- 这行里的 if then end class typedef pub import 都在注释里，不该高亮
+--[==[ 长注释也一样：class A{} pub typedef import {X} in "y" ]==]
+
+D={
+    a=1,
+    b=2,
+}
+
+function f(x:number) -> number
+    return 1
+end
+
+-- ========================= 声明 =========================
+pub class Local {                                 -- pub 是导出修饰
+    id:number,
+    name:string = "anonymous",                      -- 有默认值
+    tags:array<string> = {},                        -- 每个实例一张新表
+    on_rename:function(string) -> () = function(s:string) end,
+                                                    -- 函数**变量**字段：和 string 一样的
+                                                    -- 普通字段，只能构造时给 / 整体赋值
+    greet(self, greeting:string) -> string          -- 有 self ⇒ 方法（必带函数体）
+        return greeting .. " " .. self.name
+    end,
+    rename(self, to:string) -> ()                   -- 类体外要重定义它，先得在这里声明
+        self.name = to
+    end,
+    make(id:number) -> Local                        -- 无 self ⇒ 静态方法
+        return Local{id = id}
+    end,
+}
+
+pub class Sub : Local {                              -- ':' 表示继承
+    level:number = 0,
+}
+
+pub typedef Handler = function(evt:string) -> ()    -- 纯类型，运行时零痕迹
+typedef a = {
+    a:number,
+    b: function(x:number) -> (string, number)
+}
+
+typedef Private = number                             -- 没有 pub ⇒ 只在本文件可见
+
+-- 表的形状一次定死：模块表一次写全成完整字面量
+local M = {
+    VERSION = "1.0",
+}
+
+
+
+-- ========================= 用起来 =========================
+local a = Local{id = 1}
+local sub = Sub{id = 2, name = "root"}              -- 继承来的字段照样能给
+local hello:string = a:greet("hi")
+local made = Local.make(3)                          -- 静态方法走点号
+local n:Private = 42
+
+local h:Handler = function(evt:string) end
+local raw = require("cjson")                        -- 推断为 any
+local json = raw as {encode:function(any) -> string}
+local text:string = json.encode(a)
+
+local hex = 0xFF3p-2                                -- 十六进制带指数
+local long = [[长字符串里的 end / class 都不该高亮]]
+
+function Local:rename(to:string) -> ()              -- 类体外**重定义**方法：
+    self.name = to                                  -- 名字得是类体里声明过的方法，
+end                                                 -- 签名也得对上（self 隐式补入）
+
+-- 泛型 + turbofish
+function map<T, U>(xs:array<T>, f:function(T) -> U) -> array<U>
+    local out:array<U> = {}
+    for i:number, v:T in ipairs(xs) do out[i] = f(v) end
+    return out
+end
+local lens = map::<string, number>({"a", "bb"}, string.len)
+
+-- nil 收窄
+local maybe:string|nil = os.getenv("HOME")
+if maybe ~= nil then
+    local len:number = #maybe                       -- 这里 maybe 是 string
+end
+
+-- ========================= 跨文件 =========================
+-- 真的跨文件：pkg/account.tua 靠 typelua.json 的 search_path 找到
+import {Account as RemoteAccount, Id as AccountId} in "pkg.account"
+import {Handler as EvtHandler} in "pkg.account"
+
+local accounts = require "pkg.account"              -- 值侧照旧走 Lua
+local remote:RemoteAccount = accounts.make(7)       -- 用工厂函数造实例
+                                                    -- （accounts 是 require 来的，值侧
+                                                    --   推断为 any；类型靠 import 搬）
+local remote_id:AccountId = remote.id
+local on_evt:EvtHandler = function(evt:string) end
+local hello2:string = remote:greet("hey")           -- 方法签名跨文件也检查
+
+-- ========================= 表的形状一次定死 =========================
+local Mod = {                                       -- 一次写全，形状就定下来
+    NAME = "demo",
+    helper = function(n:number) -> string
+        return tostring(n)
+    end,
+}
+local mn:string = Mod.NAME
+local mh:string = Mod.helper(1)
+
+-- ========================= 以下每条都该报错 =========================
+
+local e1:string = 1                                 -- ERROR 声明 string，初值 number
+local e2 = Local{}                                  -- ERROR id 无默认值，必须给
+local e3 = Local {id = 1, nope = 9}                  -- ERROR nope 不是 Local 的字段
+local e11 = Local {id = 1, greet = function() end}   -- ERROR greet 是方法，构造里不能给
+function Local:absent() -> () end                   -- ERROR 类体里没声明这个方法
+function Local:on_rename(s:string) -> () end        -- ERROR on_rename 是函数变量字段
+Local.greet = function() end                        -- ERROR Local 是类名而不是变量
+a.greet = function() end                            -- ERROR 方法不能赋值覆盖
+local e4:number = a:greet("hi")                     -- ERROR greet 返回 string
+local e5 = a:greet(123)                             -- ERROR 参数要 string
+local e6 = a.no_such_field                          -- ERROR 没有这个字段
+local e7 = RemoteAccount{id = 1}                    -- ERROR import 来的类只有类型没有值
+local e9:RemoteAccount = 1                          -- ERROR 类型是真的过来了，不是占位符
+import {Internal} in "pkg.account"                  -- ERROR Internal 没有 pub
+import {Nope} in "pkg.account"                      -- ERROR 模块里没有这个名字
+import {Account} in "pkg.absent"                    -- ERROR 找不到模块
+local e8:number = maybe                             -- ERROR 可能是 nil
+Mod.untyped = 1                                     -- ERROR 裸赋值不算声明，字段不存在
+local e10 = Mod.absent                              -- ERROR 没有这个字段
+
+pub class Dup { x:number }
+pub class Dup { y:number }                          -- ERROR 类型重复声明
+
+local function f() pub typedef Nested = number end  -- ERROR pub 只能贴在顶层

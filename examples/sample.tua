@@ -1,0 +1,112 @@
+-- ========================= Type declarations =========================
+typedef Id      = number                                -- 标量也能命名（这是选 typedef 而非 interface 的原因）
+typedef Handler = function(evt:string) -> ()            -- 函数类型
+typedef Result  = A|B|nil                               -- 联合类型
+typedef Config  = {host:string, port:number}            -- record
+typedef Node    = {value:number, next:Node|nil}         -- 允许递归
+typedef Pair<A, B> = {first:A, second:B}                -- 泛型
+typedef Bounded<T:number> = {v:T}                       -- 形参上界
+typedef Meta = {VERSION:number} & table<string, any>    -- 交类型：形状合并
+typedef Logger  = {                                     -- 描述外部已存在的表的形状
+    log:function(...string),                            -- 类型位只能写函数变量字段：
+    system_os:function() -> number,                     -- 「只给签名的方法」不存在
+    os:function() -> string,
+}
+
+-- ========================= Classes =========================
+-- 类成员分两种，**不互为糖**：
+--   `m(self) … end`      方法：必须带函数体，不参与 A{…} 构造，
+--                        只有它能被类体外的 function A:m / function A.m 重定义
+--   `m:function(…)`      函数变量字段：和 string / number 一样的普通字段，
+--                        没默认值就得在每处构造里给，只能整体赋值
+class A{
+    a:string = "hello",                                 -- 有默认值
+    b:boolean,                                          -- 无默认值 -> 每处初始化都必须给
+    c:number,
+    greet(self, msg:string) -> string                   -- 方法：有 self，类型自动是 A
+        return msg
+    end,
+    greet2(self, msg:string) -> number                  -- 方法必须带体
+        return #msg
+    end,
+    bye(self) -> string return "bye" end,
+    hello_again(self) -> (string, number) return "hello", 1 end,
+    make(n:number) -> A return A{b = true, c = n} end,      -- 无 self -> 静态方法
+    onclick:function(number) -> () = function(n:number) end, -- 函数变量字段（回调），
+}                                                       -- 给了默认值所以构造时可省
+
+class B : A{
+    d:number = 0                                        -- 继承 A 的字段和方法
+}
+
+-- 方法可以在类体外**重定义**（Lua 的 ':' 形式，self 隐式）。名字必须是类体里
+-- 已声明的方法，签名也得对上 —— 函数变量字段则完全不许用 function 去定义
+function A:greet(msg:string) -> string
+    return msg
+end
+
+local x = A{
+    b = true, 
+    c = 1
+}
+x:bye()                                                 -- 方法
+x.onclick(42)                                           -- 回调字段：点号调用，不传 self
+A.make(3)                                               -- 静态方法
+
+-- ========================= Typed locals & globals =========================
+local a:string = "hello"
+local w:string, m:number, k:number = "world", 1, 2     -- 一句声明多个，各带各的类型
+local guess = "hello"                                   -- 能推断的不必标注
+-- local a                                              -- 不允许：无初始化必须声明类型
+-- local a  local a                                     -- 不允许：同层不许重复声明（Lua 能遮蔽，TypeLua 拒）
+local p:{x:number, y:number} = {x = 1, y = 2}           -- 匿名 record
+local pr:Pair<string, number> = {first = "a", second = 1}
+local h:Handler = function(evt:string) end
+local E:Result                                          -- OK：Result 含 nil，无初值就是 nil
+
+-- 空表 {} 推不出形状，所以必须标注，且标注得是「能空着的类型」
+local xs:array<string> = {}                             -- 集合：元素后加
+local t:table<string, any> = {}                         -- 映射：键后加
+-- local m = {}                                         -- 不允许：{} 推不出形状
+-- local r:Config = {}                                  -- 不允许：host/port 是非空字段，没给
+-- local _mytype:Logger                                 -- 不允许：record 也不许只声明不赋值
+local _mytype = _G.logger as Logger                     -- C 层注册的：用 as 落地
+-- record 一旦定形就长不出新成员，要事后增删就拿集合交进来（见 Meta）
+local mod:Meta = {VERSION = 1}
+
+G_config:Config = {host = "127.0.0.1", port = 80}       -- 全局变量也能标注
+-- G_cache = {}                                         -- 不允许：全局裸赋值同一条规则
+G_cache:table<string, Config> = {}
+
+-- ========================= Functions =========================
+-- 具名局部函数，参数带类型、含函数类型参数（可写裸类型），单返回值
+local function f(a:string, b:number, c:function(string)) -> string
+    return "hahaha"
+end
+
+-- 匿名函数赋值给变量，函数类型参数带返回值，多返回值
+local g = function(a:string, c:function(string) -> boolean) -> (number, string)
+    return 1, "x"
+end
+
+function noop() -> () end                               -- 无返回值(void)
+function unpackall(t) -> (...any) return 1, 2, 3 end    -- 变长返回
+
+function map<T, U>(t:array<T>, fn:function(T) -> U) -> array<U>
+    local out:array<U> = {}
+    for i:number, v:T in ipairs(t) do out[i] = fn(v) end -- 循环变量也能标注
+    return out
+end
+local ys = map(xs, string.len)                          -- 推断 T=string, U=number
+local zs = map::<string, number>(xs, string.len)        -- 推不出来时用 turbofish 指定
+
+-- ========================= 多返回值 / 收窄 / 强转 =========================
+local s1:string, n1:number = x:hello_again()            -- 展开
+local s2 = (x:hello_again())                            -- 括号把它截断成 1 个值
+local ok = pcall(noop)                                  -- 收多了照常丢弃
+
+local s:string|nil = os.getenv("HOME")
+if s ~= nil then print(#s) end                          -- nil 收窄，这里 s:string
+
+local raw  = require("cjson")                           -- 推断为 any
+local json = raw as {encode:function(any) -> string}    -- 用 as 落地
