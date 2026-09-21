@@ -1,0 +1,111 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "TypeLua",
+  "scopeName": "source.typelua",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#constants" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.typelua",
+          "begin": "--\\[(=*)\\[",
+          "end": "\\]\\1\\]"
+        },
+        {
+          "name": "comment.line.double-dash.typelua",
+          "begin": "--(?!\\[=*\\[)",
+          "end": "$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.typelua",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [{ "include": "#string-escape" }]
+        },
+        {
+          "name": "string.quoted.single.typelua",
+          "begin": "'",
+          "end": "'",
+          "patterns": [{ "include": "#string-escape" }]
+        },
+        {
+          "name": "string.quoted.other.multiline.typelua",
+          "begin": "(?<!--)\\[(=*)\\[",
+          "end": "\\]\\1\\]"
+        }
+      ]
+    },
+    "string-escape": {
+      "name": "constant.character.escape.typelua",
+      "match": "\\\\(x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f]+\\}|[0-9]{1,3}|z|[abfnrtv\\\\\"'\\n])"
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.typelua",
+          "match": "\\b0[xX][0-9A-Fa-f]*(\\.[0-9A-Fa-f]*)?([pP][-+]?[0-9]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.decimal.typelua",
+          "match": "(?<![\\w.])[0-9]+(\\.[0-9]*)?([eE][-+]?[0-9]+)?|\\.[0-9]+([eE][-+]?[0-9]+)?"
+        }
+      ]
+    },
+    "constants": {
+      "name": "constant.language.typelua",
+      "match": "\\b(true|false|nil)\\b"
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.typelua",
+          "match": "\\b(if|then|else|elseif|end|for|while|repeat|until|do|break|goto|return|in)\\b"
+        },
+        {
+          "name": "keyword.operator.word.typelua",
+          "match": "\\b(and|or|not)\\b"
+        },
+        {
+          "name": "storage.type.function.typelua",
+          "match": "\\b(function|local)\\b"
+        },
+        {
+          "name": "storage.modifier.typelua",
+          "match": "\\b(pub|extern)\\b"
+        },
+        {
+          "name": "keyword.declaration.type.typelua",
+          "match": "\\b(class|typedef)\\b"
+        },
+        {
+          "name": "keyword.control.import.typelua",
+          "match": "\\b(import|as)\\b"
+        }
+      ]
+    },
+    "types": {
+      "name": "support.type.builtin.typelua",
+      "match": "\\b(number|string|boolean|any|never|void|table|array)\\b"
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.typelua",
+          "match": "\\.\\.\\.|\\.\\.|->|::<|::|==|~=|<=|>=|<<|>>|//|[-+*/%^#&|<>=]"
+        }
+      ]
+    }
+  }
+}

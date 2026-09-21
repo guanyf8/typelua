@@ -44,6 +44,7 @@ impl TypeLinter {
             if site == FieldSite::Record && self.get_production(ast, item) == Some(Prod::MethodDef)
             {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span: ast.span_of(item),
                     msg: "类型位的 record 不能定义方法，函数成员请写成 m : function(…)".to_string(),
                 });
@@ -117,6 +118,7 @@ impl TypeLinter {
                 Some(&i) => {
                     if site == FieldSite::Record {
                         diags.push(Diagnostic {
+                            severity: DiagLevel::Error,
                             span: ast.span_of(item),
                             msg: format!("字段 {} 重复声明", self.session.names.resolve(f.name)),
                         });
@@ -562,6 +564,7 @@ impl TypeLinter {
                 TypeId::NIL | TypeId::NUMBER | TypeId::BOOLEAN | TypeId::STRING
             ) {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span,
                     msg: format!("不能调用 {} 类型的值", self.session.show(callee)),
                 });
@@ -605,6 +608,7 @@ impl TypeLinter {
             .any(|&w| !self.param_takes_nil(w));
         if (got.len() > wanted && want.vararg.is_none()) || missing_needs_value {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("{kind}个数不对：要 {wanted} 个，给了 {} 个", got.len()),
             });
@@ -644,6 +648,7 @@ impl TypeLinter {
         let cname = self.class_name(class);
         if !self.class_is_local(ctx, decl) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("{cname} 是 import 来的类，只有类型没有值，不能用它构造"),
             });
@@ -657,6 +662,7 @@ impl TypeLinter {
             // `A(…)` / `A"…"`：类名不是函数，只有表形式算构造
             _ => {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span,
                     msg: format!("class {cname} 只能用 {cname}{{…}} 构造"),
                 });
@@ -669,6 +675,7 @@ impl TypeLinter {
             let item_span = ast.span_of(item);
             let Elem::Named(f) = self.classify_field(ctx, ast, item) else {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span: item_span,
                     msg: format!("构造 {cname} 只能用 字段名 = 值，位置元素和动态键都给不出字段名"),
                 });
@@ -678,16 +685,19 @@ impl TypeLinter {
             let shown = self.session.names.resolve(f.name).to_string();
             match fields.iter().find(|e| e.name == f.name).copied() {
                 None => diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span: item_span,
                     msg: format!("{shown} 不是 {cname} 的字段"),
                 }),
                 Some(hit) if hit.method => diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span: item_span,
                     msg: format!("{shown} 是方法，方法只能在类体里定义，不能在构造里给"),
                 }),
                 Some(hit) => {
                     if !self.session.assignable(f.ty, hit.ty) {
                         diags.push(Diagnostic {
+                            severity: DiagLevel::Error,
                             span: item_span,
                             msg: format!(
                                 "不能把 {} 赋给字段 {shown} 标注的 {} 位",
@@ -706,6 +716,7 @@ impl TypeLinter {
             }
             let shown = self.session.names.resolve(hit.name).to_string();
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("构造 {cname} 缺少字段 {shown}：它没有默认值"),
             });

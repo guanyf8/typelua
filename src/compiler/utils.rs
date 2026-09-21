@@ -22,7 +22,28 @@ use crate::lexer::type_def::Span;
 use crate::parser::ast::Tree;
 use crate::parser::parser::*;
 
+/// 编辑器可消费的诊断级别。当前类型检查产出的诊断都是 Error；保留 Warning
+/// 让后续 lint 规则能画黄色波浪线，而不必再改输出协议。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiagLevel {
+    Error,
+    Warning,
+    Info,
+}
+
+impl DiagLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiagLevel::Error => "error",
+            DiagLevel::Warning => "warning",
+            DiagLevel::Info => "info",
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Diagnostic {
+    pub severity: DiagLevel,
     pub span: Span,
     pub msg: String,
 }

@@ -1,42 +1,58 @@
-mod plugin_linter;
+mod highlight_linter;
 mod type_linter;
 
-use super::utils::{DFS, Diagnostic, walk};
+pub use super::utils::{DiagLevel, Diagnostic};
+use crate::lexer::type_def::Span;
 use crate::parser::ast::*;
 use crate::parser::parser::*;
-pub use type_linter::Context;
-
-// 编辑器插件用的独立分析器（高亮 + 跳转）。刻意不走下面的 LintDriver /
-// Linter 那套：它和类型检查隔离，自带遍历与作用域，从这里原样透出
 #[allow(unused_imports)]
-pub use plugin_linter::{
-    DefLink, FileAnalysis, PluginAnalyzer, SemToken, TokenKind, analyze_project,
-};
+pub use highlight_linter::{DefLink, SemToken, TokenKind};
 
-pub trait Linter: DFS<Context> {
+/// 一个 linter 对一个文件的统一产物。诊断、高亮与跳转都从这里出来；不产某类
+/// 数据的 linter 留空即可，调用方无需再知道具体实现。
+#[derive(Debug)]
+pub struct LinterOutput {
+    pub source: String,
+    pub diagnostics: Vec<Diagnostic>,
+    pub tokens: Vec<SemToken>,
+    pub links: Vec<DefLink>,
+}
+
+impl LinterOutput {
+    fn empty(source: &str) -> Self {
+        LinterOutput {
+            source: source.to_string(),
+            diagnostics: Vec::new(),
+            tokens: Vec::new(),
+            links: Vec::new(),
+        }
+    }
+}
+
+/// 工程分析器的公共边界。每种 linter 自己拥有并驱动自己的 DFS 上下文：
+/// TypeLinter 使用类型 Context，HighlightLinter 使用轻量的 `()`，互不倒灌。
+pub trait Linter {
     fn name(&self) -> &str;
 
-    fn warm_up(
+    /// BUILD 相位：所有模块先完成这一钩子，再开始任一模块的 output。
+    fn warm_up(&mut self, _ast: &Tree<NodeSyntax<'_>>, _module: &str) {}
+
+    /// CHECK / OUTPUT 相位：完成单文件遍历并一次性交回该 linter 的全部产物。
+    fn output(
         &mut self,
-        _ctx: &mut Context,
-        _ast: &Tree<NodeSyntax<'_>>,
-        _module: &str,
-        _diags: &mut Vec<Diagnostic>,
-    ) {
-    }
+        ast: &Tree<NodeSyntax<'_>>,
+        module: &str,
+        comments: &[Span],
+    ) -> LinterOutput;
 }
 
 pub struct LintDriver {
     linters: Vec<Box<dyn Linter>>,
-    diags: Vec<Diagnostic>,
 }
 
 impl LintDriver {
     pub fn new() -> Self {
-        LintDriver {
-            linters: vec![],
-            diags: vec![],
-        }
+        LintDriver { linters: vec![] }
     }
 
     pub fn init<T: Linter + 'static>(mut self, linter: T) -> Self {
@@ -44,58 +60,101 @@ impl LintDriver {
         self
     }
 
-    /// 工程级检查入口：装好默认流水线（现在只有 TypeLinter；main 那层在
-    /// type_linter 私有模块外够不着它，由这里代装），再跑两相位：先对所有
-    /// 模块 prefill（BUILD 相位：登记导出 / 填类型体），再逐个 run（CHECK 相位）。
-    /// 相位屏障就落在这个顺序上 —— 全部 BUILD 完才开始 CHECK，于是跨模块的
-    /// import / pub 与文件顺序无关。诊断按模块返回
+    /// 工程级检查兼容入口。它仍经过统一的 output_project，只取其中诊断部分。
     pub fn check_project(
         modules: &[(&str, &Tree<NodeSyntax<'_>>)],
     ) -> Vec<(String, Vec<Diagnostic>)> {
-        let mut driver = LintDriver::new().init(type_linter::TypeLinter::new());
-        for &(module, ast) in modules {
+        let inputs: Vec<_> = modules
+            .iter()
+            .map(|&(module, ast)| (module, ast, &[][..]))
+            .collect();
+        Self::output_project(&inputs)
+            .into_iter()
+            .map(|(module, outputs)| {
+                let diagnostics = outputs
+                    .into_iter()
+                    .flat_map(|output| output.diagnostics)
+                    .collect();
+                (module, diagnostics)
+            })
+            .collect()
+    }
+
+    /// 唯一的工程级输出入口。默认流水线装入 highlight + type 两个 linter；先让
+    /// 所有模块完成 BUILD，再逐模块输出，跨模块索引和 Session 都不吃文件顺序。
+    pub fn output_project(
+        modules: &[(&str, &Tree<NodeSyntax<'_>>, &[Span])],
+    ) -> Vec<(String, Vec<LinterOutput>)> {
+        let mut driver = LintDriver::new()
+            .init(highlight_linter::HighlightLinter::new())
+            .init(type_linter::TypeLinter::new());
+        for &(module, ast, _) in modules {
             driver.prefill(ast, module);
         }
         modules
             .iter()
-            .map(|&(module, ast)| (module.to_string(), driver.run(ast, module)))
+            .map(|&(module, ast, comments)| {
+                (
+                    module.to_string(),
+                    driver.run_outputs_with_comments(ast, module, comments),
+                )
+            })
             .collect()
     }
 
     pub fn prefill(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) {
-        // per-file 上下文：现建现用，warm_up 自己会在头上重置 / 压文件帧
-        let mut ctx = Context::new();
         for linter in self.linters.iter_mut() {
-            linter.warm_up(&mut ctx, ast, module, &mut self.diags);
+            linter.warm_up(ast, module);
         }
     }
 
-    /// 跑一棵树。收 `&mut self` 而不是吃掉 self：linter 的粒度是「阶段」
-    /// 而不是「一个文件」，同一个实例要被依次驱过工程里各个文件，
-    /// TypeLinter 里的 Session 才攒得起来（全局变量、导出类型都靠它跑过
-    /// 文件边界）。per-file 的东西归各 linter 自己在 `prepare` 里清。
-    ///
-    /// 日志按文件取走：留着的话第二个文件会把第一个文件的诊断再报一遍
+    /// 兼容单 linter 测试与旧调用方：无注释输入，只取诊断。
     pub fn run(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) -> Vec<Diagnostic> {
-        // per-file 上下文只建一次，贯穿 prepare / walk / finish 三个相位。
-        // 它是个栓上局部而不是 linter 的字段：同一个 linter 实例要跨文件复用，
-        // 而 per-file 的临时状态不该跟着实例跑
-        let mut ctx = Context::new();
-        for linter in self.linters.iter_mut() {
-            linter.prepare(&mut ctx, ast, module, &mut self.diags);
-        }
+        self.run_outputs(ast, module)
+            .into_iter()
+            .flat_map(|output| output.diagnostics)
+            .collect()
+    }
 
-        // 遍历本身交给公共的 utils::walk：每个 linter 各走一趟（当前管线只一个）。
-        // 从「单趟锁步驱多个 linter」改成「逐 linter 各遍历」——各 linter 相互独立、
-        // 只经 diags 交流，先后无差
-        if let Some(root) = ast.get_root() {
-            for linter in self.linters.iter_mut() {
-                walk(linter.as_mut(), &mut ctx, ast, root, &mut self.diags);
-            }
-        }
-        for linter in self.linters.iter_mut() {
-            linter.finish(&mut ctx, &mut self.diags);
-        }
-        std::mem::take(&mut self.diags)
+    pub fn run_outputs(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) -> Vec<LinterOutput> {
+        self.run_outputs_with_comments(ast, module, &[])
+    }
+
+    fn run_outputs_with_comments(
+        &mut self,
+        ast: &Tree<NodeSyntax<'_>>,
+        module: &str,
+        comments: &[Span],
+    ) -> Vec<LinterOutput> {
+        self.linters
+            .iter_mut()
+            .map(|linter| linter.output(ast, module, comments))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parser::Parser;
+
+    #[test]
+    fn output_project_collects_all_linter_products() {
+        let mut parser = Parser::new("-- note\nlocal n: number = 1");
+        let comments = parser.parse().comments;
+        let modules = [("main", parser.tree(), comments.as_slice())];
+
+        let results = LintDriver::output_project(&modules);
+        let outputs = &results[0].1;
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Highlight", "Type"]
+        );
+        assert!(!outputs[0].tokens.is_empty());
+        assert!(outputs[0].diagnostics.is_empty());
+        assert!(outputs[1].tokens.is_empty());
     }
 }

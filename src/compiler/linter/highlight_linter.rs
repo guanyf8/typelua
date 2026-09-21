@@ -1,7 +1,7 @@
-//! plugin_linter：给编辑器插件用的独立分析器 —— 只做两件事，语义高亮
+//! highlight_linter：给编辑器插件用的独立分析器 —— 只做两件事，语义高亮
 //! （span -> 种类）与跳转定义（引用 span -> 定义位置），和 type_linter 完全隔离：
-//! 不碰 Session / TypeId / 类型系统，也不接进 LintDriver 那套 Linter 流水线，
-//! 只读 CST。遍历复用 utils 里的通用 `walk`，自带一套轻量的块级作用域。
+//! 不碰 Session / TypeId / 类型系统，只通过公共 `Linter` 生命周期接进 LintDriver。
+//! 内部遍历复用 utils 里的通用 `walk`，自带一套轻量的块级作用域。
 //!
 //! 隔离的代价是它得把 type_linter 里那几个「按 CST 形状认节点」的纯查询
 //! （get_production / spine / is_chunk_top …）各自再抄一份精简版 —— 这些只读
@@ -9,9 +9,11 @@
 //!
 //! 跨模块跳转（用户选的档位）：先扫全工程建一份「模块 -> 顶层 class/typedef 名
 //! -> 定义 span」的导出索引，再逐文件分析；`import {A as B} in "mod"` 的 A
-//! 顺着这份索引连回它在别的文件里的定义。因此对外入口是工程级的 analyze_project。
+//! 顺着这份索引连回它在别的文件里的定义。索引与逐文件输出都由 LintDriver 的
+//! BUILD / OUTPUT 两相位统一调度。
 
 use super::super::utils::{DFS, Diagnostic, walk};
+use super::{Linter, LinterOutput};
 use crate::compiler::utils::string_literal;
 use crate::lexer::type_def::{Span, Token};
 use crate::parser::ast::Tree;
@@ -62,6 +64,7 @@ impl TokenKind {
 
 /// 一个高亮片段：源码字节区间 + 种类。区间是字节偏移，行列/UTF-16 换算交给
 /// 编辑器那侧（它手里有文档全文，`positionAt` 一步到位），Rust 这边不掺和
+#[derive(Debug)]
 pub struct SemToken {
     pub span: Span,
     pub kind: TokenKind,
@@ -69,17 +72,17 @@ pub struct SemToken {
 
 /// 一条跳转：引用出现在 `span`，定义落在 `target_module` 的 `target` 处。
 /// 同文件跳转时 target_module 就是本模块名
+#[derive(Debug)]
 pub struct DefLink {
     pub span: Span,
     pub target_module: String,
     pub target: Span,
 }
 
-/// 单个文件分析完的产物
-pub struct FileAnalysis {
-    pub module: String,
-    pub tokens: Vec<SemToken>,
-    pub links: Vec<DefLink>,
+/// 单个文件分析完的内部产物，最终并入公共的 `LinterOutput`。
+struct HighlightAnalysis {
+    tokens: Vec<SemToken>,
+    links: Vec<DefLink>,
 }
 
 // ================== 工程级入口 ==================
@@ -98,23 +101,23 @@ struct VarSym {
     kind: TokenKind,
 }
 
-/// 工程级分析器。先 `index` 扫遍每个模块攒出导出索引，再 `analyze` 逐文件出结果
-pub struct PluginAnalyzer {
+/// 工程级分析器。BUILD 先扫遍每个模块攒出导出索引，再逐文件分析。
+pub(super) struct HighlightLinter {
     /// 模块名 -> (顶层 class/typedef 名 -> 定义 span)。class 名和 typedef 名
     /// 共一张表 —— typelua 里类型不分命名空间
     exports: HashMap<String, HashMap<String, Span>>,
 }
 
-impl PluginAnalyzer {
+impl HighlightLinter {
     pub fn new() -> Self {
-        PluginAnalyzer {
+        HighlightLinter {
             exports: HashMap::new(),
         }
     }
 
     /// 扫一棵树，把它顶层的 class / typedef 名登记进导出索引。只认 chunk 顶层：
     /// 嵌在块里的类型不是 `import ... in "mod"` 找得到的那些
-    pub fn index(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) {
+    fn index(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) {
         let Some(root) = ast.get_root() else { return };
         let mut found: Vec<(String, Span)> = Vec::new();
         each_node(ast, root, &mut |n| {
@@ -136,12 +139,12 @@ impl PluginAnalyzer {
 
     /// 分析一个文件。`comments` 是 parser 交回的注释 span 列表（词法期收集的），
     /// 直接铺成 Comment 高亮
-    pub fn analyze(
+    fn analyze(
         &self,
         ast: &Tree<NodeSyntax<'_>>,
         module: &str,
         comments: &[Span],
-    ) -> FileAnalysis {
+    ) -> HighlightAnalysis {
         let mut a = Analysis {
             module: module.to_string(),
             exports: &self.exports,
@@ -166,31 +169,42 @@ impl PluginAnalyzer {
             walk(&mut a, &mut (), ast, root, &mut diags);
         }
 
-        FileAnalysis {
-            module: module.to_string(),
+        HighlightAnalysis {
             tokens: a.tokens,
             links: a.links,
         }
     }
 }
 
-impl Default for PluginAnalyzer {
+impl Default for HighlightLinter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// 工程级一把梭：先对所有模块 index（攒导出索引），再逐个 analyze。
-/// 每项是 (模块名, 语法树, 该文件的注释 span)
-pub fn analyze_project(modules: &[(&str, &Tree<NodeSyntax<'_>>, Vec<Span>)]) -> Vec<FileAnalysis> {
-    let mut analyzer = PluginAnalyzer::new();
-    for (module, ast, _) in modules {
-        analyzer.index(ast, module);
+impl Linter for HighlightLinter {
+    fn name(&self) -> &str {
+        "Highlight"
     }
-    modules
-        .iter()
-        .map(|(module, ast, comments)| analyzer.analyze(ast, module, comments))
-        .collect()
+
+    fn warm_up(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) {
+        self.index(ast, module);
+    }
+
+    fn output(
+        &mut self,
+        ast: &Tree<NodeSyntax<'_>>,
+        module: &str,
+        comments: &[Span],
+    ) -> LinterOutput {
+        let analysis = self.analyze(ast, module, comments);
+        LinterOutput {
+            source: self.name().to_string(),
+            diagnostics: Vec::new(),
+            tokens: analysis.tokens,
+            links: analysis.links,
+        }
+    }
 }
 
 // ================== 单文件遍历器 ==================
@@ -455,18 +469,25 @@ impl<'e> Analysis<'e> {
                     span: sym.span,
                 },
             );
-        } else {
-            self.emit(span, TokenKind::Variable);
-            // 没声明过的写位：第一次赋值就当它的定义点，后面的引用连到这儿
-            if is_write(ast, ref_node) {
-                self.var_scopes[0].insert(
-                    name.to_string(),
-                    VarSym {
-                        span,
-                        kind: TokenKind::Variable,
-                    },
-                );
-            }
+            return;
+        }
+        // 变量没查到，但名字是个已知类型：这是把类名当构造器用（`A{…}` 里的 A 是
+        // 类名不是变量，class 没有构造器），连回类型声明，jump 落到 class/typedef 处
+        if let Some(t) = self.type_target(name) {
+            self.emit(span, TokenKind::Type);
+            self.link(span, t);
+            return;
+        }
+        self.emit(span, TokenKind::Variable);
+        // 没声明过的写位：第一次赋值就当它的定义点，后面的引用连到这儿
+        if is_write(ast, ref_node) {
+            self.var_scopes[0].insert(
+                name.to_string(),
+                VarSym {
+                    span,
+                    kind: TokenKind::Variable,
+                },
+            );
         }
     }
 

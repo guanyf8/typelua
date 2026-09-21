@@ -73,6 +73,7 @@ impl TypeLinter {
                 .is_some_and(|&c| self.get_production(ast, c) == Some(Prod::Pub));
             if !has_pub {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span: ast.span_of(name_node),
                     msg: "class / typedef 只能写在文件顶层".to_string(),
                 });
@@ -82,6 +83,7 @@ impl TypeLinter {
         let decl = self.hoisted_decl(ctx, ast, node_index, name)?;
         if self.is_dup_decl(decl, ast.span_of(name_node)) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span: ast.span_of(name_node),
                 msg: format!("类型名 {name} 重复声明"),
             });
@@ -124,6 +126,7 @@ impl TypeLinter {
             match at.get(&field.name) {
                 Some(&i) => {
                     diags.push(Diagnostic {
+                        severity: DiagLevel::Error,
                         span: ast.span_of(item),
                         msg: format!("字段 {} 重复声明", self.session.names.resolve(field.name)),
                     });
@@ -199,6 +202,7 @@ impl TypeLinter {
         // 只能由 `A{}` 造却又造不出任何字段 —— 拒掉。带 extends 的空体合法
         if fields.is_empty() {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span: ast.span_of(children[2]),
                 msg: format!("class {name} 的类型体不能为空"),
             });
@@ -227,6 +231,7 @@ impl TypeLinter {
         let parent_ok = self.extends_is_class(extends_ty);
         if !parent_ok {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span: ast.span_of(children[5]),
                 msg: format!("class {name} 只能继承 class"),
             });
@@ -241,6 +246,7 @@ impl TypeLinter {
         // 免得 lookup_field / assignable 沿链上溯时只能靠深度上限兜底
         if parent_ok && self.extends_has_cycle(decl) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span: ast.span_of(children[2]),
                 msg: format!("class {name} 的继承出现环"),
             });
@@ -304,6 +310,7 @@ impl TypeLinter {
         let got = self.child_type(ctx, children[4]);
         if !self.session.assignable(got, want) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span: ast.span_of(children[4]),
                 msg: format!(
                     "不能把 {} 赋给字段标注的 {} 位",
@@ -339,6 +346,7 @@ impl TypeLinter {
             for (name, span) in own {
                 if self.lookup_field(parent, name).is_some() {
                     diags.push(Diagnostic {
+                        severity: DiagLevel::Error,
                         span,
                         msg: format!(
                             "字段 {} 覆盖了继承来的同名字段",
@@ -480,6 +488,7 @@ impl TypeLinter {
         let name_id = self.session.names.intern(&mname);
         let Some((want, is_method)) = self.lookup_class_field(class, name_id) else {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("class {cname} 里没有声明方法 {mname}，类体外只能重定义已声明的方法"),
             });
@@ -487,6 +496,7 @@ impl TypeLinter {
         };
         if !is_method {
             diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                 span,
                 msg: format!(
                     "{cname}.{mname} 是函数变量字段而不是方法，不能用 function 定义；它只能在构造里给或整体赋值"
@@ -501,6 +511,7 @@ impl TypeLinter {
         };
         if got != want {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!(
                     "方法 {mname} 的定义和 class {cname} 里的声明不一致：声明为 {}，这里是 {}",

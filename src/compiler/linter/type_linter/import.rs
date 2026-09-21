@@ -24,6 +24,7 @@ impl TypeLinter {
         let children = ast.get_node(node_index).children.clone();
         if !self.is_chunk_top(ast, node_index) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span: ast.span_of(node_index),
                 msg: "import 只能写在文件顶层".to_string(),
             });
@@ -65,6 +66,7 @@ impl TypeLinter {
                 Some(decl) => {
                     if self.lookup_type(ctx, local).is_some() {
                         diags.push(Diagnostic {
+                            severity: DiagLevel::Error,
                             span,
                             msg: format!("{local} 已经声明过了"),
                         });
@@ -76,11 +78,13 @@ impl TypeLinter {
                 None => {
                     if self.session.module_has_type(module_id, orig_id) {
                         diags.push(Diagnostic {
+                            severity: DiagLevel::Error,
                             span,
                             msg: format!("类型 {orig} 没有 pub，不能 import"),
                         });
                     } else {
                         diags.push(Diagnostic {
+                            severity: DiagLevel::Error,
                             span,
                             msg: format!("模块 {module_str} 没有导出类型 {orig}"),
                         });
@@ -147,6 +151,7 @@ impl TypeLinter {
         };
         if !self.is_chunk_top(ast, decl_node) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span: ast.span_of(node_index),
                 msg: "pub 只能修饰顶层的 class / typedef".to_string(),
             });
@@ -173,6 +178,7 @@ impl TypeLinter {
         // 同文件内的重名早被上面的 is_dup_decl 挡掉，走到这儿的都是跨文件撞名
         if !self.session.export(ctx.current_module, name_id, decl) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span: name_span,
                 msg: format!("类型 {name} 已经被导出过了"),
             });

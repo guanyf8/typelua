@@ -58,6 +58,7 @@ impl TypeLinter {
             let annot = self.type_annotation(ctx, ast, optype);
             if annot.is_none() {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span: ast.span_of(name_node),
                     msg: "无初值的 local 必须带类型标注".to_string(),
                 });
@@ -100,6 +101,7 @@ impl TypeLinter {
             if let (Some(want), Some(got)) = (annot, value) {
                 if !self.session.assignable(got, want) {
                     diags.push(Diagnostic {
+                        severity: DiagLevel::Error,
                         span: ast.span_of(name_node),
                         msg: format!(
                             "不能把 {} 赋给标注的 {} 位",
@@ -151,6 +153,7 @@ impl TypeLinter {
             return;
         }
         diags.push(Diagnostic {
+            severity: DiagLevel::Error,
             span: ast.span_of(value),
             msg: "空表 `{}` 推不出形状，必须带类型标注".to_string(),
         });
@@ -186,6 +189,7 @@ impl TypeLinter {
                 if let Some(got) = got {
                     if !self.session.assignable(got, slot.ty) {
                         diags.push(Diagnostic {
+                            severity: DiagLevel::Error,
                             span: ast.span_of(prefix),
                             msg: format!(
                                 "不能把 {} 赋给 {}（声明为 {}）",
@@ -201,6 +205,7 @@ impl TypeLinter {
             // 没声明过：这里就是全局的声明点，而声明点只认顶层
             if !self.is_chunk_top(ast, node_index) {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span: ast.span_of(prefix),
                     msg: format!("未声明的变量 {name}；全局变量的声明点只能在文件顶层"),
                 });
@@ -234,6 +239,7 @@ impl TypeLinter {
         let span = ast.span_of(prefix);
         if self.type_annotation(ctx, ast, optype).is_some() {
             diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                 span,
                 msg: "类型标注只能贴在裸变量名上：字段和元素的类型由它所属的 class / record / 容器给出"
                     .to_string(),
@@ -250,6 +256,7 @@ impl TypeLinter {
             }
             Some(Prod::Call | Prod::MethodCall | Prod::Paren | Prod::TurboFish) => {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span,
                     msg: "赋值目标只能是变量、字段或表元素".to_string(),
                 });
@@ -288,6 +295,7 @@ impl TypeLinter {
                 .unwrap_or("")
                 .to_string();
             diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                 span,
                 msg: format!(
                     "{cname} 是类名而不是变量：方法请写 function {cname}:{fname}(…) 重定义，字段是实例上的东西"
@@ -299,6 +307,7 @@ impl TypeLinter {
         let id = self.session.names.intern(&fname);
         if let Some((_, true)) = self.lookup_class_field(owner, id) {
             diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                 span,
                 msg: format!(
                     "{fname} 是方法，不能赋值覆盖；要一个能每个实例不同的函数成员就把它声明成 {fname} : function(…)"
@@ -327,6 +336,7 @@ impl TypeLinter {
             return;
         }
         diags.push(Diagnostic {
+            severity: DiagLevel::Error,
             span,
             msg: format!(
                 "{} 上没有字段 {fname}：形状一次定死，运行时不能新增字段",
@@ -353,12 +363,14 @@ impl TypeLinter {
         };
         if !self.is_chunk_top(ast, node_index) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: "extern 只能写在文件顶层".to_string(),
             });
         }
         if !self.declare_global(name, ty, span, VarScope::Extern, true) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("{name} 已经声明过了"),
             });
@@ -417,6 +429,7 @@ impl TypeLinter {
             return;
         }
         diags.push(Diagnostic {
+            severity: DiagLevel::Error,
             span,
             msg: format!(
                 "未声明的变量 {name}；`function {name}` 写的是全局变量，声明点只能在文件顶层"
@@ -936,6 +949,7 @@ impl TypeLinter {
                 return;
             }
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("未声明的变量 {name}"),
             });
@@ -943,6 +957,7 @@ impl TypeLinter {
         };
         if !slot.inited && self.init_checkable(ctx, scope) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("变量 {name} 可能尚未赋值"),
             });
@@ -970,6 +985,7 @@ impl TypeLinter {
         }
         frame.dead_reported = true;
         diags.push(Diagnostic {
+            severity: DiagLevel::Warning,
             span: ast.span_of(node),
             msg: "这条语句到不了：上一条已经 return / break / goto，或者调了个不返回的函数"
                 .to_string(),
@@ -1152,6 +1168,7 @@ impl TypeLinter {
         };
         frame.reported = true;
         diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
             span,
             msg: format!("递归函数 {name} 必须标注返回类型：不标的话返回类型要靠体里的 return 推，而它又依赖自己"),
         });

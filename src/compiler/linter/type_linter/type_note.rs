@@ -60,6 +60,7 @@ impl TypeLinter {
         let na = self.session.type_arenas.list(args).len();
         let Some(found) = self.lookup_type(ctx, name) else {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("未声明的类型 {}", name),
             });
@@ -69,6 +70,7 @@ impl TypeLinter {
             // 标量和泛型形参都不接受实参：`number<string>` / `T<number>`
             TypeRef::Prim(_) | TypeRef::Generic(_) if na != 0 => {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span,
                     msg: format!("{} 不是 class 或 typedef，不能带类型实参", name),
                 });
@@ -83,6 +85,7 @@ impl TypeLinter {
                 let ng = self.session.decls.get(decl).generics.len();
                 if ng != na {
                     diags.push(Diagnostic {
+                        severity: DiagLevel::Error,
                         span,
                         msg: format!("{} 需要 {} 个类型实参，实际给了 {}", name, ng, na),
                     });
@@ -116,6 +119,7 @@ impl TypeLinter {
             if !self.session.assignable(arg, bound) {
                 let param = self.session.decls.generic(g).name();
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span,
                     msg: format!(
                         "类型实参 {} 越过了形参 {} 的上界 {}",
@@ -183,6 +187,7 @@ impl TypeLinter {
         }
         let Types::Func { generics, .. } = self.session.type_arenas.get_type(callee) else {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!(
                     "{} 不是函数，不能用 ::<> 给类型实参",
@@ -207,6 +212,7 @@ impl TypeLinter {
         let argtys = self.session.type_arenas.list(args).fixed.clone();
         if gids.is_empty() {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: "这个函数没有泛型形参，不能给类型实参".to_string(),
             });
@@ -214,6 +220,7 @@ impl TypeLinter {
         }
         if gids.len() != argtys.len() {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!(
                     "这个函数需要 {} 个类型实参，实际给了 {}",

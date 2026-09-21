@@ -1,0 +1,65 @@
+{
+  "name": "typelua",
+  "displayName": "TypeLua",
+  "description": "TextMate + semantic highlighting and go-to-definition for TypeLua (.tua), powered by the `typelua plugin` command.",
+  "version": "0.1.0",
+  "publisher": "typelua",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:typelua"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "typelua",
+        "aliases": [
+          "TypeLua",
+          "typelua"
+        ],
+        "extensions": [
+          ".tua"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "typelua",
+        "scopeName": "source.typelua",
+        "path": "./syntaxes/typelua.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "typelua.reanalyze",
+        "title": "TypeLua: Re-analyze workspace"
+      },
+      {
+        "command": "typelua.build",
+        "title": "TypeLua: Build to dist/ (Lua 5.3)"
+      }
+    ],
+    "configuration": {
+      "title": "TypeLua",
+      "properties": {
+        "typelua.binaryPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the `typelua` binary. Leave empty to use the binary bundled under the extension's `bin/` directory."
+        },
+        "typelua.trace": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log every analyzer invocation and error to the TypeLua output channel."
+        }
+      }
+    }
+  }
+}

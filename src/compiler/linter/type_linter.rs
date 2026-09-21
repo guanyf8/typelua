@@ -30,7 +30,7 @@
 
 // 属性只有一种值：`TypeId`。类型列表也是一等的（`Types::Pack(ListId)`），装进去用
 // `type_arenas.pack(..)`、拆出来用 `type_arenas.as_list(..)`，中间只走 TypeId 一条道
-use super::super::utils::{DFS, Diagnostic};
+use super::super::utils::{DFS, DiagLevel, Diagnostic, walk};
 use super::*;
 use crate::compiler::utils::string_literal;
 use crate::lexer::type_def::*;
@@ -691,6 +691,7 @@ impl TypeLinter {
             .is_some_and(|s| s.variables.contains_key(name))
         {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("局部变量 {name} 在同一层作用域里重复声明"),
             });
@@ -1305,38 +1306,39 @@ impl Linter for TypeLinter {
     }
 
     /// 把工程里每个模块的顶层类型——名字、module_types、泛型身份、**体**、以及
-    /// pub 出的导出——全灌进 Session。于是 import 端 CHECK 时无论文件顺序如何，
+    /// pub 出的导出——全灌进 Session。于是 import 端 OUTPUT 时无论文件顺序如何，
     /// lookup_export 都查得到，且导出类型的体已填好，跨模块的字段访问 / 赋值才核得准。
-    ///
-    /// 只碰类型声明面（顶层 class / typedef 及其体子树），不进函数体、不做流分析
-    /// —— 那些是 CHECK 的事。不发诊断：重名 / 空体 / 继承环 / 重复导出仍由主遍历的
-    /// check_* 报，这里静默避免报两遍。幂等性：hoist_top_level_types 已按
-    /// (module,name,span) 复用已有 DeclId，prepare 再跑一遍不会重铸；export /
-    /// declare_module_type 本就幂等，所以单文件测试不走 prefill、只调 run 也照常
-    fn warm_up(
-        &mut self,
-        ctx: &mut Context,
-        ast: &Tree<NodeSyntax<'_>>,
-        module: &str,
-        _diags: &mut Vec<Diagnostic>,
-    ) {
+    fn warm_up(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) {
+        let mut ctx = Context::new();
         // 标记进入 BUILD 趟：prepare 的复用守卫据此才生效（见 hoist_top_level_types）
         self.warmed = true;
-        // 和 prepare 同款的 per-file 重置：warm_up 要依次驱过工程里每个文件，
-        // 上一个文件的作用域 / node_values 不清就会串到下一个
         ctx.current_module = self.session.names.intern(module);
-        ctx.node_values.clear();
-        ctx.scope_stack.clear();
-        ctx.file_decls.clear();
-        ctx.class_stack.clear();
-        ctx.ret_stack.clear();
         ctx.scope_stack.push(Scope::new());
-        self.flow_reset(ctx);
+        self.flow_reset(&mut ctx);
         // 名字 + module_types + 泛型身份，再把体填上（两趟和 prepare 共用，幂等）
-        self.hoist_top_level_types(ctx, ast);
-        self.hoist_class_bodies(ctx, ast);
+        self.hoist_top_level_types(&mut ctx, ast);
+        self.hoist_class_bodies(&mut ctx, ast);
         // 顶层 pub 的类型登记进 Session::export：搬到这里，import 端才不吃文件顺序
-        self.hoist_exports(ctx, ast);
+        self.hoist_exports(&mut ctx, ast);
+    }
+
+    fn output(
+        &mut self,
+        ast: &Tree<NodeSyntax<'_>>,
+        module: &str,
+        _comments: &[Span],
+    ) -> LinterOutput {
+        let mut ctx = Context::new();
+        let mut diagnostics = Vec::new();
+        self.prepare(&mut ctx, ast, module, &mut diagnostics);
+        if let Some(root) = ast.get_root() {
+            walk(self, &mut ctx, ast, root, &mut diagnostics);
+        }
+        self.finish(&mut ctx, &mut diagnostics);
+
+        let mut output = LinterOutput::empty(self.name());
+        output.diagnostics = diagnostics;
+        output
     }
 }
 

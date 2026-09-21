@@ -53,6 +53,7 @@ impl TypeLinter {
             }
             if lhs != rhs {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span,
                     msg: format!(
                         "{} 运算要求两侧同类型，实际是 {} 和 {}",
@@ -74,6 +75,7 @@ impl TypeLinter {
         let name = self.session.names.intern(mm);
         if self.lookup_field(operand, name).is_none() {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!(
                     "{} 上没有 {} 元方法，不支持这个运算",
@@ -128,6 +130,7 @@ impl TypeLinter {
         // （string 不拦 —— 它有元表，`s[1]` 只是 nil 而不报错）
         if matches!(base, TypeId::NIL | TypeId::NUMBER | TypeId::BOOLEAN) {
             diags.push(Diagnostic {
+                severity: DiagLevel::Error,
                 span,
                 msg: format!("不能索引 {} 类型的值", self.session.show(base)),
             });
@@ -153,6 +156,7 @@ impl TypeLinter {
             return;
         }
         diags.push(Diagnostic {
+            severity: DiagLevel::Error,
             span,
             msg: format!(
                 "{}应为 {}，实际是 {}",
@@ -176,6 +180,7 @@ impl TypeLinter {
             return;
         }
         diags.push(Diagnostic {
+            severity: DiagLevel::Error,
             span,
             msg: format!(
                 "不能把 {} 赋给{}的 {} 位",
@@ -387,6 +392,7 @@ impl TypeLinter {
             let shape = self.resolve_alias(recv);
             if self.is_known_shape(shape) {
                 diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
                     span: ast.span_of(node_index),
                     msg: format!("{} 上没有方法 {mname}", self.session.show(shape)),
                 });
@@ -475,6 +481,7 @@ impl TypeLinter {
             return TypeId::UNKNOWN;
         }
         diags.push(Diagnostic {
+            severity: DiagLevel::Error,
             span: ast.span_of(node_index),
             msg: format!("{} 上没有字段 {fname}", self.session.show(shape)),
         });

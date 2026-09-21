@@ -486,6 +486,19 @@ mod driver_tests {
         only("do return end\nlocal a = 1", "这条语句到不了");
     }
 
+    #[test]
+    fn dead_code_uses_warning_output_protocol() {
+        let mut parser = Parser::new("do return end\nlocal a = 1");
+        let ast = parser.parse().tree;
+        let outputs = LintDriver::new()
+            .init(TypeLinter::new())
+            .run_outputs(ast, "main");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].source, "Type");
+        assert_eq!(outputs[0].diagnostics.len(), 1);
+        assert_eq!(outputs[0].diagnostics[0].severity, DiagLevel::Warning);
+    }
+
     /// 一个帧只报第一条：死代码是成段的，逐条报就是一屏
     #[test]
     fn dead_code_reports_once_per_frame() {
