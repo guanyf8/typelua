@@ -1129,34 +1129,98 @@ impl Session {
         let void: Vec<TypeId> = vec![];
 
         // ---- 基础库函数 ----
+        // 动态加载器的结果无法从值实参推断，调用方必须用 ::<> 明确承担类型断言。
+        // turbofish 只存在于类型层，发射器会擦掉，运行时仍是普通 Lua 调用。
+        let require = self.prelude_generic_func(&["T"], |_, ts| (vec![s], None, vec![ts[0]], None));
+        self.prelude_global("require", require);
+        let dofile =
+            self.prelude_generic_func(&["T"], |_, ts| (Vec::new(), Some(any), vec![ts[0]], None));
+        self.prelude_global("dofile", dofile);
+        let load = self.prelude_generic_func(&["T"], |session, ts| {
+            let loaded = session.prelude_func(Vec::new(), Some(any), vec![ts[0]]);
+            let loaded_or_nil = session.type_arenas.union(vec![loaded, nil]);
+            (vec![any], Some(any), vec![loaded_or_nil, str_or_nil], None)
+        });
+        self.prelude_global("load", load);
+
+        // 值保持型函数：泛型从实参推断，返回值不再退化为 any。
+        let assert =
+            self.prelude_generic_func(&["T"], |_, ts| (vec![ts[0]], Some(any), vec![ts[0]], None));
+        self.prelude_global("assert", assert);
+        let setmetatable =
+            self.prelude_generic_func(&["T"], |_, ts| (vec![ts[0], any], None, vec![ts[0]], None));
+        self.prelude_global("setmetatable", setmetatable);
+        let getmetatable = self.prelude_generic_func(&["T"], |session, ts| {
+            let out = session.type_arenas.union(vec![ts[0], nil]);
+            (vec![any], None, vec![out], None)
+        });
+        self.prelude_global("getmetatable", getmetatable);
+
+        // 容器函数：K / V / T 都从第一个容器实参反解。
+        let rawget = self.prelude_generic_func(&["K", "V"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0], ts[1]], None);
+            let map = session.type_arenas.reference(DeclId::TABLE, args);
+            (vec![map, ts[0]], None, vec![ts[1]], None)
+        });
+        self.prelude_global("rawget", rawget);
+        let rawset = self.prelude_generic_func(&["K", "V"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0], ts[1]], None);
+            let map = session.type_arenas.reference(DeclId::TABLE, args);
+            (vec![map, ts[0], ts[1]], None, vec![map], None)
+        });
+        self.prelude_global("rawset", rawset);
+        let next = self.prelude_generic_func(&["K", "V"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0], ts[1]], None);
+            let map = session.type_arenas.reference(DeclId::TABLE, args);
+            let key_or_nil = session.type_arenas.union(vec![ts[0], nil]);
+            let value_or_nil = session.type_arenas.union(vec![ts[1], nil]);
+            (
+                vec![map],
+                Some(key_or_nil),
+                vec![key_or_nil, value_or_nil],
+                None,
+            )
+        });
+        self.prelude_global("next", next);
+        let pairs = self.prelude_generic_func(&["K", "V"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0], ts[1]], None);
+            let map = session.type_arenas.reference(DeclId::TABLE, args);
+            let key_or_nil = session.type_arenas.union(vec![ts[0], nil]);
+            let value_or_nil = session.type_arenas.union(vec![ts[1], nil]);
+            let iter =
+                session.prelude_func(vec![map, key_or_nil], None, vec![key_or_nil, value_or_nil]);
+            (vec![map], None, vec![iter, map, nil], None)
+        });
+        self.prelude_global("pairs", pairs);
+        let ipairs = self.prelude_generic_func(&["T"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0]], None);
+            let array = session.type_arenas.reference(DeclId::ARRAY, args);
+            let index_or_nil = session.type_arenas.union(vec![n, nil]);
+            let value_or_nil = session.type_arenas.union(vec![ts[0], nil]);
+            let iter = session.prelude_func(vec![array, n], None, vec![index_or_nil, value_or_nil]);
+            (vec![array], None, vec![iter, array, n], None)
+        });
+        self.prelude_global("ipairs", ipairs);
+        let unpack = self.prelude_generic_func(&["T"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0]], None);
+            let array = session.type_arenas.reference(DeclId::ARRAY, args);
+            (vec![array], Some(n), Vec::new(), Some(ts[0]))
+        });
+        self.prelude_global("unpack", unpack);
+
         for (name, params, vararg, ret) in [
             ("print", void.clone(), Some(any), void.clone()),
-            ("require", vec![s], None, vec![any]),
             ("tostring", vec![any], None, vec![s]),
             // 第二个实参是进制，可省；推不出数时返 nil
             ("tonumber", vec![any], Some(any), vec![num_or_nil]),
             ("type", vec![any], None, vec![s]),
-            // 条件为真时原样返回第一个实参，所以**不能**声明成 `-> never`
-            ("assert", vec![any], Some(any), vec![any]),
-            // pcall 第一位是成败位，后面跟着被调者的返回值
+            // pcall / xpcall 的返回值依赖被调函数的可变长返回包；当前类型层还表达不了
             ("pcall", vec![any], Some(any), vec![b]),
             ("xpcall", vec![any, any], Some(any), vec![b]),
             ("select", vec![any], Some(any), vec![any]),
-            ("rawget", vec![any, any], None, vec![any]),
-            ("rawset", vec![any, any, any], None, vec![any]),
             ("rawequal", vec![any, any], None, vec![b]),
             ("rawlen", vec![any], None, vec![n]),
-            ("setmetatable", vec![any, any], None, vec![any]),
-            ("getmetatable", vec![any], None, vec![any]),
-            // 迭代器三件套。for-in 的控制变量现在不从返回类型里抽，
-            // 所以这里只需要名字存在、实参个数对得上
-            ("ipairs", vec![any], None, vec![any, any, n]),
-            ("pairs", vec![any], None, vec![any, any, nil]),
-            ("next", vec![any], Some(any), vec![any, any]),
-            ("unpack", vec![any], Some(any), vec![any]),
             ("collectgarbage", void.clone(), Some(any), vec![any]),
-            ("load", vec![any], Some(any), vec![any]),
-            ("dofile", void.clone(), Some(any), vec![any]),
         ] {
             let ty = self.prelude_func(params, vararg, ret);
             self.prelude_global(name, ty);
@@ -1187,13 +1251,37 @@ impl Session {
         // 库表叫 `table`，内建**类型**也叫 `table` —— 不碰：一个在 globals、
         // 一个在 builtin_types，查表的位置分得开（值位 / 类型位）
         let table_lib = self.prelude_lib(&[
+            // insert 的 `(list, value)` / `(list, pos, value)` 是重载；当前函数类型
+            // 没有重载集，保留宽签名，避免为了泛型反而拒绝合法 Lua。
             ("insert", vec![any, any], Some(any), vec![]),
-            ("remove", vec![any], Some(n), vec![any]),
             ("concat", vec![any], Some(any), vec![s]),
-            ("sort", vec![any], Some(any), vec![]),
-            ("unpack", vec![any], Some(any), vec![any]),
-            ("pack", vec![], Some(any), vec![any]),
         ]);
+        let table_remove = self.prelude_generic_func(&["T"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0]], None);
+            let array = session.type_arenas.reference(DeclId::ARRAY, args);
+            let out = session.type_arenas.union(vec![ts[0], nil]);
+            (vec![array], Some(n), vec![out], None)
+        });
+        let table_sort = self.prelude_generic_func(&["T"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0]], None);
+            let array = session.type_arenas.reference(DeclId::ARRAY, args);
+            let cmp = session.prelude_func(vec![ts[0], ts[0]], None, vec![b]);
+            (vec![array], Some(cmp), Vec::new(), None)
+        });
+        let table_pack = self.prelude_generic_func(&["T"], |session, ts| {
+            let args = session.type_arenas.intern_list(vec![ts[0]], None);
+            let array = session.type_arenas.reference(DeclId::ARRAY, args);
+            (Vec::new(), Some(ts[0]), vec![array], None)
+        });
+        let table_lib = self.prelude_extend(
+            table_lib,
+            &[
+                ("remove", table_remove),
+                ("sort", table_sort),
+                ("unpack", unpack),
+                ("pack", table_pack),
+            ],
+        );
         self.prelude_global("table", table_lib);
 
         let math_lib = self.prelude_lib(&[
@@ -1258,6 +1346,34 @@ impl Session {
         let params = self.type_arenas.intern_list(params, vararg);
         let ret = self.type_arenas.intern_list(ret, None);
         self.type_arenas.func(ListId::EMPTY, params, ret)
+    }
+
+    /// 造一个 prelude 泛型函数。形参在这里 fresh，签名闭包拿到对应的 TypeId 后
+    /// 组装参数与返回列表；返回列表也开放 vararg，供 unpack 这类 Lua API 使用。
+    fn prelude_generic_func(
+        &mut self,
+        names: &[&str],
+        signature: impl FnOnce(
+            &mut Self,
+            &[TypeId],
+        ) -> (Vec<TypeId>, Option<TypeId>, Vec<TypeId>, Option<TypeId>),
+    ) -> TypeId {
+        let gids: Vec<GenericId> = names
+            .iter()
+            .map(|name| {
+                let name = self.names.intern(name);
+                self.decls.fresh_generic(name, Span::default())
+            })
+            .collect();
+        let generics: Vec<TypeId> = gids
+            .iter()
+            .map(|&id| self.type_arenas.generic(id))
+            .collect();
+        let generic_list = self.type_arenas.intern_list(generics.clone(), None);
+        let (params, param_vararg, ret, ret_vararg) = signature(self, &generics);
+        let params = self.type_arenas.intern_list(params, param_vararg);
+        let ret = self.type_arenas.intern_list(ret, ret_vararg);
+        self.type_arenas.func(generic_list, params, ret)
     }
 
     /// 一张全是函数字段的 record（`string` / `os` / …那种库表）

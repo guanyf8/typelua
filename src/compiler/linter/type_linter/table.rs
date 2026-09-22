@@ -364,7 +364,27 @@ impl TypeLinter {
         let span = ast.span_of(node_index);
         // 推断得在核对之前：形参表里还挂着 `T` 的时候逐位比类型只会报假错
         let f = self.infer_call_generics(f, &args, span, diags);
+        let before_shape = diags.len();
         self.check_call_shape(f, &args, spread, span, diags);
+        // 只出现在返回位的形参没法从实参反解。放任它留下会让 Generic 像 any
+        // 一样穿过后续检查；这里要求调用方用 ::<> 把剩余形参全部钉死。
+        let unresolved = match self.session.type_arenas.get_type(f) {
+            Types::Func { generics, .. } => self.session.type_arenas.list(generics).fixed.len(),
+            _ => 0,
+        };
+        if unresolved != 0 {
+            // 实参数量 / 类型已经错时只保留那条更具体的诊断，不再叠一条「推不出」。
+            if diags.len() == before_shape {
+                diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
+                    span,
+                    msg: format!(
+                        "泛型调用仍有 {unresolved} 个类型形参无法从实参推断；请使用 ::<> 显式指定"
+                    ),
+                });
+            }
+            return TypeId::UNKNOWN;
+        }
         self.ret_of(f)
     }
 

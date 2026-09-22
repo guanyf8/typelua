@@ -100,6 +100,17 @@ end
 local ys = map(xs, string.len)                          -- 推断 T=string, U=number
 local zs = map::<string, number>(xs, string.len)        -- 推不出来时用 turbofish 指定
 
+-- Generic prelude functions preserve types inferred from their value arguments.
+local checked:string = assert("ready")
+local point = setmetatable(p, {kind = "point"})         -- point keeps p's record type
+local counts:table<string, number> = {}
+rawset(counts, "ready", 1)
+local ready_count:number = rawget(counts, "ready")
+local packed:array<number> = table.pack(1, 2, 3)
+local removed:string|nil = table.remove(xs)
+-- A result-only generic cannot be inferred, so getmetatable needs turbofish.
+local mt:{kind:string}|nil = getmetatable::<{kind:string}>(point)
+
 -- ========================= 多返回值 / 收窄 / 强转 =========================
 local s1:string, n1:number = x:hello_again()            -- 展开
 local s2 = (x:hello_again())                            -- 括号把它截断成 1 个值
@@ -108,5 +119,5 @@ local ok = pcall(noop)                                  -- 收多了照常丢弃
 local s:string|nil = os.getenv("HOME")
 if s ~= nil then print(#s) end                          -- nil 收窄，这里 s:string
 
-local raw  = require("cjson")                           -- 推断为 any
-local json = raw as {encode:function(any) -> string}    -- 用 as 落地
+local json = require::<{encode:function(any) -> string}>("cjson")
+                                                            -- 显式指定模块值的类型

@@ -142,6 +142,17 @@ end
 local ys = map(xs, string.len)                          -- 推断 T=string, U=number
 local zs = map::<string, number>(xs, string.len)        -- 推不出来时用 turbofish 指定
 
+-- Generic prelude functions preserve types inferred from their value arguments.
+local checked:string = assert("ready")
+local point = setmetatable(p, {kind = "point"})         -- point keeps p's record type
+local counts:table<string, number> = {}
+rawset(counts, "ready", 1)
+local ready_count:number = rawget(counts, "ready")
+local packed:array<number> = table.pack(1, 2, 3)
+local removed:string|nil = table.remove(xs)
+-- A result-only generic cannot be inferred, so getmetatable needs turbofish.
+local mt:{kind:string}|nil = getmetatable::<{kind:string}>(point)
+
 -- ========================= 多返回值 / 收窄 / 强转 =========================
 local s1:string, n1:number = x:hello_again()            -- 展开
 local s2 = (x:hello_again())                            -- 括号把它截断成 1 个值
@@ -150,8 +161,8 @@ local ok = pcall(noop)                                  -- 收多了照常丢弃
 local s:string|nil = os.getenv("HOME")
 if s ~= nil then print(#s) end                          -- nil 收窄，这里 s:string
 
-local raw  = require("cjson")                           -- 推断为 any
-local json = raw as {encode:function(any) -> string}    -- 用 as 落地
+local json = require::<{encode:function(any) -> string}>("cjson")
+                                                            -- 调用点显式指定模块值类型
 ```
 
 表的形状一次定死
@@ -189,6 +200,40 @@ local json = raw as {encode:function(any) -> string}    -- 用 as 落地
 标准库的全局（print / require / ipairs / string / os / tostring / pcall / _G / …）由一份
 内建 prelude 提前声明，形态上等价于一串 `extern`，所以不必在每个文件顶上重复写。这份
 prelude 是「先声明后使用」的必要配件，没有它每个文件都会报一屏。
+
+Generic prelude signatures
+
+The prelude uses generics where Lua library calls preserve a real relationship between their inputs and
+outputs. Type arguments are normally inferred from value arguments, so these calls need no turbofish:
+
+```lua
+local value:string = assert("ok")
+local map:table<string, number> = {}
+rawset(map, "answer", 42)
+local answer:number = rawget(map, "answer")
+local values:array<number> = table.pack(1, 2, 3)
+local first:number = table.unpack(values)
+```
+
+This applies to `assert`, `setmetatable`, `rawget`, `rawset`, `next`, `pairs`, `ipairs`, `unpack`,
+`table.remove`, `table.sort`, `table.pack`, and `table.unpack`. Their `T`, `K`, and `V` parameters are
+inferred from the supplied values or containers rather than degrading their results to `any`.
+
+Some APIs produce a type that cannot be inferred from any input. They require an explicit caller-owned
+type assertion with turbofish:
+
+```lua
+local module = require::<Module>("pkg.module")
+local result = dofile::<Result>("chunk.lua")
+local loader, err = load::<Result>("return make_result()")
+local mt = getmetatable::<Meta>(value)                  -- Meta|nil
+```
+
+A call that leaves generic parameters unresolved is rejected. `::<...>` exists only for static checking
+and is erased during Lua emission. Dynamic loading is therefore still ordinary Lua behavior; TypeLua
+does not verify that a module, chunk, or metatable actually has the caller-selected type. APIs whose Lua
+behavior needs overloads, dependent results, or variadic type packs remain conservatively typed until the
+type system can represent those relationships.
 
 无初值声明
 
@@ -271,8 +316,8 @@ FFI 是 Lua 的本职，所以宿主（C 层）注入的全局得能在 TypeLua 
 
 三条规则：
   - **静态面**（`class` / `typedef`）由 `pub` 决定是否跨文件可见，`import` 引入；纯编译期，擦除后一个字都不剩
-  - **动态面**（实例变量）走 Lua 原本的 `require` / `return`，typelua 不插手
-  - 两者互不寄生：只用类型不必 `require`，只用值不必 `import`
+  - **动态面**（实例变量）仍走 Lua 的 `require` / `return`；调用写 `require::<T>(...)` 明确模块值类型，`::<T>` 发射时擦除
+  - 两者互不寄生：只用类型不必 `require`，只用值不必 `import`，但 `require` 的结果类型必须由调用方指定
 
 1. 文件 `mod_a.lua`
 ```lua
@@ -304,7 +349,7 @@ return M                                                -- 动态面：只返回
 import {A, Shape} in "mod_a"                            -- 只引入类型名
 import {Shape as S2, A as A2} in "mod_a"                -- 撞名时用 as 改名
 
-local m:A = require "mod_a"                            
+local m = require::<A> "mod_a"                         -- require 的返回类型必须显式指定
 local ok:boolean = m:f("x", 1)
 
 local sh:S2 = {                                         
@@ -361,7 +406,7 @@ funcname ::= Name {‘.’ Name} [‘:’ Name]                               (=
 varlist ::= var {‘,’ var}                                              (=Lua)
 
 var ::=  prefixexp [‘:’ type]                                          (~Lua)
-     -- 可带类型标注，全局变量也因此能标注：`G:Config = load()`。
+     -- 可带类型标注，全局变量也因此能标注：`G:Config = dofile::<Config>("config.lua")`。
      -- 语义约束：标注只允许贴在裸 Name 上（`a.b.c:T` / `t[i]:T` 报错），
      --           且赋值目标不能是函数调用或括号表达式。
      -- 注：namelist 已删除，被 decllist 取代。

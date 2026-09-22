@@ -60,8 +60,8 @@ local made = Local.make(3)                          -- 静态方法走点号
 local n:Private = 42
 
 local h:Handler = function(evt:string) end
-local raw = require("cjson")                        -- 推断为 any
-local json = raw as {encode:function(any) -> string}
+local json = require::<{encode:function(any) -> string}>("cjson")
+                                                        -- 显式指定模块值的类型
 local text:string = json.encode(a)
 
 local hex = 0xFF3p-2                                -- 十六进制带指数
@@ -79,6 +79,17 @@ function map<T, U>(xs:array<T>, f:function(T) -> U) -> array<U>
 end
 local lens = map::<string, number>({"a", "bb"}, string.len)
 
+-- Generic prelude calls infer types when value arguments determine T, K, and V.
+local checked:string = assert("ready")
+local counts:table<string, number> = {}
+local same_counts = setmetatable(counts, {kind = "counts"})
+rawset(counts, "ready", 1)
+local ready_count:number = rawget(counts, "ready")
+local packed:array<number> = table.pack(1, 2, 3)
+local removed:number|nil = table.remove(packed)
+-- Result-only generics still need an explicit caller-selected type.
+local mt:{kind:string}|nil = getmetatable::<{kind:string}>(same_counts)
+
 -- nil 收窄
 local maybe:string|nil = os.getenv("HOME")
 if maybe ~= nil then
@@ -90,10 +101,9 @@ end
 import {Account as RemoteAccount, Id as AccountId} in "pkg.account"
 import {Handler as EvtHandler} in "pkg.account"
 
-local accounts = require "pkg.account"              -- 值侧照旧走 Lua
+local accounts = require::<{make:function(number) -> RemoteAccount}> "pkg.account"
+                                                    -- 值侧走 Lua，类型在调用点明确指定
 local remote:RemoteAccount = accounts.make(7)       -- 用工厂函数造实例
-                                                    -- （accounts 是 require 来的，值侧
-                                                    --   推断为 any；类型靠 import 搬）
 local remote_id:AccountId = remote.id
 local on_evt:EvtHandler = function(evt:string) end
 local hello2:string = remote:greet("hey")           -- 方法签名跨文件也检查
@@ -109,7 +119,6 @@ local mn:string = Mod.NAME
 local mh:string = Mod.helper(1)
 
 -- ========================= 以下每条都该报错 =========================
-
 local e1:string = 1                                 -- ERROR 声明 string，初值 number
 local e2 = Local{}                                  -- ERROR id 无默认值，必须给
 local e3 = Local {id = 1, nope = 9}                  -- ERROR nope 不是 Local 的字段
