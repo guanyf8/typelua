@@ -373,7 +373,9 @@ impl TypeLinter {
     ///
     /// ':' 形式把接收者当第一个实参传进去，而 self 是写在形参表里的，所以
     /// 核对时把接收者拼在实参表头上。形状确定却查不到这个名字就报 ——
-    /// 和字段读同一条规矩
+    /// 和字段读同一条规矩。
+    ///
+    /// 接收者是**裸类名**的一律先拦下：类名只活在类型命名空间，运行时没有那张表
     pub(super) fn resolve_method_call(
         &mut self,
         ctx: &Context,
@@ -382,11 +384,26 @@ impl TypeLinter {
         diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
         let children = ast.get_node(node_index).children.clone();
-        //prefix是class/table/array(后两者都是class)没跑了
-        let recv = self.child_type(ctx, children[0]);
         let mname = self
             .name_or_panic(ast, children[2], "method name")
             .to_string();
+        // 类名当接收者：':' 把它当值传进去，而类名不是变量、运行时求不出那张表，
+        // self 落成 nil。方法带不带 self 都一样错，所以得赶在查成员**之前**拦 ——
+        // 查得到反而会放过：接收者拼出来的正是本类的 Ref，和声明里的 `self:A`
+        // 严丝合缝对得上。静态成员走 '.'，那条路 `resolve_dot` 已经认类名
+        if let Some((_, class)) = self.bare_class_ref(ctx, ast, children[0]) {
+            let cname = self.class_name(class);
+            diags.push(Diagnostic {
+                severity: DiagLevel::Error,
+                span: ast.span_of(node_index),
+                msg: format!(
+                    "{cname} 是类名而不是变量：{cname}:{mname}(…) 会把它当接收者传进去，运行时是 nil；静态方法请写 {cname}.{mname}(…)"
+                ),
+            });
+            return TypeId::UNKNOWN;
+        }
+        //prefix是class/table/array(后两者都是class)没跑了
+        let recv = self.child_type(ctx, children[0]);
         let name = self.session.names.intern(&mname);
         let Some(m) = self.member_type(recv, name) else {
             let shape = self.resolve_alias(recv);
@@ -445,7 +462,8 @@ impl TypeLinter {
     /// 判成终结，前提就是这里把 `os.exit` 解析成那个 `-> never` 的函数类型。
     ///
     /// 基是类名时（`A.make(1)`）拿本类的 Ref 当基 —— 类名不是变量，但静态
-    /// 成员就是这么读的。形状确定却查不到就报：表和 class 的形状一次定死，
+    /// 方法就是这么读的；只有方法这么读得，数据字段和函数变量字段长在实例上。
+    /// 形状确定却查不到就报：表和 class 的形状一次定死，
     /// 读一个不存在的字段永远只能拿到 nil，那就不是「还没算出来」而是写错了
     pub(super) fn resolve_dot(
         &mut self,
@@ -459,10 +477,33 @@ impl TypeLinter {
             .name_or_panic(ast, children[2], "field name")
             .to_string();
         let name = self.session.names.intern(&fname);
-        let base = match self.bare_class_ref(ctx, ast, children[0]) {
-            Some((_, class)) => class,
-            None => self.child_type(ctx, children[0]),
-        };
+        // 类名当基：类表上只有方法。数据字段和函数变量字段都是构造时才填进
+        // 实例的东西，TypeLua 没有静态变量，`A.a` 运行时求出来是 nil ——
+        // 所以走不到下面 `lookup_field` 那条通用路，得自己把方法那一位分出来
+        let class_base = self.bare_class_ref(ctx, ast, children[0]);
+        if let Some((_, class)) = class_base {
+            let hit = self.lookup_class_field(class, name);
+            if let Some((ty, true)) = hit {
+                return ty;
+            }
+            // 写位归 `check_field_write` 报「类名而不是变量」，两边都报就成了同一个错两道
+            if self.is_writing(ast, node_index) {
+                return TypeId::UNKNOWN;
+            }
+            let cname = self.class_name(class);
+            diags.push(Diagnostic {
+                severity: DiagLevel::Error,
+                span: ast.span_of(node_index),
+                msg: match hit {
+                    Some(_) => format!(
+                        "{fname} 是 {cname} 的实例成员：TypeLua 没有静态变量，类名上只读得方法"
+                    ),
+                    None => format!("{cname} 上没有字段 {fname}"),
+                },
+            });
+            return TypeId::UNKNOWN;
+        }
+        let base = self.child_type(ctx, children[0]);
         if let Some(ty) = self.lookup_field(base, name) {
             return ty;
         }
