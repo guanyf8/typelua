@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 
 use crate::lexer::type_def::Span;
 
-use crate::compiler::emitter::{EmitDriver, Lua53};
+use crate::compiler::emitter::{EmitCtx, EmitDriver, Lua53};
 use crate::compiler::linter::{DiagLevel, LintDriver, LinterOutput};
+use crate::compiler::plan::{ModulePlan, RUNTIME_MODULE};
+use crate::compiler::runtime;
 use crate::parser::ast::Tree;
 use crate::parser::parser::{NodeSyntax, Parser, SyntaxError};
 
@@ -70,6 +72,9 @@ fn check(args: &[String]) {
     }
     if sources.is_empty() {
         log_error!("没有找到 .tua 源文件");
+        return;
+    }
+    if reject_runtime_module_name(&sources) {
         return;
     }
 
@@ -163,6 +168,22 @@ fn module_name(base: &Path, path: &Path) -> String {
         .join(".")
 }
 
+/// 模块名撞上共享运行时的文件名：`compile` 先写各模块、再写
+/// `__typelua_runtime.lua`，同一条路径上的用户模块会被静默覆盖。模块名是从
+/// 路径推出来的，源码里没有能挂诊断的 span，所以只能在收齐源之后中止
+fn reject_runtime_module_name(sources: &[(String, PathBuf, String)]) -> bool {
+    for (module, path, _) in sources {
+        if module == RUNTIME_MODULE {
+            log_error!(
+                "模块名 {RUNTIME_MODULE} 是编译器保留的：{} 生成的 .lua 会被共享运行时的同名文件覆盖，请把这个源文件改名",
+                path.display()
+            );
+            return true;
+        }
+    }
+    false
+}
+
 /// `compile`：解析 -> 类型检查 -> 发射。任一阶段有错都中止，绝不落地半成品代码。
 /// 通过检查后每个模块生成 .lua：默认在源 .tua 旁原地生成（`with_extension`）；
 /// 给了 `--out <dir>`（`-o` 同义）则按模块名铺到该目录下（pkg.account ->
@@ -190,8 +211,10 @@ fn compile(args: &[String]) {
     }
 
     // 1) 收源。和 check 一样内容全程留着（Tree 借 Parser、Parser 借内容）；
-    //    compile 额外要留源路径，用来定位输出的 .lua
+    //    compile 额外要留源路径，用来定位输出的 .lua。bases 记「模块名的根」：
+    //    共享运行时要落到唯一那个根上，多个根时没法决定
     let mut sources: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut bases: Vec<PathBuf> = Vec::new();
     for arg in &paths {
         let path = Path::new(arg);
         let base = if path.is_dir() {
@@ -199,10 +222,16 @@ fn compile(args: &[String]) {
         } else {
             path.parent().map(Path::to_path_buf).unwrap_or_default()
         };
+        if !bases.contains(&base) {
+            bases.push(base.clone());
+        }
         collect_sources(&base, path, &mut sources);
     }
     if sources.is_empty() {
         log_error!("没有找到 .tua 源文件");
+        return;
+    }
+    if reject_runtime_module_name(&sources) {
         return;
     }
 
@@ -235,8 +264,10 @@ fn compile(args: &[String]) {
         return;
     }
 
-    // 3) 工程级两相位类型检查：有诊断就别发射，免得把已知错误的树落成 .lua
-    let results = LintDriver::check_project(&modules);
+    // 3) 工程级两相位类型检查：有诊断就别发射，免得把已知错误的树落成 .lua。
+    //    计划（import 改写点 + 前置声明）和诊断一起回来，发射阶段直接用
+    let check = LintDriver::check_project_planned(&modules);
+    let results = check.results;
     let mut errors = 0usize;
     let mut warnings = 0usize;
     for (module, diags) in &results {
@@ -262,9 +293,28 @@ fn compile(args: &[String]) {
     }
 
     // 4) 发射：每个模块原地 .tua -> .lua。EmitDriver 挂 Lua53 一个后端，
-    //    以后要多目标（别的 Lua 版本 / 别的语言）再往 driver 上加
+    //    以后要多目标（别的 Lua 版本 / 别的语言）再往 driver 上加。
+    //    多模块工程走共享模式：文件头注入运行时、pub 类注册、import 来的类取值。
+    //    运行时的落地目录先算好：原地生成又分属多个根时根本无从决定，
+    //    得在**写任何文件之前**中止，不能留一堆半成品
+    let shared = sources.len() > 1;
+    let runtime_dir = if shared {
+        match &out_dir {
+            Some(dir) => Some(dir.clone()),
+            None if bases.len() == 1 => Some(bases[0].clone()),
+            None => {
+                log_error!(
+                    "compile 中止：源文件分属多个目录，共享运行时的落地位置不唯一；请用 --out 指定输出目录"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let mut driver = EmitDriver::new();
     driver.add_emitter(Box::new(Lua53::new()));
+    let empty_plan = ModulePlan::default();
     let mut emitted = 0usize;
     for ((_, path, _), &(module, tree)) in sources.iter().zip(&modules) {
         // --out 给了就按模块名铺进该目录（并按需建子目录），否则在源文件旁原地生成
@@ -282,9 +332,27 @@ fn compile(args: &[String]) {
             }
             None => path.with_extension("lua"),
         };
-        driver.write(tree, module, &target.display().to_string());
+        let ctx = EmitCtx {
+            module,
+            plan: check.plan.module(module).unwrap_or(&empty_plan),
+            shared,
+        };
+        driver.write(tree, &ctx, &target.display().to_string());
         log_debug!("生成 {}", target.display());
         emitted += 1;
+    }
+    // 5) 共享运行时只需要一份，位置在 4) 开头就定下了
+    if let Some(dir) = runtime_dir {
+        let runtime_path = dir.join(format!("{RUNTIME_MODULE}.lua"));
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            log_error!("无法创建输出目录 {}: {}", dir.display(), err);
+            return;
+        }
+        if let Err(err) = std::fs::write(&runtime_path, runtime::SOURCE) {
+            log_error!("无法写出共享运行时 {}: {}", runtime_path.display(), err);
+            return;
+        }
+        log_debug!("生成 {}", runtime_path.display());
     }
     let dest = out_dir
         .as_ref()

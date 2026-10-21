@@ -12,19 +12,19 @@
 //!   §8 类型位     类型名 / 泛型实例化 / 联合 / 交 / 列表打包
 //!   §9 声明与语句 local / 全局赋值 / extern / function，以及驱动点要用的动作
 //!   §10 类与方法   class 子系统：声明填体、继承、字段，以及类体内外的方法定义
-//!   §11 跨模块    import / pub：只搬「类型名 -> DeclId」，纯编译期
+//!   §11 跨模块    import / pub：搬「类型名 -> DeclId」，另存值位改写要的模块 / 原名
 //!   §12 占位      语义不在节点本身上的产生式，一律返回 UNKNOWN
 //!   驱动          `impl Linter`：前序开作用域与流帧、后序求值与收口
 //!
 //! 文件太大，按上面的分节拆了几块到同名子模块（都还是 `impl TypeLinter` 的
 //! 内在方法，标 pub(super) 给父模块和兄弟节调用）：§4→flow.rs、§6→expr.rs、
-//! §7→table.rs、§8→type_pos.rs、§9→decl_stmt.rs、§10→class.rs、§11→cross_module.rs。
+//! §7→table.rs、§8→type_note.rs、§9→decl_and_stat.rs、§10→class.rs、§11→import.rs。
 //! §1/§2/§3/§5/§12 与驱动仍留在本文件。
 //!
 //! 两条贯穿全文的约定：
 //!   - **求值在后序**（`leave`）：孩子的类型先算好才谈得上组合。要在前序做的
 //!     事只有三类，且各自在原处写明了为什么（作用域/流帧的「进」、@VarRef 的
-//!     两条诊断、`local function` 的名字预声明）
+//!     读诊断、`local function` 的名字预声明）
 //!   - `resolve_*` 出类型、`check_*` 出诊断。前者的返回值会被登记进
 //!     `node_values` 供父节点读，后者只往 diags 里写
 
@@ -32,6 +32,7 @@
 // `type_arenas.pack(..)`、拆出来用 `type_arenas.as_list(..)`，中间只走 TypeId 一条道
 use super::super::utils::{DFS, DiagLevel, Diagnostic, walk};
 use super::*;
+use crate::compiler::plan::{ImportedClass, ModulePlan};
 use crate::compiler::utils::string_literal;
 use crate::lexer::type_def::*;
 use crate::parser::ast::Tree;
@@ -247,6 +248,21 @@ fn metamethod(op: &Token, unary: bool) -> Option<(&'static str, MetaResult)> {
     Some(hit)
 }
 
+/// 一条 import 绑定的全部事实。类型检查只要 `decl`，发射期还得知道运行时
+/// 去哪张表取它 —— 别名只改本文件的类型命名空间，注册表里的键是**原名**
+pub(super) struct ImportBinding {
+    /// 对面模块名（`import {..} in "pkg.account"` 里那个）
+    module: String,
+    /// 对面模块导出时的原名
+    class: String,
+    /// 那条 Decl。只有 class 才有值位改写，typedef 只留在类型命名空间里
+    decl: DeclId,
+    /// 单条 item 的 span：同一条 import 里重复列同一个名字按它认同一次
+    item_span: Span,
+    /// 整条 import 语句的 span。值位顺序检查拿它当「import 那一行」的位置
+    statement_span: Span,
+}
+
 pub struct Context {
     // 这里都是一些要传递继承属性而存在的缓冲区，最理想的状况是
     // 这里什么也没有，可以从子节点自然继承
@@ -274,6 +290,20 @@ pub struct Context {
     /// 当前文件所属模块名，`prepare` 里由驱动传进来的 module 字串 intern 而成。
     /// pub 拿它当导出的键一半，跨文件的 import 靠它知道自己往哪个模块查
     current_module: NameId,
+    /// 本文件的 import 绑定：本地名 -> 那条绑定。`hoist_imports` 填，整趟
+    /// 检查都读它；类型位只取 `decl`，值位（构造 / 静态访问 / 继承 / 外部方法）
+    /// 还要知道模块名才能去运行时注册表里取
+    imports: HashMap<String, ImportBinding>,
+    /// 发射计划的一半：值位上的 import 类名（NAME token 节点 -> 去哪取）。
+    /// 键用节点下标，理由见 plan.rs 抬头
+    rewrites: HashMap<usize, ImportedClass>,
+    /// 发射计划的另一半：被更早的值位引用、需要提到文件头 `local` 里的本地类。
+    /// 存 DeclId 而不是名字，是为了算撞名时拿得到声明位置
+    predeclares: Vec<DeclId>,
+    /// 顶层变量名与声明位置（含全局）。预声明会往文件头补 `local 类名`，
+    /// 同名变量在类之前就已经占了这个名字时，那个 `local` 会把变量遮住、
+    /// 类表赋值也会打到变量身上，所以 `finish` 要拿它核对
+    top_vars: Vec<(String, Span)>,
 }
 
 impl Context {
@@ -291,6 +321,10 @@ impl Context {
             class_stack: Vec::new(),
             ret_stack: Vec::new(),
             current_module: NameId::default(),
+            imports: HashMap::new(),
+            rewrites: HashMap::new(),
+            predeclares: Vec::new(),
+            top_vars: Vec::new(),
         }
     }
 }
@@ -458,6 +492,22 @@ impl TypeLinter {
             return false;
         };
         self.get_production(ast, parent) == Some(Prod::Var)
+    }
+
+    /// 这个 @VarRef 是不是别人的「基」：`A{…}` / `A.m` / `A:m` / `A[k]` 的第 0 个
+    /// 孩子。这几种形状各有更懂语义的钩子（构造 / 静态读 / 方法调用不该拿类名当
+    /// 接收者 / 类表不能下标），类名的值位分类归它们，`check_var_read` 不再重复算一遍
+    fn is_owner_base(&self, ast: &Tree<NodeSyntax<'_>>, node_index: usize) -> bool {
+        let Some(parent) = ast.get_node(node_index).parent else {
+            return false;
+        };
+        if ast.get_node(parent).children.first().copied() != Some(node_index) {
+            return false;
+        }
+        matches!(
+            self.get_production(ast, parent),
+            Some(Prod::Call | Prod::Dot | Prod::MethodCall | Prod::Index)
+        )
     }
 
     /// 这条语句在不在 chunk 的**直接**语句列表里。全局的声明点（带标注的
@@ -652,6 +702,11 @@ impl TypeLinter {
         assigned: bool,
     ) -> bool {
         let slot = self.session.new_slot(ty, span, kind, assigned);
+        // 顶层 local 也叫一个名字。层数 2 = chunk 的 @Block（层 1 是 prepare 压的
+        // 文件级作用域），再深就是函数体 / 分支块里的局部，和文件头不撞
+        if ctx.scope_stack.len() == 2 {
+            ctx.top_vars.push((name.to_string(), span));
+        }
         let scope = ctx
             .scope_stack
             .last_mut()
@@ -664,12 +719,15 @@ impl TypeLinter {
     /// 后登记的全局立刻会和快照对不上
     fn declare_global(
         &mut self,
+        ctx: &mut Context,
         name: &str,
         ty: TypeId,
         span: Span,
         kind: VarScope,
         assigned: bool,
     ) -> bool {
+        // 全局的声明点本来就只认 chunk 顶层（is_chunk_top），所以全记
+        ctx.top_vars.push((name.to_string(), span));
         let slot = self.session.new_slot(ty, span, kind, assigned);
         self.session.declare_global(name, slot)
     }
@@ -1080,14 +1138,21 @@ impl DFS<Context> for TypeLinter {
         ctx.file_decls.clear();
         ctx.class_stack.clear();
         ctx.ret_stack.clear();
+        ctx.imports.clear();
+        ctx.rewrites.clear();
+        ctx.predeclares.clear();
+        ctx.top_vars.clear();
         // 文件级作用域：它是 flow_reset 记 scope_depth 的基准，得先压。
         // chunk 的 @Block 还会自己再压一格，顶层 local 落在那一格里
         ctx.scope_stack.push(Scope::new());
         self.flow_reset(ctx);
         // 变量名与类型名两条独立的抬升：函数名进 variables，class/typedef 名进
         // type_names。互不相干，先后无所谓
-        self.hoist_top_level(ast);
+        self.hoist_top_level(ctx, ast);
         self.hoist_top_level_types(ctx, ast);
+        // import 得赶在填体之前：类体的 extends 可能指着一个 import 来的类，
+        // 而那颗名字只在这张绑定表里
+        self.hoist_imports(ctx, ast);
         // 名字占好了再把 class / typedef 的体提前填上：内联方法体里的 `self.x`
         // 要在主遍历里就查得到本类字段，而 P1 的 check_* 填体在各自 leave（方法体
         // 之后）才发生 —— 这一趟抢在主遍历之前把字段/父类/别名目标灌进 ClassInfo
@@ -1097,11 +1162,11 @@ impl DFS<Context> for TypeLinter {
         self.hoist_func_signatures(ctx, ast);
     }
 
-    /// 前序：作用域与流帧的「进」、以及两条非前序不可的诊断。
+    /// 前序：作用域与流帧的「进」、以及几条非前序不可的诊断。
     ///
     /// 哪些事必须在这里而不能拉到 leave：
     ///   - 作用域/流帧得包住子树，开在后序就来不及了
-    ///   - @VarRef 的两条诊断：看 resolve_var_ref 的注释
+    ///   - @VarRef 的读诊断（未声明 / 未赋值 / 类名不是值）：`resolve_var_ref` 只查表
     ///   - `local function f` 得先声明名字才递归得了
     fn enter(
         &mut self,
@@ -1293,10 +1358,79 @@ impl DFS<Context> for TypeLinter {
         // 字段覆盖的收口留到这里：extends 的父类可能声明在子类后面（前向继承），
         // 子类 leave 时父类体还没填，只有全走完才查得准
         self.check_field_overrides(ctx, diags);
+        // 前置声明和保留名都是「一整趟才说得清」的事：前者要知道最终哪些类被
+        // 提前引用了，后者要把变量 / 类 / import 三张表都看一遍
+        self.check_predeclares(ctx, diags);
+        self.check_reserved_names(ctx, diags);
         debug_assert_eq!(ctx.flow_stack.len(), 1, "流帧栈没配平");
         debug_assert!(ctx.join_stack.is_empty(), "join 帧没配平");
         debug_assert!(ctx.ret_stack.is_empty(), "函数体栈没配平");
         debug_assert_eq!(ctx.scope_stack.len(), 1, "作用域栈没配平");
+    }
+}
+
+impl TypeLinter {
+    /// 前置声明的落地检查。`local 类名` 要占文件头那个名字，撞上同名的顶层
+    /// 变量就会把那个变量遮住，类表赋值 `类名 = {}` 也会打到变量身上。只有
+    /// **声明在类之前**的变量才算撞 —— 类后面再 `local 同名` 只是从那时起
+    /// 遮蔽，影响不到类表赋值和更早的值位
+    fn check_predeclares(&self, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+        for &decl in &ctx.predeclares {
+            let class_span = self.session.decls.get(decl).span();
+            let cname = self
+                .session
+                .names
+                .resolve(self.session.decls.get(decl).name());
+            for (name, span) in &ctx.top_vars {
+                if name != cname || span.start >= class_span.start {
+                    continue;
+                }
+                diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
+                    span: *span,
+                    msg: format!(
+                        "class {cname} 需要在文件头前置声明，但它和这个同名的顶层变量冲突：改个名字，或者把引用挪到类声明之后"
+                    ),
+                });
+            }
+        }
+    }
+
+    /// 发射器的共享头会往每个文件里写 `local __typelua = require(…)`。那个名字
+    /// 一旦被用户占用，注入的局域名会和用户的值互相覆盖 —— 直接当保留名拒掉
+    fn check_reserved_names(&self, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+        let hit = |name: &str| name == crate::compiler::plan::RUNTIME_LOCAL;
+        for (name, span) in &ctx.top_vars {
+            if hit(name) {
+                diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
+                    span: *span,
+                    msg: format!("{name} 是编译器保留的名字（共享运行时的局域名），换一个"),
+                });
+            }
+        }
+        for &decl in &ctx.file_decls {
+            let d = self.session.decls.get(decl);
+            if hit(self.session.names.resolve(d.name())) {
+                diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
+                    span: d.span(),
+                    msg: format!(
+                        "{} 是编译器保留的名字（共享运行时的局域名），换一个",
+                        self.session.names.resolve(d.name())
+                    ),
+                });
+            }
+        }
+        for (name, binding) in &ctx.imports {
+            if hit(name) {
+                diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
+                    span: binding.item_span,
+                    msg: format!("{name} 是编译器保留的名字（共享运行时的局域名），换个本地名"),
+                });
+            }
+        }
     }
 }
 
@@ -1305,9 +1439,9 @@ impl Linter for TypeLinter {
         "Type"
     }
 
-    /// 把工程里每个模块的顶层类型——名字、module_types、泛型身份、**体**、以及
-    /// pub 出的导出——全灌进 Session。于是 import 端 OUTPUT 时无论文件顺序如何，
-    /// lookup_export 都查得到，且导出类型的体已填好，跨模块的字段访问 / 赋值才核得准。
+    /// 把工程里每个模块的顶层类型——名字、module_types、泛型身份、以及 pub 出的
+    /// 导出——全灌进 Session。**只做导出**：它不依赖任何别的模块，所以能第一趟
+    /// 就跑完。import 都查得到导出、类体也能解析 extends 了，才轮到下一趟
     fn warm_up(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) {
         let mut ctx = Context::new();
         // 标记进入 BUILD 趟：prepare 的复用守卫据此才生效（见 hoist_top_level_types）
@@ -1315,11 +1449,25 @@ impl Linter for TypeLinter {
         ctx.current_module = self.session.names.intern(module);
         ctx.scope_stack.push(Scope::new());
         self.flow_reset(&mut ctx);
-        // 名字 + module_types + 泛型身份，再把体填上（两趟和 prepare 共用，幂等）
         self.hoist_top_level_types(&mut ctx, ast);
-        self.hoist_class_bodies(&mut ctx, ast);
         // 顶层 pub 的类型登记进 Session::export：搬到这里，import 端才不吃文件顺序
-        self.hoist_exports(&mut ctx, ast);
+        self.hoist_exports(&ctx, ast);
+    }
+
+    /// BUILD 相位二：所有模块的导出都已登记完，现在可以绑 import 并填类体。
+    /// 挤回 warm_up 那趟就会让「a 的 import 去查 b 还没登记的导出」重新暴露在
+    /// 文件顺序上；而 `hoist_class_bodies` 又必须在 import 之后，否则
+    /// `class X extends Imported` 解不出父类
+    fn warm_up_imports(&mut self, ast: &Tree<NodeSyntax<'_>>, module: &str) {
+        let mut ctx = Context::new();
+        ctx.current_module = self.session.names.intern(module);
+        ctx.scope_stack.push(Scope::new());
+        self.flow_reset(&mut ctx);
+        // 名字在这趟的 ctx 里已经没了（上一趟的 ctx 用完即丢），得重新占一遍；
+        // 复用守卫保证拿到的是同一条 DeclId，不会铸第二个
+        self.hoist_top_level_types(&mut ctx, ast);
+        self.hoist_imports(&mut ctx, ast);
+        self.hoist_class_bodies(&mut ctx, ast);
     }
 
     fn output(
@@ -1338,7 +1486,34 @@ impl Linter for TypeLinter {
 
         let mut output = LinterOutput::empty(self.name());
         output.diagnostics = diagnostics;
+        output.plan = self.module_plan(&mut ctx);
         output
+    }
+}
+
+impl TypeLinter {
+    /// 把本趟攒下的改写点与前置声明收成发射计划。两样都空就交 `None`，
+    /// 让单文件 / 无 import 的工程走 emitter 的空计划路径，输出与 master 一致
+    fn module_plan(&mut self, ctx: &mut Context) -> Option<ModulePlan> {
+        if ctx.rewrites.is_empty() && ctx.predeclares.is_empty() {
+            return None;
+        }
+        // 按声明位置排：文件头建表的顺序就跟着源码，读起来自然
+        let mut predeclares: Vec<DeclId> = std::mem::take(&mut ctx.predeclares);
+        predeclares.sort_by_key(|&d| self.session.decls.get(d).span().start);
+        predeclares.dedup();
+        Some(ModulePlan {
+            rewrites: std::mem::take(&mut ctx.rewrites),
+            predeclares: predeclares
+                .into_iter()
+                .map(|d| {
+                    self.session
+                        .names
+                        .resolve(self.session.decls.get(d).name())
+                        .to_string()
+                })
+                .collect(),
+        })
     }
 }
 

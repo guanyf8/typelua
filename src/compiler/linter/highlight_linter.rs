@@ -187,7 +187,9 @@ impl HighlightLinter {
             .map(|(label, kind)| Completion { label, kind })
             .collect();
         completions.sort_by(|x, y| {
-            x.label.cmp(&y.label).then(x.kind.as_str().cmp(y.kind.as_str()))
+            x.label
+                .cmp(&y.label)
+                .then(x.kind.as_str().cmp(y.kind.as_str()))
         });
 
         HighlightAnalysis {
@@ -226,6 +228,7 @@ impl Linter for HighlightLinter {
             tokens: analysis.tokens,
             links: analysis.links,
             completions: analysis.completions,
+            plan: None,
         }
     }
 }

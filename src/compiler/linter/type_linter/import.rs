@@ -2,18 +2,106 @@
 //! `use super::*;` pulls in the struct, helper types and imports.
 use super::*;
 
+/// import 语句里拆出来的一条：本地名 / 原名 / 单条 item 的 span。
+/// 只活在本文件的借用里，不往 Context 存
+struct ImportItem<'a> {
+    local: &'a str,
+    orig: &'a str,
+    span: Span,
+}
+
 impl TypeLinter {
     // ================== §11 跨模块 ==================
     //
-    // import / pub。搬的只是「类型名 -> DeclId」这层绑定，纯编译期、擦除后
-    // 一个字不剩。两条都【只许顶层】—— 文法表达不了，所以都在这里拦
+    // import / pub。类型面搬的是「类型名 -> DeclId」，语句本身擦除后一个字不剩；
+    // 但 class 的绑定要多记对面模块名与导出原名 —— 值位改写（`get`）靠它。
+    // 两条都【只许顶层】—— 文法表达不了，所以都在这里拦
+
+    /// 一条 import 的 item 列表。`@ImportAlias` 收起两种写法：
+    /// 别名取 children[2] 的本地名，普通 item 原名即本地名
+    fn import_items<'t>(
+        &self,
+        ast: &'t Tree<NodeSyntax<'t>>,
+        node_index: usize,
+    ) -> Vec<ImportItem<'t>> {
+        let children = &ast.get_node(node_index).children;
+        let Some(&list_node) = children.get(2) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        for node in self.spine(ast, list_node) {
+            let Some(orig) = self.get_child_name(ast, node, 0) else {
+                continue;
+            };
+            let local = if self.get_production(ast, node) == Some(Prod::ImportAlias) {
+                match self.get_child_name(ast, node, 2) {
+                    Some(local) => local,
+                    None => continue,
+                }
+            } else {
+                orig
+            };
+            items.push(ImportItem {
+                local,
+                orig,
+                span: ast.span_of(node),
+            });
+        }
+        items
+    }
+
+    /// import 语句里的模块名（去引号 / 解转义）。`import '{' importlist '}' IN STRING`
+    /// 的形状下 STRING 恒在 children[5]
+    fn import_module(&self, ast: &Tree<NodeSyntax<'_>>, node_index: usize) -> Option<String> {
+        let &str_node = ast.get_node(node_index).children.get(5)?;
+        match ast.get_node(str_node).get_data() {
+            NodeSyntax::Token(Token::STRING(s)) => Some(string_literal(s)),
+            _ => None,
+        }
+    }
+
+    /// BUILD 相位二的第一趟：把本文件的 import 全绑上。
+    ///
+    /// 必须晚于**所有**模块的 hoist_exports，所以不能和 `warm_up` 挤在一趟；
+    /// 又必须早于 `hoist_class_bodies` —— 类体的 extends 可能就是 import 来的。
+    /// 这趟不发诊断：真正的诊断留给主遍历的 check_import，输出顺序才跟源码一致
+    pub(super) fn hoist_imports(&mut self, ctx: &mut Context, ast: &Tree<NodeSyntax<'_>>) {
+        for stat in self.top_level_stats(ast) {
+            if self.get_production(ast, stat) != Some(Prod::Import) {
+                continue;
+            }
+            let Some(module) = self.import_module(ast, stat) else {
+                continue;
+            };
+            let module_id = self.session.names.intern(&module);
+            let statement_span = ast.span_of(stat);
+            for item in self.import_items(ast, stat) {
+                let orig_id = self.session.names.intern(item.orig);
+                let Some(decl) = self.session.lookup_export(module_id, orig_id) else {
+                    continue;
+                };
+                // 本文件已有同名类型：撞名的诊断归 check_import，这趟只负责不覆盖
+                if self.lookup_type(ctx, item.local).is_some() {
+                    continue;
+                }
+                self.declare_type(ctx, item.local, TypeRef::Decl(decl));
+                ctx.imports.insert(
+                    item.local.to_string(),
+                    ImportBinding {
+                        module: module.clone(),
+                        class: item.orig.to_string(),
+                        decl,
+                        item_span: item.span,
+                        statement_span,
+                    },
+                );
+            }
+        }
+    }
 
     /// `import '{' importlist '}' IN STRING` —— 把别的模块 pub 出的类型引进
-    /// 当前文件的类型命名空间。纯编译期：绑的只是类型名 -> DeclId，
-    /// 擦除后一个字不剩。【只许顶层】文法表达不了，和 extern 一样归这里拦。
-    ///
-    /// @ImportAlias 的逐条改名也在这里一并处理（spine 把两种 item 都收上来），
-    /// 所以 check_import_alias 无事
+    /// 当前文件的类型命名空间。绑定已在 prepare 的 hoist_imports 里做完，
+    /// 这里只补诊断；碰见同一条 item（同 span）就跳过，不报「已声明」
     pub(super) fn check_import(
         &mut self,
         ctx: &mut Context,
@@ -21,7 +109,6 @@ impl TypeLinter {
         node_index: usize,
         diags: &mut Vec<Diagnostic>,
     ) {
-        let children = ast.get_node(node_index).children.clone();
         if !self.is_chunk_top(ast, node_index) {
             diags.push(Diagnostic {
                 severity: DiagLevel::Error,
@@ -30,48 +117,45 @@ impl TypeLinter {
             });
             return;
         }
-        // 模块名在 children[5] 的 STRING 里，要去引号 / 解转义才是真正的名字
-        let Some(&str_node) = children.get(5) else {
+        let Some(module_str) = self.import_module(ast, node_index) else {
             return;
-        };
-        let module_str = match ast.get_node(str_node).get_data() {
-            NodeSyntax::Token(Token::STRING(s)) => string_literal(s),
-            _ => return,
         };
         let module_id = self.session.names.intern(&module_str);
-        let Some(&list_node) = children.get(2) else {
-            return;
-        };
-        for item in self.spine(ast, list_node) {
-            // @ImportAlias : NAME AS NAME —— 原名 children[0]、本地名 children[2]；
-            // @ImportItem  : NAME        —— 原名即本地名
-            let is_alias = self.get_production(ast, item) == Some(Prod::ImportAlias);
-            let Some(orig) = self.get_child_name(ast, item, 0) else {
+        let statement_span = ast.span_of(node_index);
+        for item in self.import_items(ast, node_index) {
+            // 同一条 item 已经由 hoist_imports 绑过：不再重复走一遍绑定/诊断
+            if ctx
+                .imports
+                .get(item.local)
+                .is_some_and(|bound| bound.item_span == item.span)
+            {
                 continue;
-            };
-            let local = if is_alias {
-                let Some(l) = self.get_child_name(ast, item, 2) else {
-                    continue;
-                };
-                l
-            } else {
-                orig
-            };
-            let orig_id = self.session.names.intern(orig);
-            let span = ast.span_of(item);
+            }
+            let orig_id = self.session.names.intern(item.orig);
+            let span = item.span;
             match self.session.lookup_export(module_id, orig_id) {
                 // 查到导出：本文件已有同名类型→撞名，否则把本地名绑到那条 Decl 上。
                 // 碰名得问 lookup_type：顶层类型是 prepare 里 hoist 进**文件级**作用域的，
                 // import 的 declare_type 却落在上层 chunk 块那格，只看顶格的 declare_type 拓不到它
                 Some(decl) => {
-                    if self.lookup_type(ctx, local).is_some() {
+                    if self.lookup_type(ctx, item.local).is_some() {
                         diags.push(Diagnostic {
                             severity: DiagLevel::Error,
                             span,
-                            msg: format!("{local} 已经声明过了"),
+                            msg: format!("{} 已经声明过了", item.local),
                         });
                     } else {
-                        self.declare_type(ctx, local, TypeRef::Decl(decl));
+                        self.declare_type(ctx, item.local, TypeRef::Decl(decl));
+                        ctx.imports.insert(
+                            item.local.to_string(),
+                            ImportBinding {
+                                module: module_str.clone(),
+                                class: item.orig.to_string(),
+                                decl,
+                                item_span: span,
+                                statement_span,
+                            },
+                        );
                     }
                 }
                 // 查不到导出：模块里真有这类型只是没 pub，跟压根没这类型，报不同的错
@@ -80,13 +164,13 @@ impl TypeLinter {
                         diags.push(Diagnostic {
                             severity: DiagLevel::Error,
                             span,
-                            msg: format!("类型 {orig} 没有 pub，不能 import"),
+                            msg: format!("类型 {} 没有 pub，不能 import", item.orig),
                         });
                     } else {
                         diags.push(Diagnostic {
                             severity: DiagLevel::Error,
                             span,
-                            msg: format!("模块 {module_str} 没有导出类型 {orig}"),
+                            msg: format!("模块 {module_str} 没有导出类型 {}", item.orig),
                         });
                     }
                 }

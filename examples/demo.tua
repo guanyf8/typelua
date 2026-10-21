@@ -99,7 +99,7 @@ end
 -- ========================= 跨文件 =========================
 -- 真的跨文件：pkg/account.tua 靠 typelua.json 的 search_path 找到
 import {Account as RemoteAccount, Id as AccountId} in "pkg.account"
-import {Handler as EvtHandler} in "pkg.account"
+import {fHandler as EvtHandler} in "pkg.account"
 
 local accounts = require::<{make:function(number) -> RemoteAccount}> "pkg.account"
                                                     -- 值侧走 Lua，类型在调用点明确指定
@@ -107,6 +107,8 @@ local remote:RemoteAccount = accounts.make(7)       -- 用工厂函数造实例
 local remote_id:AccountId = remote.id
 local on_evt:EvtHandler = function(evt:string) end
 local hello2:string = remote:greet("hey")           -- 方法签名跨文件也检查
+local built:RemoteAccount = RemoteAccount {id = 2}  -- import 来的类也能直接构造：
+                                                    -- emitter 换成运行时的 get
 
 -- ========================= 表的形状一次定死 =========================
 local Mod = {                                       -- 一次写全，形状就定下来
@@ -130,7 +132,8 @@ a.greet = function() end                            -- ERROR 方法不能赋值�
 local e4:number = a:greet("hi")                     -- ERROR greet 返回 string
 local e5 = a:greet(123)                             -- ERROR 参数要 string
 local e6 = a.no_such_field                          -- ERROR 没有这个字段
-local e7 = RemoteAccount{id = 1}                    -- ERROR import 来的类只有类型没有值
+local e7 = RemoteAccount {id = 3, nope = 1}          -- ERROR nope 不是跨文件那个类的字段
+function RemoteAccount:extra() -> () end            -- ERROR import 来的类不能在本文件挂方法
 local e9:RemoteAccount = 1                          -- ERROR 类型是真的过来了，不是占位符
 import {Internal} in "pkg.account"                  -- ERROR Internal 没有 pub
 import {Nope} in "pkg.account"                      -- ERROR 模块里没有这个名字

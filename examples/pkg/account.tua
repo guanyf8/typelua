@@ -52,8 +52,9 @@ pub typedef fHandler = function(evt:string) -> ()
 
 typedef Internal = boolean                  -- 无 pub：别的文件 import 不到
 
--- 动态面：import 只搬类型，值仍然走 Lua 自己的 require / return。
--- 想让别的文件造实例，就导出一个工厂函数。
+-- 跨文件：`pub class` 既导出类型，也导出**值** —— 别的文件 import 之后可以直接
+-- `Account{…}` 构造，emitter 会在那边换成运行时的 get，按需 require 这个模块。
+-- 工厂函数不再是非用不可，但它仍然是「构造细节不想暴露」时的选择。
 --
 -- 表的形状一次定死：模块表要一次写全成完整字面量（下面这样），或声明成
 -- 能后加键的 table<K,V>。`local M = {}` 之后再 `M.VERSION:string = …`

@@ -215,7 +215,7 @@ impl TypeLinter {
             self.require_annot_for_empty_table(ast, values_node, i, annot, diags);
             // 报完照样登记：不登的话同一个名字后面每出现一次就再报一道
             let ty = annot.or(got).unwrap_or(TypeId::UNKNOWN);
-            self.declare_global(name, ty, ast.span_of(prefix), VarScope::Global, true);
+            self.declare_global(ctx, name, ty, ast.span_of(prefix), VarScope::Global, true);
         }
     }
 
@@ -351,7 +351,7 @@ impl TypeLinter {
     /// 「只许顶层」文法里表达不了（参见 table.rs 里这条产生式的注释），归这里拦
     pub(super) fn check_extern(
         &mut self,
-        ctx: &Context,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
         diags: &mut Vec<Diagnostic>,
@@ -368,7 +368,7 @@ impl TypeLinter {
                 msg: "extern 只能写在文件顶层".to_string(),
             });
         }
-        if !self.declare_global(name, ty, span, VarScope::Extern, true) {
+        if !self.declare_global(ctx, name, ty, span, VarScope::Extern, true) {
             diags.push(Diagnostic {
                 severity: DiagLevel::Error,
                 span,
@@ -435,7 +435,7 @@ impl TypeLinter {
                 "未声明的变量 {name}；`function {name}` 写的是全局变量，声明点只能在文件顶层"
             ),
         });
-        self.declare_global(name, ty, span, VarScope::Global, true);
+        self.declare_global(ctx, name, ty, span, VarScope::Global, true);
     }
 
     // ---- 驱动点要用的几个动作 ----
@@ -474,7 +474,7 @@ impl TypeLinter {
     /// b 的声明语句在后面，但 a 的体要等被调用时才求值。inited 从 false 起步，
     /// 于是顶层立即位置读它照样会报而函数体内不查 —— 抬升和定值分析共用同一位
     /// （见 VarScope::HoistedFn 的注释）
-    pub(super) fn hoist_top_level(&mut self, ast: &Tree<NodeSyntax<'_>>) {
+    pub(super) fn hoist_top_level(&mut self, ctx: &mut Context, ast: &Tree<NodeSyntax<'_>>) {
         for stat in self.top_level_stats(ast) {
             let children = &ast.get_node(stat).children;
             // 只认 `FUNCTION funcname funcbody`（3 个孩子）里 funcname 是裸名的：
@@ -497,7 +497,7 @@ impl TypeLinter {
             if let Some(name) = self.get_child_name(ast, fname, 0) {
                 // 类型先留 UNKNOWN；重名（两条 `function f`）时 declare_global 返回
                 // false，不管 —— 后一条在 Lua 里就是一次重新赋值
-                self.declare_global(name, TypeId::UNKNOWN, span, VarScope::HoistedFn, false);
+                self.declare_global(ctx, name, TypeId::UNKNOWN, span, VarScope::HoistedFn, false);
                 // 再把 inited 压回 false。`new_slot` 会因为 `admits_nil(UNKNOWN)`
                 // 把它当成已赋值，那一条放过是为了「别在推断失败之上再叠一条误报」；
                 // 可这里不是推断失败 —— 声明语句确实还没执行到，那一格此刻真的是 nil，
@@ -922,7 +922,8 @@ impl TypeLinter {
         }
     }
 
-    /// @VarRef 的两条诊断。为何在前序：看 resolve_var_ref 的注释
+    /// @VarRef 的读诊断（未声明的变量 / 可能尚未赋值 / 类名不是值）。为何在前序：
+    /// `resolve_var_ref` 只查表、不出诊断，读了一个什么样的名字得在这一趟说清楚
     pub(super) fn check_var_read(
         &mut self,
         ctx: &mut Context,
@@ -942,10 +943,20 @@ impl TypeLinter {
         // 报不报和名字查得到查不到无关，所以在查表之前
         self.check_recursive_ret(ctx, name, span, diags);
         let Some((scope, slot)) = self.lookup_variable_at(ctx, name) else {
-            // 类名不在变量表里（hoist_top_level_types 只登记类型名），但它确实能
-            // 写在值位：`A{…}` 构造、`A.m(…)` 静态方法。那两条各自有钩子，
-            // 这里不该再按「未声明的变量」报一道
-            if self.class_ref_by_name(ctx, name).is_some() {
+            // 类名不在变量表里（hoist_top_level_types 只登记类型名）。它当别人的基时
+            // （`A{…}` / `A.m` / `A:m`）归各自的钩子，这里不插嘴；剩下的裸读一律是错：
+            // 类型只在编译期存在，跨不过静态/动态那条线
+            if let Some((_, class)) = self.class_ref_by_name(ctx, name) {
+                if !self.is_owner_base(ast, node) {
+                    let cname = self.class_name(class);
+                    diags.push(Diagnostic {
+                        severity: DiagLevel::Error,
+                        span,
+                        msg: format!(
+                            "{cname} 是类名而不是值：类型只活在编译期，不能进变量、实参、返回值或表项；要实例写 {cname}{{…}}，静态成员写 {cname}.成员，类型别名用 typedef"
+                        ),
+                    });
+                }
                 return;
             }
             diags.push(Diagnostic {

@@ -333,6 +333,83 @@ impl TypeLinter {
         self.session.lookup_module_type(ctx.current_module, name) == Some(decl)
     }
 
+    /// 一个类名被当值用了。值位只有三处 —— `A{…}` 构造、`A.m` 静态读、
+    /// `class B : A` 继承（裸读在 `check_var_read` 里就拒了）—— **三处都归这
+    /// 一条口径**，于是「这里能不能用这个类」「发射时要换成什么」只有一处答案。
+    ///
+    ///   - import 来的类：记一条改写，让 emitter 把名字换成 `__typelua.get(模块, 类)`。
+    ///     顺序只看 import 那一行 —— 值位必须写在它后面
+    ///   - 本地类：声明之前的**延迟**值位（函数体 / 类体里）记一条前置声明，
+    ///     让 emitter 把类表提到文件头 `local` 里；立即位置就真的读到 nil 了，报错
+    ///
+    /// `deferred` = 这个值位是不是延迟求值的。extends 恒按**延迟**算：父类允许写在
+    /// 后面，靠前置声明让 `__index = 父类` 抓到文件头那张表，而不是声明时还没建的 nil
+    ///
+    /// 返回 false = 这里已经不能用了（诊断已出），调用方不必再往下核对
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn note_class_value_site(
+        &mut self,
+        ctx: &mut Context,
+        ast: &Tree<NodeSyntax<'_>>,
+        site: usize,
+        name: &str,
+        decl: DeclId,
+        deferred: bool,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
+        let span = ast.span_of(site);
+        let cname = self
+            .session
+            .names
+            .resolve(self.session.decls.get(decl).name())
+            .to_string();
+        // 这个名字绑的是这条 decl 才算 import 来的；同名斜体（撞名诊断）不算
+        if let Some(binding) = ctx.imports.get(name).filter(|b| b.decl == decl) {
+            if span.start < binding.statement_span.end {
+                diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
+                    span,
+                    msg: format!(
+                        "import 来的类 {cname} 在 import 语句之前就用到了：把那一行挪到前面，或者把引用挪到它后面"
+                    ),
+                });
+                return false;
+            }
+            ctx.rewrites.insert(
+                site,
+                ImportedClass {
+                    module: binding.module.clone(),
+                    class: binding.class.clone(),
+                },
+            );
+            return true;
+        }
+        if span.start > self.session.decls.get(decl).span().end {
+            return true;
+        }
+        if deferred {
+            if !ctx.predeclares.contains(&decl) {
+                ctx.predeclares.push(decl);
+            }
+            return true;
+        }
+        diags.push(Diagnostic {
+            severity: DiagLevel::Error,
+            span,
+            msg: format!(
+                "class {cname} 在声明之前就用到了，那时类表还没赋值：把声明挪到前面，或者只在函数体 / 类体里引用它"
+            ),
+        });
+        false
+    }
+
+    /// 这个值位是不是**延迟求值**的：在函数体里，或在类体里（方法体、字段默认值）。
+    /// 两处的代码都等到调用 / 构造时才跑，那时类表早赋值了，所以引用后面才声明的
+    /// 本地类没问题 —— 这正是互相引用的两个类能写在一个文件里的原因
+    pub(super) fn is_deferred_site(&self, ctx: &Context) -> bool {
+        !ctx.ret_stack.is_empty() || !ctx.class_stack.is_empty()
+    }
+
     /// Ref 上那个 class 的名字，只进诊断文案
     pub(super) fn class_name(&self, class: TypeId) -> String {
         match self.session.type_arenas.get_type(class) {
@@ -350,7 +427,7 @@ impl TypeLinter {
     /// 两条路靠 callee 分：裸类名 ⇒ 构造，其余一律当函数调
     pub(super) fn resolve_call(
         &mut self,
-        ctx: &Context,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
         diags: &mut Vec<Diagnostic>,
@@ -657,7 +734,7 @@ impl TypeLinter {
     /// 回 UNKNOWN 只会让后续每一处用它的地方再堆一堆假错
     pub(super) fn check_construction(
         &mut self,
-        ctx: &Context,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         call: usize,
         decl: DeclId,
@@ -666,12 +743,14 @@ impl TypeLinter {
     ) -> TypeId {
         let span = ast.span_of(call);
         let cname = self.class_name(class);
-        if !self.class_is_local(ctx, decl) {
-            diags.push(Diagnostic {
-                severity: DiagLevel::Error,
-                span,
-                msg: format!("{cname} 是 import 来的类，只有类型没有值，不能用它构造"),
-            });
+        // `A{}` 里的 A 是值位：本地类记前置声明、import 来的类记改写点。
+        // 构造在函数体 / 类体里是延迟的，立即位置引用后声明的类会读到 nil
+        let callee = ast.get_node(call).children[0];
+        let Some(name) = self.get_child_name(ast, callee, 0) else {
+            return class;
+        };
+        let deferred = self.is_deferred_site(ctx);
+        if !self.note_class_value_site(ctx, ast, callee, name, decl, deferred, diags) {
             return class;
         }
         // `args : tableconstructor` 是无标签单孩子、被折叠了，所以这里直接就是表节点

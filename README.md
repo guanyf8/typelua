@@ -314,12 +314,23 @@ FFI 是 Lua 的本职，所以宿主（C 层）注入的全局得能在 TypeLua 
 
 跨文件/跨模块
 
-三条规则：
-  - **静态面**（`class` / `typedef`）由 `pub` 决定是否跨文件可见，`import` 引入；纯编译期，擦除后一个字都不剩
-  - **动态面**（实例变量）仍走 Lua 的 `require` / `return`；调用写 `require::<T>(...)` 明确模块值类型，`::<T>` 发射时擦除
-  - 两者互不寄生：只用类型不必 `require`，只用值不必 `import`，但 `require` 的结果类型必须由调用方指定
+四条规则：
+  - **静态面**（`class` / `typedef`）由 `pub` 决定是否跨文件可见，`import` 引入
+  - **`pub class` 同时导出值**。别的文件 import 之后可以直接 `A{…}` 构造、`A.m(…)` 读静态成员、`class B : A` 继承；
+    发射时那个名字换成运行时的 `__typelua.get("mod_a", "A")`，对方模块还没加载就先 require 它。
+    互相引用的两个类因此不会互相 require 到爆 —— 先注册的那个已经能直接拿到。
+    除这三处外类名不许当值用：`local k = A`、`f(A)`、`{v = A}` 都报错 —— 类名只在静态面，值从实例走
+  - **动态面**（实例变量 / 模块表）仍走 Lua 的 `require` / `return`；调用写 `require::<T>(...)` 明确模块值类型，`::<T>` 发射时擦除
+  - **多文件工程会多一个 `__typelua_runtime.lua`**，生成的文件头都 require 它；单文件编译一个字都不多
 
-1. 文件 `mod_a.lua`
+两条限制：
+  - import 来的类只能写在 import 语句**之后** —— 那行才是本文件认识它的起点。
+    同文件的前向引用宽松得多：函数体 / 类体里用到后面才声明的类都行（编译器在文件头先把类表建好），
+    只有顶层**立即**使用（`local x = B{}` 写在 `class B` 之前）仍报错
+  - `function A:m(…)` 不能用来给 import 来的类挂方法：那张类表在本文件里没有名字。
+    要改就在定义它的模块里改
+
+1. 文件 `mod_a.tua`
 ```lua
 pub class A {                                           -- pub：类型名可被别的文件 import
     a:string,
@@ -344,22 +355,24 @@ end
 return M                                                -- 动态面：只返回实例变量
 ```
 
-2. 文件 `mod_b.lua`
+2. 文件 `mod_b.tua`
 ```lua
-import {A, Shape} in "mod_a"                            -- 只引入类型名
+import {A, Shape} in "mod_a"                            -- 引入类型名（pub class 还带值）
 import {Shape as S2, A as A2} in "mod_a"                -- 撞名时用 as 改名
 
-local m = require::<A> "mod_a"                         -- require 的返回类型必须显式指定
-local ok:boolean = m:f("x", 1)
+local a = A2 { a = "x", b = 1 }                         -- 直接构造 import 来的类
+local ok:boolean = a:f("x", 1)
 
+class C : A2 { d:number = 0 }                           -- 继承也只要 import
+local c = C { a = "y", b = 2 }
+
+local m = require::<A> "mod_a"                          -- 动态面依旧走 Lua 的 require
 local sh:S2 = {                                         
     g = function(s:string, n:number) -> number return 1 end,
 }
 
 -- import {Internal} in "mod_a"                         -- 不允许：Internal 没有 pub
--- local bad = A { a = "x", b = 1 }                     -- 不允许：import 只带类型不带值。
---                                                         要构造就用 mod_a 导出的工厂函数
--- class C : A2 { d:number = 0 }                        -- 同上：继承要父类的运行时值
+-- function A:extra() -> () end                         -- 不允许：import 来的类不能在本文件挂方法
 ```
 
 ## typelua compared to lua

@@ -215,7 +215,7 @@ impl TypeLinter {
     /// `optpub CLASS NAME generics ':' extendtype classbody`
     pub(super) fn check_class_decl_extends(
         &mut self,
-        ctx: &Context,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
         diags: &mut Vec<Diagnostic>,
@@ -235,6 +235,18 @@ impl TypeLinter {
                 span: ast.span_of(children[5]),
                 msg: format!("class {name} 只能继承 class"),
             });
+        } else if let Types::Ref { decl: parent, .. } =
+            self.session.type_arenas.get_type(extends_ty)
+        {
+            // extends 在 emitter 里也是个值位（`__index = 父类`、`__apply_defaults`
+            // 里也要碰上父类），所以照样走值位口径：
+            //   - 父类在本文件后面才声明：前置声明，让 `__index = B` 指的是文件头
+            //     那个 local。前向继承本身是允许的（字段覆盖 finish 才收口、环也在
+            //     声明处才查），但**不改写就会读到 nil**、继承静默消失
+            //   - 父类是 import 来的：换成运行时的 get，并检查 import 语句的顺序
+            if let Some(parent_name) = self.get_child_name(ast, children[5], 0) {
+                self.note_class_value_site(ctx, ast, children[5], parent_name, parent, true, diags);
+            }
         }
         let fields = self.collect_class_fields(ctx, ast, children[6], diags);
         if let Some(c) = self.session.decls.get_mut(decl).as_class_mut() {
@@ -482,6 +494,20 @@ impl TypeLinter {
             return;
         }
         let cname = self.class_name(class);
+        // import 来的类挂不了方法：Lua 的 funcname 只能是 `名字{.名字}`，运行时
+        // 先去全局查那个名字，而本文件压根没有那张类表 —— 连改写都无处可改
+        if let Types::Ref { decl, .. } = self.session.type_arenas.get_type(class)
+            && !self.class_is_local(ctx, decl)
+        {
+            diags.push(Diagnostic {
+                severity: DiagLevel::Error,
+                span,
+                msg: format!(
+                    "import 来的类 {cname} 不能在类体外用 function 定义方法：那张类表在本文件里取不到，要改就在定义它的模块里改"
+                ),
+            });
+            return;
+        }
         let mname = self
             .name_or_panic(ast, children[2], "method name")
             .to_string();

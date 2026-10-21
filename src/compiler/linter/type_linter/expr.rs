@@ -113,11 +113,25 @@ impl TypeLinter {
         node_index: usize,
         diags: &mut Vec<Diagnostic>,
     ) -> TypeId {
+        let span = ast.span_of(node_index);
+        // 类名当基：类表上只有方法，`C[k]` 在运行时读的是它那张表上的任意键。
+        // 类型层面也拿不出元素类型（class 不是容器），所以这里直接拦
+        let base_node = ast.get_node(node_index).children[0];
+        if let Some((_, class)) = self.bare_class_ref(ctx, ast, base_node) {
+            diags.push(Diagnostic {
+                severity: DiagLevel::Error,
+                span,
+                msg: format!(
+                    "{} 是类名而不是变量：类表上只有方法，没有可以下标的容器；字段请用 . 访问实例",
+                    self.class_name(class)
+                ),
+            });
+            return TypeId::UNKNOWN;
+        }
         // 别名透明：`typedef Xs = array<number>` 上的 `xs[1]` 和直接写 array 一样
         let base = self.resolve_alias(self.pass_through(ctx, ast, node_index, 0));
         // `t[f()]`：键位不是末位，多值要截到一个
         let key = self.truncate_ret(self.pass_through(ctx, ast, node_index, 2));
-        let span = ast.span_of(node_index);
         if let Some(elem) = self.session.type_arenas.as_array(base) {
             self.expect_key(key, TypeId::NUMBER, span, diags, "数组下标");
             return elem;
@@ -467,7 +481,7 @@ impl TypeLinter {
     /// 读一个不存在的字段永远只能拿到 nil，那就不是「还没算出来」而是写错了
     pub(super) fn resolve_dot(
         &mut self,
-        ctx: &Context,
+        ctx: &mut Context,
         ast: &Tree<NodeSyntax<'_>>,
         node_index: usize,
         diags: &mut Vec<Diagnostic>,
@@ -481,7 +495,14 @@ impl TypeLinter {
         // 实例的东西，TypeLua 没有静态变量，`A.a` 运行时求出来是 nil ——
         // 所以走不到下面 `lookup_field` 那条通用路，得自己把方法那一位分出来
         let class_base = self.bare_class_ref(ctx, ast, children[0]);
-        if let Some((_, class)) = class_base {
+        if let Some((decl, class)) = class_base {
+            // 写位（`A.m = f`）的错归 check_field_write；只有读位才是真正的值位
+            if !self.is_writing(ast, node_index)
+                && let Some(base_name) = self.get_child_name(ast, children[0], 0)
+            {
+                let deferred = self.is_deferred_site(ctx);
+                self.note_class_value_site(ctx, ast, children[0], base_name, decl, deferred, diags);
+            }
             let hit = self.lookup_class_field(class, name);
             if let Some((ty, true)) = hit {
                 return ty;
