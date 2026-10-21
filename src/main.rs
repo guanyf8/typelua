@@ -6,6 +6,7 @@ mod parser;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use crate::lexer::type_def::Span;
 
@@ -16,47 +17,69 @@ use crate::compiler::runtime;
 use crate::parser::ast::Tree;
 use crate::parser::parser::{NodeSyntax, Parser, SyntaxError};
 
-fn parse(args: &[String]) -> HashMap<String, Vec<SyntaxError>> {
+fn parse(args: &[String]) -> bool {
     // 按路径收集每个文件的语法诊断。parse() 返回的 Tree 借自每个文件的局部
     // Parser，无法跨迭代存进 map，故这里只留持有所权的 Vec<SyntaxError>
     let mut results: HashMap<String, Vec<SyntaxError>> = HashMap::new();
+    let mut ok = true;
     for arg in args {
-        parse_path(Path::new(arg), &mut results);
+        ok &= parse_path(Path::new(arg), &mut results);
     }
-    results
+    if results.is_empty() {
+        log_error!("没有找到可解析的文件");
+        return false;
+    }
+    // 读不了的文件和语法错误都算失败：CI 只看退出码，不再 grep 输出
+    ok && results.values().all(|errors| errors.is_empty())
 }
 
-// 递归处理一个路径：文件直接分析，目录则遍历其下每个条目（含子目录）
-fn parse_path(path: &Path, results: &mut HashMap<String, Vec<SyntaxError>>) {
+// 递归处理一个路径：文件直接分析，目录则遍历其下每个条目（含子目录）。
+// 返回 false 表示有路径读不了（文件本身有语法错由调用方看 error_lists）
+fn parse_path(path: &Path, results: &mut HashMap<String, Vec<SyntaxError>>) -> bool {
     if path.is_dir() {
         match std::fs::read_dir(path) {
             Ok(entries) => {
+                let mut ok = true;
                 for entry in entries.flatten() {
-                    parse_path(&entry.path(), results);
+                    ok &= parse_path(&entry.path(), results);
                 }
+                ok
             }
-            Err(err) => log_error!("无法读取目录 {}：{}", path.display(), err),
+            Err(err) => {
+                log_error!("无法读取目录 {}：{}", path.display(), err);
+                false
+            }
         }
     } else if path.is_file() {
-        let contents = std::fs::read_to_string(path).unwrap();
-        let mut parser = parser::parser::Parser::new(&contents);
-        let errors = parser.parse().errors;
-        for e in &errors {
-            log_error!(
-                "{}: 语法错误 @ {}..{}：{}",
-                path.display(),
-                e.span.start,
-                e.span.end,
-                e.msg
-            );
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let mut parser = parser::parser::Parser::new(&contents);
+                let errors = parser.parse().errors;
+                for e in &errors {
+                    log_error!(
+                        "{}: 语法错误 @ {}..{}：{}",
+                        path.display(),
+                        e.span.start,
+                        e.span.end,
+                        e.msg
+                    );
+                }
+                results.insert(path.display().to_string(), errors);
+                true
+            }
+            Err(err) => {
+                log_error!("无法读取文件 {}：{}", path.display(), err);
+                false
+            }
         }
-        results.insert(path.display().to_string(), errors);
     } else {
         log_error!("路径不存在: {}", path.display());
+        false
     }
 }
 
-fn check(args: &[String]) {
+fn check(args: &[String]) -> bool {
+    let mut collect_ok = true;
     // 1) 收齐所有源（模块名 + 内容）。内容要全程留着：Tree 借 Parser、
     //    Parser 又借内容，prefill / run 两相位都要访问，中途不能释放
     let mut sources: Vec<(String, PathBuf, String)> = Vec::new();
@@ -68,14 +91,14 @@ fn check(args: &[String]) {
         } else {
             path.parent().map(Path::to_path_buf).unwrap_or_default()
         };
-        collect_sources(&base, path, &mut sources);
+        collect_ok &= collect_sources(&base, path, &mut sources);
     }
     if sources.is_empty() {
         log_error!("没有找到 .tua 源文件");
-        return;
+        return false;
     }
     if reject_runtime_module_name(&sources) {
-        return;
+        return false;
     }
 
     // 2) 并行解析。每个文件一棵独立的 Tree、互不共享状态（Session 只在之后的
@@ -92,8 +115,10 @@ fn check(args: &[String]) {
     });
 
     let mut modules: Vec<(&str, &Tree<NodeSyntax>)> = Vec::new();
+    let mut syntax_errors = 0usize;
     for (((module, _, _), parser), errors) in sources.iter().zip(parsers.iter()).zip(&error_lists) {
         for e in errors {
+            syntax_errors += 1;
             log_error!(
                 "{module}: 语法错误 @ {}..{}：{}",
                 e.span.start,
@@ -125,36 +150,52 @@ fn check(args: &[String]) {
             }
         }
     }
-    if errors == 0 {
+    // 语法错误和读不进来的路径也计入汇总：以前前者只打印不计数，后者连汇总都不进
+    let total = errors + syntax_errors + usize::from(!collect_ok);
+    if total == 0 {
         log_info!("检查通过：{} 个模块，{warnings} 条警告", modules.len());
+        true
     } else {
-        log_error!("检查失败：{errors} 条错误，{warnings} 条警告");
+        log_error!("检查失败：{total} 条错误，{warnings} 条警告");
+        false
     }
 }
 
 /// 递归收集 `path` 下的 .tua 源：目录逐项深入，文件按扩展名过滤后读内容。
 /// `base` 是算模块名的根（相对路径去扩展名、'/' 换 '.'）
-fn collect_sources(base: &Path, path: &Path, out: &mut Vec<(String, PathBuf, String)>) {
+fn collect_sources(base: &Path, path: &Path, out: &mut Vec<(String, PathBuf, String)>) -> bool {
     if path.is_dir() {
         match std::fs::read_dir(path) {
             Ok(entries) => {
+                let mut ok = true;
                 for entry in entries.flatten() {
-                    collect_sources(base, &entry.path(), out);
+                    ok &= collect_sources(base, &entry.path(), out);
                 }
+                ok
             }
-            Err(err) => log_error!("无法读取目录 {}: {}", path.display(), err),
+            Err(err) => {
+                log_error!("无法读取目录 {}: {}", path.display(), err);
+                false
+            }
         }
     } else if path.is_file() {
         // check 只处理 .tua 源；目录里夹杂的别的文件跳过，免得当源去解析报错
         if path.extension().and_then(|e| e.to_str()) != Some("tua") {
-            return;
+            return true;
         }
         match std::fs::read_to_string(path) {
-            Ok(contents) => out.push((module_name(base, path), path.to_path_buf(), contents)),
-            Err(err) => log_error!("无法读取文件 {}: {}", path.display(), err),
+            Ok(contents) => {
+                out.push((module_name(base, path), path.to_path_buf(), contents));
+                true
+            }
+            Err(err) => {
+                log_error!("无法读取文件 {}: {}", path.display(), err);
+                false
+            }
         }
     } else {
         log_error!("路径不存在: {}", path.display());
+        false
     }
 }
 
@@ -188,7 +229,8 @@ fn reject_runtime_module_name(sources: &[(String, PathBuf, String)]) -> bool {
 /// 通过检查后每个模块生成 .lua：默认在源 .tua 旁原地生成（`with_extension`）；
 /// 给了 `--out <dir>`（`-o` 同义）则按模块名铺到该目录下（pkg.account ->
 /// <dir>/pkg/account.lua），子目录按需创建
-fn compile(args: &[String]) {
+fn compile(args: &[String]) -> bool {
+    let mut collect_ok = true;
     // 0) 摘掉 `--out <dir>`（`-o` / `--out=<dir>` 同义）。给了就把 .lua 按模块名
     //    铺到该目录下（pkg.account -> <dir>/pkg/account.lua）；不给则在源文件原地生成
     let mut out_dir: Option<PathBuf> = None;
@@ -202,7 +244,7 @@ fn compile(args: &[String]) {
                 Some(dir) => out_dir = Some(PathBuf::from(dir)),
                 None => {
                     log_error!("--out 需要一个输出目录参数");
-                    return;
+                    return false;
                 }
             }
         } else {
@@ -225,14 +267,19 @@ fn compile(args: &[String]) {
         if !bases.contains(&base) {
             bases.push(base.clone());
         }
-        collect_sources(&base, path, &mut sources);
+        collect_ok &= collect_sources(&base, path, &mut sources);
     }
     if sources.is_empty() {
         log_error!("没有找到 .tua 源文件");
-        return;
+        return false;
+    }
+    // 读不进来的源不能只报一半就发射：宁可一行 .lua 都不写
+    if !collect_ok {
+        log_error!("compile 中止：有源目录或源文件读不进来，未生成代码");
+        return false;
     }
     if reject_runtime_module_name(&sources) {
-        return;
+        return false;
     }
 
     // 2) 并行解析（同 check）：scoped 线程各解析一份，只带回 owned 的语法错误列表
@@ -261,7 +308,7 @@ fn compile(args: &[String]) {
     }
     if syntax_errors > 0 {
         log_error!("compile 中止：{syntax_errors} 处语法错误，未生成代码");
-        return;
+        return false;
     }
 
     // 3) 工程级两相位类型检查：有诊断就别发射，免得把已知错误的树落成 .lua。
@@ -289,7 +336,7 @@ fn compile(args: &[String]) {
     }
     if errors > 0 {
         log_error!("compile 中止：{errors} 条错误，{warnings} 条警告，未生成代码");
-        return;
+        return false;
     }
 
     // 4) 发射：每个模块原地 .tua -> .lua。EmitDriver 挂 Lua53 一个后端，
@@ -306,7 +353,7 @@ fn compile(args: &[String]) {
                 log_error!(
                     "compile 中止：源文件分属多个目录，共享运行时的落地位置不唯一；请用 --out 指定输出目录"
                 );
-                return;
+                return false;
             }
         }
     } else {
@@ -326,7 +373,7 @@ fn compile(args: &[String]) {
                     && let Err(err) = std::fs::create_dir_all(parent)
                 {
                     log_error!("无法创建输出目录 {}: {}", parent.display(), err);
-                    return;
+                    return false;
                 }
                 t
             }
@@ -337,7 +384,10 @@ fn compile(args: &[String]) {
             plan: check.plan.module(module).unwrap_or(&empty_plan),
             shared,
         };
-        driver.write(tree, &ctx, &target.display().to_string());
+        // 写出失败（磁盘满 / 没权限）也算编译失败，不能让 CI 误判成功
+        if !driver.write(tree, &ctx, &target.display().to_string()) {
+            return false;
+        }
         log_debug!("生成 {}", target.display());
         emitted += 1;
     }
@@ -346,11 +396,11 @@ fn compile(args: &[String]) {
         let runtime_path = dir.join(format!("{RUNTIME_MODULE}.lua"));
         if let Err(err) = std::fs::create_dir_all(&dir) {
             log_error!("无法创建输出目录 {}: {}", dir.display(), err);
-            return;
+            return false;
         }
         if let Err(err) = std::fs::write(&runtime_path, runtime::SOURCE) {
             log_error!("无法写出共享运行时 {}: {}", runtime_path.display(), err);
-            return;
+            return false;
         }
         log_debug!("生成 {}", runtime_path.display());
     }
@@ -359,12 +409,13 @@ fn compile(args: &[String]) {
         .map(|d| format!("到 {}", d.display()))
         .unwrap_or_else(|| "（原地）".to_string());
     log_info!("compile 完成：{emitted} 个模块已生成 .lua {dest}");
+    true
 }
 
 /// `plugin`：给编辑器插件喂数据。解析每个 .tua，由 LintDriver::output_project
 /// 统一运行 highlight_linter 与 type_linter，输出高亮、跳转和诊断。
 /// 区间是字节偏移，行列换算交给插件那侧
-fn plugin(args: &[String]) {
+fn plugin(args: &[String]) -> bool {
     // 收源，和 check / compile 同款：内容全程留着（Tree 借 Parser、Parser 借内容）
     let mut sources: Vec<(String, PathBuf, String)> = Vec::new();
     for arg in args {
@@ -378,7 +429,7 @@ fn plugin(args: &[String]) {
     }
     if sources.is_empty() {
         log_error!("没有找到 .tua 源文件");
-        return;
+        return false;
     }
 
     // 并行解析（同 check）：这里带回的是每个文件的注释 span，高亮要用
@@ -413,6 +464,9 @@ fn plugin(args: &[String]) {
         "{}",
         render_plugin_json(&sources, &lint_outputs, &module_path)
     );
+    // 有语法/类型错误也照常输出 JSON：诊断走 diagnostics 字段，编辑器靠它画波浪线。
+    // plugin 的退出码只表示「这份 JSON 有没有产出」，别把编辑器刷成空白
+    true
 }
 
 /// 把分析结果拼成 JSON 数组。没有引第三方序列化库，这里手拼；只需转义字符串里的
@@ -541,23 +595,31 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args = std::env::args().collect::<Vec<_>>();
     log::init_from_env();
 
-    if let Some(cmd) = args.get(1) {
+    let ok = if let Some(cmd) = args.get(1) {
         // 跳过程序名与子命令，摘掉日志开关（-q/-v/--log=）后余下才是路径参数
         let rest = log::take_flags(&args[2..]);
         match cmd.as_str() {
             "compile" => compile(&rest),
-            "parse" => {
-                parse(&rest);
-            }
+            "parse" => parse(&rest),
             "check" => check(&rest),
             "plugin" => plugin(&rest),
-            other => log_error!("未知命令: {other}"),
+            other => {
+                log_error!("未知命令: {other}");
+                false
+            }
         }
     } else {
         log_error!("未提供命令");
+        false
+    };
+    // 0 只代表「这一步真的成功了」。CI 直接看退出码，不再 grep 输出文本
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

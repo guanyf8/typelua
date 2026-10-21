@@ -350,10 +350,14 @@ impl Lua53 {
 impl DFS<()> for Lua53 {}
 
 impl Emitter for Lua53 {
-    fn write(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>, target_path: &str) {
+    fn write(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>, target_path: &str) -> bool {
         let buffer = self.render(ast, ctx);
-        if let Err(err) = std::fs::write(target_path, buffer) {
-            eprintln!("{}: 写出失败 {target_path}: {err}", ctx.module);
+        match std::fs::write(target_path, buffer) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("{}: 写出失败 {target_path}: {err}", ctx.module);
+                false
+            }
         }
     }
 }

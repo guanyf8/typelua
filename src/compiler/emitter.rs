@@ -19,7 +19,8 @@ pub struct EmitCtx<'a> {
 }
 
 pub trait Emitter: DFS<()> {
-    fn write(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>, target_path: &str);
+    /// 返回 false 表示写出失败（原因由实现自己报过），CLI 据此决定退出码
+    fn write(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>, target_path: &str) -> bool;
 }
 
 pub struct EmitDriver {
@@ -35,9 +36,11 @@ impl EmitDriver {
         self.emitters.push(emitter);
     }
 
-    pub fn write(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>, target_path: &str) {
+    pub fn write(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>, target_path: &str) -> bool {
+        let mut ok = true;
         for emitter in &self.emitters {
-            emitter.write(ast, ctx, target_path);
+            ok &= emitter.write(ast, ctx, target_path);
         }
+        ok
     }
 }
