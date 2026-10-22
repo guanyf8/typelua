@@ -10,9 +10,9 @@ use std::process::ExitCode;
 
 use crate::lexer::type_def::Span;
 
+use crate::compiler::RUNTIME_MODULE;
 use crate::compiler::emitter::{EmitCtx, EmitDriver, Lua53};
 use crate::compiler::linter::{DiagLevel, LintDriver, LinterOutput};
-use crate::compiler::plan::{ModulePlan, RUNTIME_MODULE};
 use crate::compiler::runtime;
 use crate::parser::ast::Tree;
 use crate::parser::parser::{NodeSyntax, Parser, SyntaxError};
@@ -312,9 +312,8 @@ fn compile(args: &[String]) -> bool {
     }
 
     // 3) 工程级两相位类型检查：有诊断就别发射，免得把已知错误的树落成 .lua。
-    //    计划（import 改写点 + 前置声明）和诊断一起回来，发射阶段直接用
-    let check = LintDriver::check_project_planned(&modules);
-    let results = check.results;
+    //    发射端只读树，import 改写与前置声明由它自己算，这里只取诊断
+    let results = LintDriver::check_project(&modules);
     let mut errors = 0usize;
     let mut warnings = 0usize;
     for (module, diags) in &results {
@@ -361,7 +360,6 @@ fn compile(args: &[String]) -> bool {
     };
     let mut driver = EmitDriver::new();
     driver.add_emitter(Box::new(Lua53::new()));
-    let empty_plan = ModulePlan::default();
     let mut emitted = 0usize;
     for ((_, path, _), &(module, tree)) in sources.iter().zip(&modules) {
         // --out 给了就按模块名铺进该目录（并按需建子目录），否则在源文件旁原地生成
@@ -379,11 +377,7 @@ fn compile(args: &[String]) -> bool {
             }
             None => path.with_extension("lua"),
         };
-        let ctx = EmitCtx {
-            module,
-            plan: check.plan.module(module).unwrap_or(&empty_plan),
-            shared,
-        };
+        let ctx = EmitCtx { module, shared };
         // 写出失败（磁盘满 / 没权限）也算编译失败，不能让 CI 误判成功
         if !driver.write(tree, &ctx, &target.display().to_string()) {
             return false;

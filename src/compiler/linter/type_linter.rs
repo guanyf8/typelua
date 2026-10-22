@@ -32,7 +32,7 @@
 // `type_arenas.pack(..)`、拆出来用 `type_arenas.as_list(..)`，中间只走 TypeId 一条道
 use super::super::utils::{DFS, DiagLevel, Diagnostic, walk};
 use super::*;
-use crate::compiler::plan::{ImportedClass, ModulePlan};
+use crate::compiler::RUNTIME_LOCAL;
 use crate::compiler::utils::string_literal;
 use crate::lexer::type_def::*;
 use crate::parser::ast::Tree;
@@ -248,14 +248,10 @@ fn metamethod(op: &Token, unary: bool) -> Option<(&'static str, MetaResult)> {
     Some(hit)
 }
 
-/// 一条 import 绑定的全部事实。类型检查只要 `decl`，发射期还得知道运行时
-/// 去哪张表取它 —— 别名只改本文件的类型命名空间，注册表里的键是**原名**
+/// 一条 import 绑定。检查端只要 `decl` 与两个 span；运行时的模块 / 原名
+/// 由发射端直接读 import 语句自己算，不在这里重存一份
 pub(super) struct ImportBinding {
-    /// 对面模块名（`import {..} in "pkg.account"` 里那个）
-    module: String,
-    /// 对面模块导出时的原名
-    class: String,
-    /// 那条 Decl。只有 class 才有值位改写，typedef 只留在类型命名空间里
+    /// 那条 Decl。只有 class 才有值位，typedef 只留在类型命名空间里
     decl: DeclId,
     /// 单条 item 的 span：同一条 import 里重复列同一个名字按它认同一次
     item_span: Span,
@@ -291,19 +287,12 @@ pub struct Context {
     /// pub 拿它当导出的键一半，跨文件的 import 靠它知道自己往哪个模块查
     current_module: NameId,
     /// 本文件的 import 绑定：本地名 -> 那条绑定。`hoist_imports` 填，整趟
-    /// 检查都读它；类型位只取 `decl`，值位（构造 / 静态访问 / 继承 / 外部方法）
-    /// 还要知道模块名才能去运行时注册表里取
+    /// 检查都读它；类型位取 `decl`，值位顺序检查取两个 span。运行时的模块 /
+    /// 原名不在这里存 —— 发射端直接读 import 语句自己算
     imports: HashMap<String, ImportBinding>,
-    /// 发射计划的一半：值位上的 import 类名（NAME token 节点 -> 去哪取）。
-    /// 键用节点下标，理由见 plan.rs 抬头
-    rewrites: HashMap<usize, ImportedClass>,
-    /// 发射计划的另一半：被更早的值位引用、需要提到文件头 `local` 里的本地类。
-    /// 存 DeclId 而不是名字，是为了算撞名时拿得到声明位置
-    predeclares: Vec<DeclId>,
-    /// 顶层变量名与声明位置（含全局）。预声明会往文件头补 `local 类名`，
-    /// 同名变量在类之前就已经占了这个名字时，那个 `local` 会把变量遮住、
-    /// 类表赋值也会打到变量身上，所以 `finish` 要拿它核对
-    top_vars: Vec<(String, Span)>,
+    /// 本文件里用户写出的全部值绑定（local / 形参 / for 变量 / 全局 / extern /
+    /// 顶层函数名）与位置。保留名规则按模块核对，所以不分作用域深浅，全收在一张表
+    bindings: Vec<(String, Span)>,
 }
 
 impl Context {
@@ -322,9 +311,7 @@ impl Context {
             ret_stack: Vec::new(),
             current_module: NameId::default(),
             imports: HashMap::new(),
-            rewrites: HashMap::new(),
-            predeclares: Vec::new(),
-            top_vars: Vec::new(),
+            bindings: Vec::new(),
         }
     }
 }
@@ -702,11 +689,9 @@ impl TypeLinter {
         assigned: bool,
     ) -> bool {
         let slot = self.session.new_slot(ty, span, kind, assigned);
-        // 顶层 local 也叫一个名字。层数 2 = chunk 的 @Block（层 1 是 prepare 压的
-        // 文件级作用域），再深就是函数体 / 分支块里的局部，和文件头不撞
-        if ctx.scope_stack.len() == 2 {
-            ctx.top_vars.push((name.to_string(), span));
-        }
+        // 保留名规则要按模块核对，不分作用域深浅：形参 / 分支块里的 local 同样
+        // 会和发射端的名字改写撞车，所以每个绑定都记
+        ctx.bindings.push((name.to_string(), span));
         let scope = ctx
             .scope_stack
             .last_mut()
@@ -727,7 +712,7 @@ impl TypeLinter {
         assigned: bool,
     ) -> bool {
         // 全局的声明点本来就只认 chunk 顶层（is_chunk_top），所以全记
-        ctx.top_vars.push((name.to_string(), span));
+        ctx.bindings.push((name.to_string(), span));
         let slot = self.session.new_slot(ty, span, kind, assigned);
         self.session.declare_global(name, slot)
     }
@@ -1139,9 +1124,7 @@ impl DFS<Context> for TypeLinter {
         ctx.class_stack.clear();
         ctx.ret_stack.clear();
         ctx.imports.clear();
-        ctx.rewrites.clear();
-        ctx.predeclares.clear();
-        ctx.top_vars.clear();
+        ctx.bindings.clear();
         // 文件级作用域：它是 flow_reset 记 scope_depth 的基准，得先压。
         // chunk 的 @Block 还会自己再压一格，顶层 local 落在那一格里
         ctx.scope_stack.push(Scope::new());
@@ -1358,9 +1341,7 @@ impl DFS<Context> for TypeLinter {
         // 字段覆盖的收口留到这里：extends 的父类可能声明在子类后面（前向继承），
         // 子类 leave 时父类体还没填，只有全走完才查得准
         self.check_field_overrides(ctx, diags);
-        // 前置声明和保留名都是「一整趟才说得清」的事：前者要知道最终哪些类被
-        // 提前引用了，后者要把变量 / 类 / import 三张表都看一遍
-        self.check_predeclares(ctx, diags);
+        // 保留名是「一整趟才说得清」的事：类 / import 两张表要等 hoist 全跑完
         self.check_reserved_names(ctx, diags);
         debug_assert_eq!(ctx.flow_stack.len(), 1, "流帧栈没配平");
         debug_assert!(ctx.join_stack.is_empty(), "join 帧没配平");
@@ -1370,64 +1351,79 @@ impl DFS<Context> for TypeLinter {
 }
 
 impl TypeLinter {
-    /// 前置声明的落地检查。`local 类名` 要占文件头那个名字，撞上同名的顶层
-    /// 变量就会把那个变量遮住，类表赋值 `类名 = {}` 也会打到变量身上。只有
-    /// **声明在类之前**的变量才算撞 —— 类后面再 `local 同名` 只是从那时起
-    /// 遮蔽，影响不到类表赋值和更早的值位
-    fn check_predeclares(&self, ctx: &Context, diags: &mut Vec<Diagnostic>) {
-        for &decl in &ctx.predeclares {
-            let class_span = self.session.decls.get(decl).span();
-            let cname = self
-                .session
-                .names
-                .resolve(self.session.decls.get(decl).name());
-            for (name, span) in &ctx.top_vars {
-                if name != cname || span.start >= class_span.start {
-                    continue;
-                }
+    /// 保留名规则：类名与 import 本地名在模块的值命名空间里保留。发射端只读
+    /// 文件本身，按名字把 import 名换成 `get`、把前向引用的类提前建表；一旦有
+    /// 变量 / 形参 / 全局赋值用了同一个名字，值位就会静默指错。这里一次收口，
+    /// 发射端不必再重算一遍作用域。
+    ///
+    /// `__typelua` 是共享运行时注入的局域名，`self` 是方法接收者（每个方法都有
+    /// 隐式绑定），两者也不许被类 / import 占用。
+    fn check_reserved_names(&self, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+        // true = 名字来自 import；false = 名字来自本文件的 class
+        let mut reserved: HashMap<&str, bool> = HashMap::new();
+        for &decl in &ctx.file_decls {
+            let d = self.session.decls.get(decl);
+            let name = self.session.names.resolve(d.name());
+            if name == RUNTIME_LOCAL || name == "self" {
+                let why = if name == RUNTIME_LOCAL {
+                    "共享运行时的局域名"
+                } else {
+                    "方法接收者"
+                };
                 diags.push(Diagnostic {
                     severity: DiagLevel::Error,
-                    span: *span,
-                    msg: format!(
-                        "class {cname} 需要在文件头前置声明，但它和这个同名的顶层变量冲突：改个名字，或者把引用挪到类声明之后"
-                    ),
+                    span: d.span(),
+                    msg: format!("{name} 是编译器保留的名字（{why}），类不能叫这个"),
                 });
+                continue;
+            }
+            if matches!(d.kind(), DeclKind::Class) {
+                reserved.insert(name, false);
             }
         }
-    }
-
-    /// 发射器的共享头会往每个文件里写 `local __typelua = require(…)`。那个名字
-    /// 一旦被用户占用，注入的局域名会和用户的值互相覆盖 —— 直接当保留名拒掉
-    fn check_reserved_names(&self, ctx: &Context, diags: &mut Vec<Diagnostic>) {
-        let hit = |name: &str| name == crate::compiler::plan::RUNTIME_LOCAL;
-        for (name, span) in &ctx.top_vars {
-            if hit(name) {
+        for (name, binding) in &ctx.imports {
+            if name == RUNTIME_LOCAL || name == "self" {
+                let why = if name == RUNTIME_LOCAL {
+                    "共享运行时的局域名"
+                } else {
+                    "方法接收者"
+                };
+                diags.push(Diagnostic {
+                    severity: DiagLevel::Error,
+                    span: binding.item_span,
+                    msg: format!("{name} 是编译器保留的名字（{why}），换个本地名"),
+                });
+                continue;
+            }
+            reserved.insert(name.as_str(), true);
+        }
+        for (name, span) in &ctx.bindings {
+            // 每个方法都有的隐式接收者；用户显式写 `self` 也走同一条，不当撞名
+            if name == "self" {
+                continue;
+            }
+            if name == RUNTIME_LOCAL {
                 diags.push(Diagnostic {
                     severity: DiagLevel::Error,
                     span: *span,
                     msg: format!("{name} 是编译器保留的名字（共享运行时的局域名），换一个"),
                 });
+                continue;
             }
-        }
-        for &decl in &ctx.file_decls {
-            let d = self.session.decls.get(decl);
-            if hit(self.session.names.resolve(d.name())) {
+            if let Some(&from_import) = reserved.get(name.as_str()) {
+                let msg = if from_import {
+                    format!(
+                        "变量 {name} 和 import 的本地名冲突：import 名在模块的值命名空间里保留，改用别的名字，或在 import 里换个本地名"
+                    )
+                } else {
+                    format!(
+                        "变量 {name} 和模块里的类名冲突：类名在模块的值命名空间里保留，改用别的名字"
+                    )
+                };
                 diags.push(Diagnostic {
                     severity: DiagLevel::Error,
-                    span: d.span(),
-                    msg: format!(
-                        "{} 是编译器保留的名字（共享运行时的局域名），换一个",
-                        self.session.names.resolve(d.name())
-                    ),
-                });
-            }
-        }
-        for (name, binding) in &ctx.imports {
-            if hit(name) {
-                diags.push(Diagnostic {
-                    severity: DiagLevel::Error,
-                    span: binding.item_span,
-                    msg: format!("{name} 是编译器保留的名字（共享运行时的局域名），换个本地名"),
+                    span: *span,
+                    msg,
                 });
             }
         }
@@ -1486,34 +1482,7 @@ impl Linter for TypeLinter {
 
         let mut output = LinterOutput::empty(self.name());
         output.diagnostics = diagnostics;
-        output.plan = self.module_plan(&mut ctx);
         output
-    }
-}
-
-impl TypeLinter {
-    /// 把本趟攒下的改写点与前置声明收成发射计划。两样都空就交 `None`，
-    /// 让单文件 / 无 import 的工程走 emitter 的空计划路径，输出与 master 一致
-    fn module_plan(&mut self, ctx: &mut Context) -> Option<ModulePlan> {
-        if ctx.rewrites.is_empty() && ctx.predeclares.is_empty() {
-            return None;
-        }
-        // 按声明位置排：文件头建表的顺序就跟着源码，读起来自然
-        let mut predeclares: Vec<DeclId> = std::mem::take(&mut ctx.predeclares);
-        predeclares.sort_by_key(|&d| self.session.decls.get(d).span().start);
-        predeclares.dedup();
-        Some(ModulePlan {
-            rewrites: std::mem::take(&mut ctx.rewrites),
-            predeclares: predeclares
-                .into_iter()
-                .map(|d| {
-                    self.session
-                        .names
-                        .resolve(self.session.decls.get(d).name())
-                        .to_string()
-                })
-                .collect(),
-        })
     }
 }
 

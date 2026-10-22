@@ -1,7 +1,6 @@
 mod lua53;
 pub use lua53::Lua53;
 
-use super::plan::ModulePlan;
 use super::utils::DFS;
 use crate::parser::ast::*;
 use crate::parser::parser::*;
@@ -11,16 +10,42 @@ use crate::parser::parser::*;
 pub struct EmitCtx<'a> {
     /// 当前模块名（`import {..} in "pkg.account"` 里那个）
     pub module: &'a str,
-    /// linter 算好的本模块发射计划（import 改写点 + 前置声明）
-    pub plan: &'a ModulePlan,
     /// 多模块工程：注入共享运行时头、注册 pub 类、import 来的类走 `get`。
     /// 单文件工程不开；再叠上「没有前向引用」时输出与 master 逐字一致
     pub shared: bool,
 }
 
 pub trait Emitter: DFS<()> {
-    /// 返回 false 表示写出失败（原因由实现自己报过），CLI 据此决定退出码
-    fn write(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>, target_path: &str) -> bool;
+    /// 整棵树 -> 一份 Lua 文本。发射端只读同一次解析的 CST：import 了谁、
+    /// 哪个类声明在后面，这两件事都写在树上，不需要 linter 的产出
+    fn render(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>) -> String;
+
+    /// 落盘。原因由实现自己报过，CLI 据此决定退出码
+    fn write(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>, target_path: &str) -> bool {
+        let buffer = self.render(ast, ctx);
+        match std::fs::write(target_path, buffer) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("{}: 写出失败 {target_path}: {err}", ctx.module);
+                false
+            }
+        }
+    }
+}
+
+/// 解析 + 发射：把一份 `.tua` 源码直接变成 Lua 文本，不经过 linter。
+///
+/// 这是给宿主（C loader / 编辑器插件）用的窄接口：拿到源码字符串就出 Lua，
+/// 不需要工程、不需要检查结果。语法错误原样交回，由调用方决定怎么报。
+/// bin 里暂时没有调用点（loader 还没接上），先允许它在非测试构建里空着
+#[allow(dead_code)]
+pub fn emit_source(module: &str, source: &str, shared: bool) -> Result<String, Vec<SyntaxError>> {
+    let mut parser = Parser::new(source);
+    let errors = parser.parse().errors;
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(Lua53::new().render(parser.tree(), &EmitCtx { module, shared }))
 }
 
 pub struct EmitDriver {

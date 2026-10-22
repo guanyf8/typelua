@@ -1,7 +1,6 @@
 mod highlight_linter;
 mod type_linter;
 
-use super::plan::{ModulePlan, ProjectPlan};
 pub use super::utils::{DiagLevel, Diagnostic};
 use crate::lexer::type_def::Span;
 use crate::parser::ast::*;
@@ -18,10 +17,6 @@ pub struct LinterOutput {
     pub tokens: Vec<SemToken>,
     pub links: Vec<DefLink>,
     pub completions: Vec<Completion>,
-    /// 只有类型 linter 会填：本模块的发射计划（import 改写点 + 前置声明）。
-    /// 高亮 linter 留空。计划挂在产物上而不是再加一个 trait 方法，是因为
-    /// 驱动本来就是「一次 output 交回全部产物」，多开一条通道反而要驱动再攒一遍
-    pub plan: Option<ModulePlan>,
 }
 
 impl LinterOutput {
@@ -32,7 +27,6 @@ impl LinterOutput {
             tokens: Vec::new(),
             links: Vec::new(),
             completions: Vec::new(),
-            plan: None,
         }
     }
 }
@@ -63,12 +57,6 @@ pub struct LintDriver {
     linters: Vec<Box<dyn Linter>>,
 }
 
-/// 工程级检查的完整产物：诊断 + 发射计划
-pub struct ProjectCheck {
-    pub results: Vec<(String, Vec<Diagnostic>)>,
-    pub plan: ProjectPlan,
-}
-
 impl LintDriver {
     pub fn new() -> Self {
         LintDriver { linters: vec![] }
@@ -79,32 +67,25 @@ impl LintDriver {
         self
     }
 
-    /// 工程级检查兼容入口。它仍经过统一的 output_project，只取其中诊断部分。
+    /// 工程级检查：经过统一的 output_project，只取诊断。发射端不再需要计划，
+    /// 每个模块的 import / 前置声明都由 emitter 从树本身算出来。
     pub fn check_project(
         modules: &[(&str, &Tree<NodeSyntax<'_>>)],
     ) -> Vec<(String, Vec<Diagnostic>)> {
-        Self::check_project_planned(modules).results
-    }
-
-    /// 工程级检查 + 发射计划。compile 用这个，check 只用上面的诊断部分。
-    pub fn check_project_planned(modules: &[(&str, &Tree<NodeSyntax<'_>>)]) -> ProjectCheck {
         let inputs: Vec<_> = modules
             .iter()
             .map(|&(module, ast)| (module, ast, &[][..]))
             .collect();
-        let mut plan = ProjectPlan::default();
-        let mut results = Vec::new();
-        for (module, outputs) in Self::output_project(&inputs) {
-            let mut diagnostics = Vec::new();
-            for output in outputs {
-                if let Some(module_plan) = output.plan {
-                    plan.insert(module.clone(), module_plan);
+        Self::output_project(&inputs)
+            .into_iter()
+            .map(|(module, outputs)| {
+                let mut diagnostics = Vec::new();
+                for output in outputs {
+                    diagnostics.extend(output.diagnostics);
                 }
-                diagnostics.extend(output.diagnostics);
-            }
-            results.push((module, diagnostics));
-        }
-        ProjectCheck { results, plan }
+                (module, diagnostics)
+            })
+            .collect()
     }
 
     /// 唯一的工程级输出入口。默认流水线装入 highlight + type 两个 linter；先让

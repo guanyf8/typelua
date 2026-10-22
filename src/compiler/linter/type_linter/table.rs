@@ -335,15 +335,15 @@ impl TypeLinter {
 
     /// 一个类名被当值用了。值位只有三处 —— `A{…}` 构造、`A.m` 静态读、
     /// `class B : A` 继承（裸读在 `check_var_read` 里就拒了）—— **三处都归这
-    /// 一条口径**，于是「这里能不能用这个类」「发射时要换成什么」只有一处答案。
+    /// 一条口径**，于是「这里能不能用这个类」只有一处答案。
     ///
-    ///   - import 来的类：记一条改写，让 emitter 把名字换成 `__typelua.get(模块, 类)`。
-    ///     顺序只看 import 那一行 —— 值位必须写在它后面
-    ///   - 本地类：声明之前的**延迟**值位（函数体 / 类体里）记一条前置声明，
-    ///     让 emitter 把类表提到文件头 `local` 里；立即位置就真的读到 nil 了，报错
+    ///   - import 来的类：值位必须写在 import 那一行后面，否则报错
+    ///   - 本地类：声明之前的**延迟**值位（函数体 / 类体里）是合法的；立即位置
+    ///     就真的读到 nil 了，报错
     ///
-    /// `deferred` = 这个值位是不是延迟求值的。extends 恒按**延迟**算：父类允许写在
-    /// 后面，靠前置声明让 `__index = 父类` 抓到文件头那张表，而不是声明时还没建的 nil
+    /// 发射端按名字自己算改写与前置声明（保留名规则保证名字唯一），这里只出诊断。
+    /// `deferred` = 这个值位是不是延迟求值的。extends 恒按**延迟**算：父类允许 写在
+    /// 后面，`__index = 父类` 靠发射端的前置声明拿到文件头那张表
     ///
     /// 返回 false = 这里已经不能用了（诊断已出），调用方不必再往下核对
     #[allow(clippy::too_many_arguments)]
@@ -375,22 +375,12 @@ impl TypeLinter {
                 });
                 return false;
             }
-            ctx.rewrites.insert(
-                site,
-                ImportedClass {
-                    module: binding.module.clone(),
-                    class: binding.class.clone(),
-                },
-            );
             return true;
         }
         if span.start > self.session.decls.get(decl).span().end {
             return true;
         }
         if deferred {
-            if !ctx.predeclares.contains(&decl) {
-                ctx.predeclares.push(decl);
-            }
             return true;
         }
         diags.push(Diagnostic {

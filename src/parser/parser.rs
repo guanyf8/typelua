@@ -20,6 +20,7 @@ impl NodeData for NodeSyntax<'_> {
 
 /// 一条语法诊断：字节区间 + 人读信息。词法错误（`next_terminal` 跳过坏字符时）
 /// 与文法错误（`Action::Error`）共用这个壳，`main` 按模块名逐条报。
+#[derive(Debug)]
 pub struct SyntaxError {
     pub span: Span,
     pub msg: String,

@@ -14,7 +14,7 @@ impl TypeLinter {
     // ================== §11 跨模块 ==================
     //
     // import / pub。类型面搬的是「类型名 -> DeclId」，语句本身擦除后一个字不剩；
-    // 但 class 的绑定要多记对面模块名与导出原名 —— 值位改写（`get`）靠它。
+    // 运行时的值位改写由发射端按 import 语句现算，检查端只留诊断所需的事实。
     // 两条都【只许顶层】—— 文法表达不了，所以都在这里拦
 
     /// 一条 import 的 item 列表。`@ImportAlias` 收起两种写法：
@@ -88,8 +88,6 @@ impl TypeLinter {
                 ctx.imports.insert(
                     item.local.to_string(),
                     ImportBinding {
-                        module: module.clone(),
-                        class: item.orig.to_string(),
                         decl,
                         item_span: item.span,
                         statement_span,
@@ -149,8 +147,6 @@ impl TypeLinter {
                         ctx.imports.insert(
                             item.local.to_string(),
                             ImportBinding {
-                                module: module_str.clone(),
-                                class: item.orig.to_string(),
                                 decl,
                                 item_span: span,
                                 statement_span,

@@ -228,7 +228,6 @@ impl Linter for HighlightLinter {
             tokens: analysis.tokens,
             links: analysis.links,
             completions: analysis.completions,
-            plan: None,
         }
     }
 }

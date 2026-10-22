@@ -1141,10 +1141,14 @@ mod driver_tests {
         );
     }
 
-    /// 同名局部变量遮蔽类名：`A(1)` 就回到普通调用
+    /// 同名局部变量不能遮蔽类名：发射端按名字认值位，遮蔽会让它指错。
+    /// 这条从「合法遮蔽」改成了保留名错误
     #[test]
-    fn local_variable_shadows_class_name() {
-        clean("class A { n : number = 0 }\nlocal A = function(x:number) end\nA(1)");
+    fn local_variable_shadows_class_name_reports() {
+        only(
+            "class A { n : number = 0 }\nlocal A = function(x:number) end\nA(1)",
+            "和模块里的类名冲突",
+        );
     }
 
     /// 构造的结果就是那个类：接给标注本类的 local 干净
@@ -1166,6 +1170,45 @@ mod driver_tests {
     #[test]
     fn class_name_in_value_position_is_not_undeclared() {
         clean("class A { n:number, make(x:number) -> number return x end }\nlocal v = A.make(1)");
+    }
+
+    /// 类名不是值：裸读一律拒绝 —— 赋给变量、当实参、进表项、套括号都一样。
+    /// 这是静态（类型）与动态（值）的隔离：类名只活在类型命名空间
+    #[test]
+    fn bare_class_read_is_not_a_value() {
+        only("class A { n:number = 1 }\nlocal k = A", "是类名而不是值");
+        only(
+            "class A { n:number = 1 }\nlocal function f(a:A) -> A return a end\nf(A)",
+            "是类名而不是值",
+        );
+        only(
+            "class A { n:number = 1 }\nlocal t = {v = A}",
+            "是类名而不是值",
+        );
+        only("class A { n:number = 1 }\nlocal p = (A)", "是类名而不是值");
+    }
+
+    /// 拒绝裸读的同时不能误伤四个合法值位：构造、静态成员、extends 照旧
+    #[test]
+    fn class_value_forms_still_clean() {
+        clean("class A { n:number = 1 }\nlocal a = A{}");
+        clean("class A { twice(x:number) -> number return x end }\nlocal v = A.twice(2)");
+        clean("class A { n:number = 1 }\nclass B : A { m:number = 2 }");
+    }
+
+    /// 跨模块同理：import 来的类裸读报错，不当成值
+    #[test]
+    fn imported_class_bare_read_is_not_a_value() {
+        let diags = lint_project(&[
+            ("base", "pub class A { n:number = 1 }"),
+            ("main", "import {A} in \"base\"\nlocal k = A"),
+        ]);
+        assert_eq!(diags[1].len(), 1, "实得 {:?}", diags[1]);
+        assert!(
+            diags[1][0].contains("是类名而不是值"),
+            "实得 {:?}",
+            diags[1]
+        );
     }
 
     /// 方法的形参不外泄：`p` 是方法 `f` 的形参，类体外读它该报未声明
@@ -2299,6 +2342,199 @@ mod driver_tests {
             "do pub class Point { x : number } end",
             "pub 只能修饰顶层的 class / typedef",
         );
+    }
+
+    // ---- 跨模块的值 ----
+
+    /// import 来的类现在带值：构造与继承都只要求写在 import 语句之后
+    #[test]
+    fn imported_class_can_be_constructed_and_extended() {
+        let got = lint_project(&[
+            ("base", "pub class Base { n : number = 1 }"),
+            (
+                "main",
+                "import {Base as B} in \"base\"\nlocal x = B{}\nclass C : B { m : number = 2 }\nlocal c = C{}",
+            ),
+        ]);
+        assert!(got[0].is_empty(), "实得 {:?}", got[0]);
+        assert!(got[1].is_empty(), "实得 {:?}", got[1]);
+    }
+
+    /// import 之前的用法要报：那行才是本文件认识这个类的起点
+    #[test]
+    fn imported_class_used_before_the_import_reports() {
+        let got = lint_project(&[
+            ("base", "pub class Base { n : number = 1 }"),
+            ("main", "local x = B{}\nimport {Base as B} in \"base\""),
+        ]);
+        assert!(got[0].is_empty(), "实得 {:?}", got[0]);
+        assert_eq!(got[1].len(), 1, "实得 {:?}", got[1]);
+        assert!(got[1][0].contains("import 语句之前"), "实得 {:?}", got[1]);
+    }
+
+    /// 类体外的 `function A:m` 要的是本文件里的那张类表；import 来的没有
+    #[test]
+    fn external_method_on_imported_class_reports() {
+        let got = lint_project(&[
+            ("base", "pub class Base { m(self) -> number return 1 end }"),
+            (
+                "main",
+                "import {Base} in \"base\"\nfunction Base:m() -> number\n    return 2\nend",
+            ),
+        ]);
+        assert!(got[0].is_empty(), "实得 {:?}", got[0]);
+        assert_eq!(got[1].len(), 1, "实得 {:?}", got[1]);
+        assert!(
+            got[1][0].contains("不能在类体外用 function 定义方法"),
+            "实得 {:?}",
+            got[1]
+        );
+    }
+
+    /// 同文件的前向值位合法：发射端会按名字自己算前置声明，检查端只放行
+    #[test]
+    fn forward_local_value_in_method_is_clean() {
+        let got = lint_project(&[(
+            "main",
+            "class Z { make(self) -> A return A{} end }\nclass A { n : number = 1 }",
+        )]);
+        assert!(got[0].is_empty(), "实得 {:?}", got[0]);
+    }
+
+    /// 前向继承同样只靠发射端的前置声明：父类写在后面也合法
+    #[test]
+    fn forward_extends_is_clean() {
+        let got = lint_project(&[(
+            "main",
+            "class B : A { m : number = 2 }\nclass A { n : number = 1 }",
+        )]);
+        assert!(got[0].is_empty(), "实得 {:?}", got[0]);
+    }
+
+    /// 顶层立即使用后面才声明的类：那时表还没建，真的读到 nil
+    #[test]
+    fn immediate_forward_value_reports() {
+        only(
+            "local x = A{}\nclass A { n : number = 1 }",
+            "在声明之前就用到了",
+        );
+    }
+
+    /// 顶层变量撞类名：类名在值命名空间里保留，发射端才敢按名字认值位
+    #[test]
+    fn shadowing_a_class_name_reports() {
+        only(
+            "class Z { make(self) -> A return A{} end }\nlocal A = 5\nclass A { n : number = 1 }",
+            "和模块里的类名冲突",
+        );
+    }
+
+    /// 声明前给全局赋值也算占名：发射端会把后面的类当成本文件的类表
+    #[test]
+    fn global_assignment_before_class_reports() {
+        only("A = 1\nclass A { n : number = 1 }", "和模块里的类名冲突");
+    }
+
+    /// 形参同样不许遮蔽 import 的本地名（形参在模块的值命名空间里）
+    #[test]
+    fn parameter_shadowing_import_reports() {
+        let got = lint_project(&[
+            ("base", "pub class Point { x : number } "),
+            (
+                "main",
+                "import {Point} in \"base\"\nlocal function f(Point:number)\n    return Point\nend",
+            ),
+        ]);
+        assert!(got[0].is_empty(), "实得 {:?}", got[0]);
+        assert_eq!(got[1].len(), 1, "实得 {:?}", got[1]);
+        assert!(
+            got[1][0].contains("和 import 的本地名冲突"),
+            "实得 {:?}",
+            got[1]
+        );
+    }
+
+    /// 局部变量遮蔽 import 的本地名：发射端会把它当 import 改写，必须拒绝
+    #[test]
+    fn local_shadowing_import_reports() {
+        let got = lint_project(&[
+            ("base", "pub class Point { x : number } "),
+            (
+                "main",
+                "import {Point} in \"base\"\nlocal Point = 1\nprint(Point)",
+            ),
+        ]);
+        assert!(got[0].is_empty(), "实得 {:?}", got[0]);
+        assert_eq!(got[1].len(), 1, "实得 {:?}", got[1]);
+        assert!(
+            got[1][0].contains("和 import 的本地名冲突"),
+            "实得 {:?}",
+            got[1]
+        );
+    }
+
+    /// 顶层函数名也占值命名空间：`function A` 同样不能和类名撞
+    #[test]
+    fn function_name_shadowing_class_reports() {
+        only(
+            "function A() end\nclass A { n : number = 1 }",
+            "和模块里的类名冲突",
+        );
+    }
+
+    /// 类名不能占用运行时局域名
+    #[test]
+    fn class_named_runtime_local_reports() {
+        only("class __typelua { n : number = 1 }", "编译器保留的名字");
+    }
+
+    /// import 的本地别名也不能叫运行时局域名
+    #[test]
+    fn import_alias_named_runtime_local_reports() {
+        let got = lint_project(&[
+            ("base", "pub class Point { x : number } "),
+            ("main", "import {Point as __typelua} in \"base\""),
+        ]);
+        assert_eq!(got[1].len(), 1, "实得 {:?}", got[1]);
+        assert!(got[1][0].contains("编译器保留的名字"), "实得 {:?}", got[1]);
+    }
+
+    /// typedef 只在类型命名空间里，值绑定同名不冲突
+    #[test]
+    fn shadowing_a_typedef_name_stays_clean() {
+        clean("typedef P = number\nlocal P = 1");
+    }
+
+    /// `__typelua` 是编译器保留的局域名，用户不能占
+    #[test]
+    fn reserved_runtime_local_reports() {
+        only("local __typelua = 1", "编译器保留");
+    }
+
+    /// 类表上只有方法，没有可以下标的容器
+    #[test]
+    fn indexing_a_class_reports() {
+        only(
+            "class A { n : number = 1 }\nlocal k = \"n\"\nlocal v = A[k]",
+            "类名而不是变量",
+        );
+    }
+
+    /// 走真路径（两相位 BUILD）只取诊断：发射计划已经整个从检查端删掉了
+    fn lint_project(mods: &[(&str, &str)]) -> Vec<Vec<String>> {
+        let mut parsers: Vec<Parser> = mods.iter().map(|(_, src)| Parser::new(src)).collect();
+        for parser in parsers.iter_mut() {
+            parser.parse();
+        }
+        let modules: Vec<(&str, &Tree<NodeSyntax>)> = mods
+            .iter()
+            .zip(parsers.iter())
+            .map(|((module, _), parser)| (*module, parser.tree()))
+            .collect();
+        LintDriver::check_project(&modules)
+            .into_iter()
+            .map(|(_, entries)| entries.into_iter().map(|d| d.msg).collect())
+            .collect()
     }
 
     // ---- 整棵样例 ----
