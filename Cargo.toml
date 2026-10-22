@@ -2,6 +2,13 @@
 name = "typelua"
 version = "1.0.0"
 edition = "2024"
+build = "build.rs"
+
+[lib]
+name = "typelua"
+path = "src/lib.rs"
+# rlib 给 bin / 测试用；cdylib 给 Lua 的 require 用
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 grammar = { path = "grammar" }

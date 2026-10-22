@@ -35,10 +35,8 @@ pub trait Emitter: DFS<()> {
 
 /// 解析 + 发射：把一份 `.tua` 源码直接变成 Lua 文本，不经过 linter。
 ///
-/// 这是给宿主（C loader / 编辑器插件）用的窄接口：拿到源码字符串就出 Lua，
+/// 这是给宿主（Lua loader / 编辑器插件）用的窄接口：拿到源码字符串就出 Lua，
 /// 不需要工程、不需要检查结果。语法错误原样交回，由调用方决定怎么报。
-/// bin 里暂时没有调用点（loader 还没接上），先允许它在非测试构建里空着
-#[allow(dead_code)]
 pub fn emit_source(module: &str, source: &str, shared: bool) -> Result<String, Vec<SyntaxError>> {
     let mut parser = Parser::new(source);
     let errors = parser.parse().errors;

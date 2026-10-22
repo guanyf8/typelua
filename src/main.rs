@@ -1,21 +1,18 @@
-mod compiler;
-mod lexer;
 #[macro_use]
 mod log;
-mod parser;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::lexer::type_def::Span;
+use typelua::lexer::type_def::Span;
 
-use crate::compiler::RUNTIME_MODULE;
-use crate::compiler::emitter::{EmitCtx, EmitDriver, Lua53};
-use crate::compiler::linter::{DiagLevel, LintDriver, LinterOutput};
-use crate::compiler::runtime;
-use crate::parser::ast::Tree;
-use crate::parser::parser::{NodeSyntax, Parser, SyntaxError};
+use typelua::compiler::RUNTIME_MODULE;
+use typelua::compiler::emitter::{EmitCtx, EmitDriver, Lua53};
+use typelua::compiler::linter::{DiagLevel, LintDriver, LinterOutput};
+use typelua::compiler::runtime;
+use typelua::parser::ast::Tree;
+use typelua::parser::parser::{NodeSyntax, Parser, SyntaxError};
 
 fn parse(args: &[String]) -> bool {
     // 按路径收集每个文件的语法诊断。parse() 返回的 Tree 借自每个文件的局部
@@ -53,7 +50,7 @@ fn parse_path(path: &Path, results: &mut HashMap<String, Vec<SyntaxError>>) -> b
     } else if path.is_file() {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let mut parser = parser::parser::Parser::new(&contents);
+                let mut parser = Parser::new(&contents);
                 let errors = parser.parse().errors;
                 for e in &errors {
                     log_error!(

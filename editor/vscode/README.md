@@ -3,6 +3,14 @@
 Language support for **TypeLua** (`.tua`): TextMate + semantic highlighting and
 go-to-definition, driven by the compiler's own `typelua plugin` command.
 
+## Install
+
+```
+code --install-extension typelua-1.0.0.vsix
+```
+
+The package bundles the macOS CLI (universal: arm64 + x86_64, version 1.0.0).
+
 ## What it does
 
 - **Syntax highlighting** — a TextMate grammar colors keywords, strings, numbers,
@@ -38,7 +46,11 @@ and jumps update after you save.
 | `typelua.binaryPath` | `""` | Absolute path to the `typelua` binary. Empty = use the binary bundled in `bin/`. |
 | `typelua.trace` | `false` | Log analyzer invocations/errors to the **TypeLua** output channel. |
 
-Command: **TypeLua: Re-analyze workspace** (`typelua.reanalyze`).
+Commands:
+
+- **TypeLua: Re-analyze workspace** (`typelua.reanalyze`)
+- **TypeLua: Build to dist/ (Lua 5.3)** (`typelua.build`) — runs
+  `typelua compile … --out dist` in the active workspace folder.
 
 ## Project configuration (`typelua.json`)
 
@@ -67,6 +79,10 @@ For example, to analyze only the `examples` directory:
 
 ## The bundled binary
 
-A release build of `typelua` ships under `bin/`. If it does not match your
-platform, build one (`cargo build --release`) and point `typelua.binaryPath` at
+`bin/typelua` is the 1.0.0 macOS universal binary (arm64 + x86_64). On other
+platforms, build one (`cargo build --release`) and point `typelua.binaryPath` at
 `target/release/typelua`.
+
+The CLI exits `0` only when the command succeeded: `check` and `compile` return
+non-zero on syntax errors, type errors, missing paths and write failures, so CI
+can gate on the exit status.
