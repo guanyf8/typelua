@@ -3,20 +3,35 @@
 //! 语法错误转成 `行:列: 消息`，真实路径由调用方补 —— loader 手里有文件名，
 //! 编辑器插件手里是缓冲区名，同一个函数不用为两边各写一套。
 
-use crate::compiler::emitter::emit_source;
+use crate::compiler::emitter::{RuntimeMode, emit_source};
 use crate::parser::parser::SyntaxError;
 
 /// 解析并发射一份 `.tua`。类型检查不参与，语法错误原样返回。
 ///
-/// 总是按多模块工程发射（共享运行时头 + pub 类登记）：loader 加载的模块
-/// 天然可能互相 import；单文件模式下 `import` 本来也不允许。
+/// loader 总是拿 `RuntimeMode::Require` 的产物：运行时由它自己装进
+/// `package.preload`，各模块共用一个 `.lua` 比每份都内联省。
 pub fn compile_source(module: &str, source: &str) -> Result<String, Vec<String>> {
-    emit_source(module, source, true).map_err(|errors| {
+    emit_source(module, source, RuntimeMode::Require).map_err(|errors| {
         errors
             .iter()
             .map(|error| format_error(source, error))
             .collect()
     })
+}
+
+/// 模块名会原样进生成代码的字符串字面量（`enter` / `def` / `get`）。
+/// 引号、反斜杠、控制字符会直接破坏 Lua 语法，CLI 和 loader 在入口统一拒绝。
+pub fn validate_module_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("模块名为空".to_string());
+    }
+    if let Some(ch) = name
+        .chars()
+        .find(|&ch| ch == '"' || ch == '\\' || ch.is_control())
+    {
+        return Err(format!("模块名 {name:?} 含有不支持的字符 {ch:?}"));
+    }
+    Ok(())
 }
 
 fn format_error(source: &str, error: &SyntaxError) -> String {

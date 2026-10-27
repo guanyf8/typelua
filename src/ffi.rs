@@ -216,17 +216,9 @@ fn load_module(name: &str, package_path: &str) -> Result<String, LoadError> {
 }
 
 /// 保护发射端的字符串插值：模块名会原样进 `enter("...")`/`get("...", "..")`。
+/// 规则与 CLI 共用，loader 这里额外带上来源前缀。
 fn validate_module_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("typelua: 模块名为空".to_string());
-    }
-    if let Some(ch) = name
-        .chars()
-        .find(|&ch| ch == '"' || ch == '\\' || ch.is_control())
-    {
-        return Err(format!("typelua: 模块名 {name:?} 含有不支持的字符 {ch:?}"));
-    }
-    Ok(())
+    crate::api::validate_module_name(name).map_err(|message| format!("typelua: {message}"))
 }
 
 /// 把 `package.path` 的模板改成 `.tua`。只替换结尾的 `.lua`，目录名里带

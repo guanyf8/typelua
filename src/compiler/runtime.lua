@@ -1,7 +1,11 @@
--- TypeLua 共享运行时。多模块工程的每个 .lua 文件头都会 require 它：
+-- 传目录编译时，每个 .lua 文件头都会 require 它：
 --
 --   local __typelua = require("__typelua_runtime")
 --   __typelua.enter("pkg.account")
+--
+-- 只列文件编译时，这份源码被内联在产物文件头，并登记到
+-- package.loaded["__typelua_runtime"]；因此文件列表产物、目录编译产物和
+-- loader 共用同一张注册表。
 --
 -- 它只做两件事：
 --   1. def / get：pub 类在自己的定义处登记，别的模块按 (模块名, 类名) 取

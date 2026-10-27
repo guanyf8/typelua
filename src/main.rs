@@ -2,13 +2,14 @@
 mod log;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use typelua::lexer::type_def::Span;
 
+use typelua::api::validate_module_name;
 use typelua::compiler::RUNTIME_MODULE;
-use typelua::compiler::emitter::{EmitCtx, EmitDriver, Lua53};
+use typelua::compiler::emitter::{EmitCtx, EmitDriver, Lua53, RuntimeMode};
 use typelua::compiler::linter::{DiagLevel, LintDriver, LinterOutput};
 use typelua::compiler::runtime;
 use typelua::parser::ast::Tree;
@@ -82,13 +83,15 @@ fn check(args: &[String]) -> bool {
     let mut sources: Vec<(String, PathBuf, String)> = Vec::new();
     for arg in args {
         let path = Path::new(arg);
-        // 目录以自身为根算模块名；单文件以其父目录为根（于是 a/b.tua -> "b"）
+        // 目录以自身为根算模块名（一个目录 = 一个工程）；文件参数见 adopt_relative_name
         let base = if path.is_dir() {
             path.to_path_buf()
         } else {
             path.parent().map(Path::to_path_buf).unwrap_or_default()
         };
+        let start = sources.len();
         collect_ok &= collect_sources(&base, path, &mut sources);
+        adopt_relative_name(path, &mut sources[start..]);
     }
     if sources.is_empty() {
         log_error!("没有找到 .tua 源文件");
@@ -206,14 +209,61 @@ fn module_name(base: &Path, path: &Path) -> String {
         .join(".")
 }
 
-/// 模块名撞上共享运行时的文件名：`compile` 先写各模块、再写
-/// `__typelua_runtime.lua`，同一条路径上的用户模块会被静默覆盖。模块名是从
-/// 路径推出来的，源码里没有能挂诊断的 span，所以只能在收齐源之后中止
+/// 单文件参数的模块名：按**相对当前目录**的路径推，`pkg/account.tua` 因此叫
+/// `pkg.account`，生成的 `.lua` 也落在同样的相对层级（`--out dist` 时是
+/// `dist/pkg/account.lua`）。路径跑出当前目录时返回 None：绝对路径在别处、
+/// 带 `..`、非 UTF-8 —— 调用方退回「以父目录为根」的命名。
+///
+/// 任何一段以 `.` 开头（`.verify/a.tua`）也不收：拼出来的名字会带空段
+/// （`pkg..a`），换回路径时那段空的前缀会变成根目录 `/a`
+fn relative_module_name(path: &Path, cwd: &Path) -> Option<String> {
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let rel = full.strip_prefix(cwd).ok()?.with_extension("");
+    let mut parts: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_str()?;
+                if part.starts_with('.') {
+                    return None;
+                }
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
+/// 文件参数的模块名跟相对当前目录的路径走 —— 列多个文件时也不退回「各自父目录为根」，
+/// 否则 `pkg/a.tua` 和 `other/a.tua` 会撞名、`get("pkg.a", ..)` 也 require 不到。
+/// 传目录时由目录自己当根，不走这里；`entries` 是这一个参数收出来的源（一般一个）
+fn adopt_relative_name(path: &Path, entries: &mut [(String, PathBuf, String)]) {
+    if !path.is_file() || entries.len() != 1 {
+        return;
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    if let Some(name) = relative_module_name(path, &cwd) {
+        entries[0].0 = name;
+    }
+}
+
+/// 模块名撞上运行时的注册键：目录编译时 `compile` 还要写 `__typelua_runtime.lua`，
+/// 同一条路径上的用户模块会被静默覆盖；只列文件时注册表也挂在
+/// `package.loaded["__typelua_runtime"]` 上，同名模块 require 回来是运行时本身。
+/// 模块名是从路径推出来的，源码里没有能挂诊断的 span，所以只能在收齐源之后中止
 fn reject_runtime_module_name(sources: &[(String, PathBuf, String)]) -> bool {
     for (module, path, _) in sources {
         if module == RUNTIME_MODULE {
             log_error!(
-                "模块名 {RUNTIME_MODULE} 是编译器保留的：{} 生成的 .lua 会被共享运行时的同名文件覆盖，请把这个源文件改名",
+                "模块名 {RUNTIME_MODULE} 是编译器保留的：{} 生成的 .lua 会和共享运行时（文件或 package.loaded 条目）撞名，请把这个源文件改名",
                 path.display()
             );
             return true;
@@ -225,22 +275,35 @@ fn reject_runtime_module_name(sources: &[(String, PathBuf, String)]) -> bool {
 /// `compile`：解析 -> 类型检查 -> 发射。任一阶段有错都中止，绝不落地半成品代码。
 /// 通过检查后每个模块生成 .lua：默认在源 .tua 旁原地生成（`with_extension`）；
 /// 给了 `--out <dir>`（`-o` 同义）则按模块名铺到该目录下（pkg.account ->
-/// <dir>/pkg/account.lua），子目录按需创建
+/// <dir>/pkg/account.lua），子目录按需创建。模块名跟源文件的相对路径走
+/// （`pkg/account.tua` -> `pkg.account`）；传目录时多一份共享运行时，只列文件时
+/// 各自内联；`--module <name>` 可以另指定注册表的键
 fn compile(args: &[String]) -> bool {
     let mut collect_ok = true;
-    // 0) 摘掉 `--out <dir>`（`-o` / `--out=<dir>` 同义）。给了就把 .lua 按模块名
-    //    铺到该目录下（pkg.account -> <dir>/pkg/account.lua）；不给则在源文件原地生成
+    // 0) 摘掉 `--out <dir>`（`-o` / `--out=<dir>` 同义）和 `--module <name>`。
+    //    `--out` 给了就把 .lua 按模块名铺到该目录下；不给则在源文件原地生成
     let mut out_dir: Option<PathBuf> = None;
+    let mut module_override: Option<String> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         if let Some(dir) = arg.strip_prefix("--out=") {
             out_dir = Some(PathBuf::from(dir));
+        } else if let Some(name) = arg.strip_prefix("--module=") {
+            module_override = Some(name.to_string());
         } else if arg.as_str() == "--out" || arg.as_str() == "-o" {
             match it.next() {
                 Some(dir) => out_dir = Some(PathBuf::from(dir)),
                 None => {
                     log_error!("--out 需要一个输出目录参数");
+                    return false;
+                }
+            }
+        } else if arg.as_str() == "--module" {
+            match it.next() {
+                Some(name) => module_override = Some(name.clone()),
+                None => {
+                    log_error!("--module 需要一个模块名参数");
                     return false;
                 }
             }
@@ -264,7 +327,9 @@ fn compile(args: &[String]) -> bool {
         if !bases.contains(&base) {
             bases.push(base.clone());
         }
+        let start = sources.len();
         collect_ok &= collect_sources(&base, path, &mut sources);
+        adopt_relative_name(path, &mut sources[start..]);
     }
     if sources.is_empty() {
         log_error!("没有找到 .tua 源文件");
@@ -274,6 +339,27 @@ fn compile(args: &[String]) -> bool {
     if !collect_ok {
         log_error!("compile 中止：有源目录或源文件读不进来，未生成代码");
         return false;
+    }
+    if let Some(name) = module_override {
+        if sources.len() != 1 {
+            log_error!("--module 只能用于单个源文件（当前 {} 个）", sources.len());
+            return false;
+        }
+        // --out 会按模块名铺目录（pkg.account -> pkg/account.lua）。模块名只收
+        // 点分形式，空段 / 斜杠 / `..` 既没有意义，也可能把输出带出 --out
+        if name.contains('/') || name.split('.').any(str::is_empty) {
+            log_error!("--module {name:?} 不是点分模块名（例：pkg.account）");
+            return false;
+        }
+        sources[0].0 = name;
+    }
+    // 模块名（路径推出来的或 --module 给的）会原样进 `enter("..")` / `def("..")`：
+    // 引号、反斜杠、控制符会破坏生成代码，别等到 Lua 那边才报语法错
+    for (module, path, _) in &sources {
+        if let Err(err) = validate_module_name(module) {
+            log_error!("{}: {err}", path.display());
+            return false;
+        }
     }
     if reject_runtime_module_name(&sources) {
         return false;
@@ -337,11 +423,18 @@ fn compile(args: &[String]) -> bool {
 
     // 4) 发射：每个模块原地 .tua -> .lua。EmitDriver 挂 Lua53 一个后端，
     //    以后要多目标（别的 Lua 版本 / 别的语言）再往 driver 上加。
-    //    多模块工程走共享模式：文件头注入运行时、pub 类注册、import 来的类取值。
+    //    传目录 = 交给编译器一个工程：落地共享运行时文件，各模块 require 它；
+    //    只列文件（一个或多个）没有共同的项目根，各自内联运行时，注册表靠
+    //    package.loaded 合并。两种模式的 enter / pub 注册 / import 取值完全一致。
     //    运行时的落地目录先算好：原地生成又分属多个根时根本无从决定，
     //    得在**写任何文件之前**中止，不能留一堆半成品
-    let shared = sources.len() > 1;
-    let runtime_dir = if shared {
+    let project = paths.iter().any(|path| Path::new(path).is_dir());
+    let runtime = if project {
+        RuntimeMode::Require
+    } else {
+        RuntimeMode::Inline
+    };
+    let runtime_dir = if project {
         match &out_dir {
             Some(dir) => Some(dir.clone()),
             None if bases.len() == 1 => Some(bases[0].clone()),
@@ -364,6 +457,15 @@ fn compile(args: &[String]) -> bool {
             Some(dir) => {
                 let mut t = dir.join(module.replace('.', std::path::MAIN_SEPARATOR_STR));
                 t.set_extension("lua");
+                // 模块名换成路径必须还在输出目录里：以 `.` 开头的文件推出来的
+                // 名字带空段（`.a` -> `/a`），`join` 会把它当绝对路径写到别处
+                if !t.starts_with(dir) {
+                    log_error!(
+                        "{module}: 模块名不能含空的点分段，无法落到输出目录 {}",
+                        dir.display()
+                    );
+                    return false;
+                }
                 if let Some(parent) = t.parent()
                     && let Err(err) = std::fs::create_dir_all(parent)
                 {
@@ -374,7 +476,7 @@ fn compile(args: &[String]) -> bool {
             }
             None => path.with_extension("lua"),
         };
-        let ctx = EmitCtx { module, shared };
+        let ctx = EmitCtx { module, runtime };
         // 写出失败（磁盘满 / 没权限）也算编译失败，不能让 CI 误判成功
         if !driver.write(tree, &ctx, &target.display().to_string()) {
             return false;
@@ -407,7 +509,8 @@ fn compile(args: &[String]) -> bool {
 /// 统一运行 highlight_linter 与 type_linter，输出高亮、跳转和诊断。
 /// 区间是字节偏移，行列换算交给插件那侧
 fn plugin(args: &[String]) -> bool {
-    // 收源，和 check / compile 同款：内容全程留着（Tree 借 Parser、Parser 借内容）
+    // 收源，和 check / compile 同款：内容全程留着（Tree 借 Parser、Parser 借内容）。
+    // 模块名也跟着同一套规则走，诊断里的模块名才能和 check / compile 对上
     let mut sources: Vec<(String, PathBuf, String)> = Vec::new();
     for arg in args {
         let path = Path::new(arg);
@@ -416,7 +519,9 @@ fn plugin(args: &[String]) -> bool {
         } else {
             path.parent().map(Path::to_path_buf).unwrap_or_default()
         };
+        let start = sources.len();
         collect_sources(&base, path, &mut sources);
+        adopt_relative_name(path, &mut sources[start..]);
     }
     if sources.is_empty() {
         log_error!("没有找到 .tua 源文件");
@@ -612,5 +717,47 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// 单文件的模块名推导：相对路径、绝对路径都落到同一个键上，
+/// 跑出当前目录时交给调用方退回旧规则
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_module_name_is_the_path_from_cwd() {
+        let cwd = Path::new("/proj");
+        assert_eq!(
+            relative_module_name(Path::new("pkg/account.tua"), cwd).as_deref(),
+            Some("pkg.account")
+        );
+        assert_eq!(
+            relative_module_name(Path::new("/proj/pkg/account.tua"), cwd).as_deref(),
+            Some("pkg.account")
+        );
+        assert_eq!(
+            relative_module_name(Path::new("./a.tua"), cwd).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn relative_module_name_gives_up_outside_cwd() {
+        let cwd = Path::new("/proj");
+        assert_eq!(relative_module_name(Path::new("../x.tua"), cwd), None);
+        assert_eq!(
+            relative_module_name(Path::new("/elsewhere/x.tua"), cwd),
+            None
+        );
+    }
+
+    /// 以 `.` 开头的目录不能进模块名：拼出来带空段，回填路径时会跑出 --out
+    #[test]
+    fn relative_module_name_gives_up_on_hidden_paths() {
+        let cwd = Path::new("/proj");
+        assert_eq!(relative_module_name(Path::new(".verify/a.tua"), cwd), None);
+        assert_eq!(relative_module_name(Path::new(".a.tua"), cwd), None);
     }
 }

@@ -20,8 +20,8 @@
 //! 「这个类要不要前置」只需比较引用位置与声明位置 —— 都是文件内的语法事实
 
 use super::super::utils::{DFS, string_literal};
-use super::{EmitCtx, Emitter};
-use crate::compiler::{RUNTIME_LOCAL, RUNTIME_MODULE};
+use super::{EmitCtx, Emitter, RuntimeMode};
+use crate::compiler::{RUNTIME_LOCAL, RUNTIME_MODULE, runtime};
 use crate::lexer::type_def::*;
 use crate::parser::ast::*;
 use crate::parser::parser::*;
@@ -38,9 +38,9 @@ struct ImportRef {
 /// 发射期的本文件上下文。两项事实全部从 CST 现算：
 ///   - `imports`：顶层 `@Import` 语句里的本地名 -> (模块, 原名)
 ///   - `predeclares`：声明位置之前就被当值用到的本地类名，按首次引用排序
-struct LowerCtx<'a> {
+struct FileCtx<'a> {
     module: &'a str,
-    shared: bool,
+    runtime: RuntimeMode,
     imports: HashMap<String, ImportRef>,
     predeclares: Vec<String>,
 }
@@ -58,7 +58,7 @@ impl Lua53 {
         ast: &Tree<NodeSyntax>,
         node: usize,
         buffer: &mut String,
-        lower: &LowerCtx<'_>,
+        lower: &FileCtx<'_>,
     ) {
         let data = ast.get_node(node).get_data();
         match data {
@@ -119,7 +119,7 @@ impl Lua53 {
         ast: &Tree<NodeSyntax>,
         node: usize,
         buffer: &mut String,
-        lower: &LowerCtx<'_>,
+        lower: &FileCtx<'_>,
     ) {
         for &child in &ast.get_node(node).children {
             self.resolve(ast, child, buffer, lower);
@@ -150,9 +150,6 @@ impl Lua53 {
     }
 
     fn push_token(&self, buffer: &mut String, text: &str) {
-        if text.is_empty() {
-            return;
-        }
         // 只看末字节即可判空白：空白都是 ASCII，O(1)
         if buffer
             .as_bytes()
@@ -178,7 +175,7 @@ impl Lua53 {
         ast: &Tree<NodeSyntax>,
         node: usize,
         buffer: &mut String,
-        lower: &LowerCtx<'_>,
+        lower: &FileCtx<'_>,
     ) {
         let is_extends = matches!(
             ast.get_node(node).get_data(),
@@ -257,8 +254,9 @@ impl Lua53 {
         buffer.push_str("return setmetatable(o, cls)\n");
         buffer.push_str("end,\n});\n");
 
-        // 注册得放在最后：`get` 拿到的一定是挂完方法、设好元表的完整类
-        if lower.shared && self.class_is_pub(ast, node) {
+        // 注册得放在最后：`get` 拿到的一定是挂完方法、设好元表的完整类。
+        // 只列文件编译也注册 —— 内联运行时同样登记到 package.loaded，产物之间可以互相取值
+        if self.class_is_pub(ast, node) {
             buffer.push_str(&format!(
                 "{RUNTIME_LOCAL}.def(\"{}\", \"{name}\", {name})\n",
                 lower.module
@@ -284,7 +282,7 @@ impl Lua53 {
         class: &str,
         mdef: usize,
         buffer: &mut String,
-        lower: &LowerCtx<'_>,
+        lower: &FileCtx<'_>,
     ) {
         let methodsig = ast.get_node(mdef).children[0];
         let block = ast.get_node(mdef).children[1];
@@ -533,10 +531,10 @@ impl Lua53 {
     /// 这个 @VarRef 是「值位」吗：`A{…}` / `A(…)` 的被调，或 `A.m` 的基。
     /// 写位（`A = …`）、方法调用（`A:m()`）、下标（`A[1]`）都不算 —— 它们在
     /// 检查期就被拒绝了，发射端不必也不该改写
+    ///
+    /// 只接 @VarRef 节点：两个调用点都在 `Prod::VarRef` 分支里
     fn value_site_name<'t>(&self, ast: &'t Tree<NodeSyntax<'_>>, node: usize) -> Option<&'t str> {
-        if self.get_production(ast, node) != Some(Prod::VarRef) {
-            return None;
-        }
+        debug_assert_eq!(self.get_production(ast, node), Some(Prod::VarRef));
         let parent = ast.get_node(node).parent?;
         if ast.get_node(parent).children.first().copied() != Some(node) {
             return None;
@@ -555,7 +553,7 @@ impl Lua53 {
         &self,
         ast: &Tree<NodeSyntax<'_>>,
         node: usize,
-        lower: &'l LowerCtx<'_>,
+        lower: &'l FileCtx<'_>,
     ) -> Option<&'l ImportRef> {
         let name = self.value_site_name(ast, node)?;
         lower.imports.get(name)
@@ -564,13 +562,45 @@ impl Lua53 {
 
 impl DFS<()> for Lua53 {}
 
+/// 只列文件编译时的内联运行时头。
+///
+/// 运行时必须全进程只有一份：`defs` 是注册表，若每个 `.lua` 各带一份，
+/// A 文件 `def` 的类 B 文件 `get` 不到。loader 和多文件产物都从
+/// `package.loaded` 拿运行时，所以先查那里；没有才展开内联副本并登记。
+///
+/// 运行时本体包进 IIFE：`M` / `defs` / `started` 这些局域名不能漏进用户 chunk
+fn inline_runtime_header() -> String {
+    // 运行时源码缩进一层，生成的 Lua 里能看出它属于这个 IIFE
+    let body = runtime::SOURCE
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("            {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"local {RUNTIME_LOCAL} = package and package.loaded["{RUNTIME_MODULE}"]
+if not {RUNTIME_LOCAL} then
+    {RUNTIME_LOCAL} = (function()
+{body}
+    end)()
+    if package then package.loaded["{RUNTIME_MODULE}"] = {RUNTIME_LOCAL} end
+end
+"#
+    )
+}
+
 impl Emitter for Lua53 {
     /// 整棵树 -> 一份 Lua 文本。`write` 只是它再加一次落盘；拆开是为了
     /// 测试与宿主（C loader）不必碰文件系统
     fn render(&self, ast: &Tree<NodeSyntax>, ctx: &EmitCtx<'_>) -> String {
-        let mut lower = LowerCtx {
+        let mut lower = FileCtx {
             module: ctx.module,
-            shared: ctx.shared,
+            runtime: ctx.runtime,
             imports: HashMap::new(),
             predeclares: Vec::new(),
         };
@@ -579,16 +609,17 @@ impl Emitter for Lua53 {
         self.collect_predeclares(ast, &mut lower.predeclares);
 
         let mut buffer = String::new();
-        // 共享模式的文件头：拿到运行时句柄，声明本模块「已开始加载」。
+        // 运行时头：只列文件内联，传目录 / loader 走共享 .lua。
         // enter 是循环 require 的挡板：本模块还在加载时别人来 get，会直接报
         // 「正在加载」而不是再 require 一遍
-        if lower.shared {
-            buffer.push_str(&format!(
+        match lower.runtime {
+            RuntimeMode::Inline => buffer.push_str(&inline_runtime_header()),
+            RuntimeMode::Require => buffer.push_str(&format!(
                 "local {RUNTIME_LOCAL} = require(\"{RUNTIME_MODULE}\")\n"
-            ));
-            buffer.push_str(&format!("{RUNTIME_LOCAL}.enter(\"{}\")\n", lower.module));
+            )),
         }
-        // 前置声明：单文件也要，和 shared 无关 —— 一个文件里两个类互相引用
+        buffer.push_str(&format!("{RUNTIME_LOCAL}.enter(\"{}\")\n", lower.module));
+        // 前置声明：两种模式都要 —— 一个文件里两个类互相引用
         // 同样要求类表先占住名字。这里**直接把表建出来**（`local B = {{}}`），
         // 声明处只往里填：`setmetatable(A, {{__index = B}})` 抓到的是同一张表，
         // 前向继承才不会静默丢成 nil
@@ -611,7 +642,7 @@ mod tests {
     use crate::parser::parser::Parser;
 
     /// 把一组模块（模块名, 源码）各自解析并发射，返回各模块的 Lua 文本
-    fn emit(mods: &[(&str, &str)], shared: bool) -> Vec<String> {
+    fn emit(mods: &[(&str, &str)], runtime: RuntimeMode) -> Vec<String> {
         let mut parsers: Vec<Parser> = mods.iter().map(|(_, src)| Parser::new(src)).collect();
         for parser in parsers.iter_mut() {
             parser.parse();
@@ -619,7 +650,7 @@ mod tests {
         mods.iter()
             .zip(parsers.iter())
             .map(|((module, _), parser)| {
-                Lua53::new().render(parser.tree(), &EmitCtx { module, shared })
+                Lua53::new().render(parser.tree(), &EmitCtx { module, runtime })
             })
             .collect()
     }
@@ -630,7 +661,7 @@ mod tests {
         let out = emit_source(
             "main",
             "import {B} in \"pkg.b\"\nlocal b = B {n = 1}",
-            false,
+            RuntimeMode::Inline,
         )
         .expect("语法该是好的");
         assert!(
@@ -650,7 +681,7 @@ mod tests {
                     "import {Account} in \"pkg.acc\"\nlocal a = Account {id = 1}\nprint(a.id)",
                 ),
             ],
-            true,
+            RuntimeMode::Require,
         );
         assert!(
             out[0].contains("__typelua.def(\"pkg.acc\", \"Account\", Account)"),
@@ -674,14 +705,47 @@ mod tests {
         );
     }
 
-    /// 单文件不该看见运行时的任何痕迹
+    /// 只列文件：运行时内联进文件头，但注册表挂在 package.loaded 上，多个产物共用
     #[test]
-    fn single_module_output_stays_plain() {
+    fn single_module_output_embeds_shared_runtime() {
         let out = emit(
             &[("main", "pub class A { n : number = 1 }\nlocal a = A{}")],
-            false,
+            RuntimeMode::Inline,
         );
-        assert!(!out[0].contains("__typelua"), "实得 {}", out[0]);
+        assert!(
+            out[0].starts_with(
+                "local __typelua = package and package.loaded[\"__typelua_runtime\"]\n"
+            ),
+            "要先取共享运行时，实得 {}",
+            out[0]
+        );
+        assert!(
+            out[0]
+                .contains("if package then package.loaded[\"__typelua_runtime\"] = __typelua end"),
+            "没有运行时时要登记，实得 {}",
+            out[0]
+        );
+        assert!(
+            out[0].contains("local M = {}"),
+            "运行时本体应该内联，实得 {}",
+            out[0]
+        );
+    }
+
+    /// 两种传法只差运行时头：`enter` 往后的每个字节都该一样 ——
+    /// pub 注册、import 取值、前置声明、类体都是同一套
+    #[test]
+    fn inline_and_required_outputs_share_the_same_body() {
+        let src = "pub class A { n : number = 1 }\nlocal a = A{}";
+        let inline = emit(&[("main", src)], RuntimeMode::Inline);
+        let required = emit(&[("main", src)], RuntimeMode::Require);
+        let body = |text: &str| {
+            let start = text
+                .find("__typelua.enter(\"main\")")
+                .unwrap_or_else(|| panic!("没有 enter：{text}"));
+            text[start..].to_string()
+        };
+        assert_eq!(body(&inline[0]), body(&required[0]));
     }
 
     /// 前向引用：类表在文件头就建好，声明处不再新建一张
@@ -692,11 +756,13 @@ mod tests {
                 "main",
                 "class Z { make(self) -> A return A{} end }\nclass A { n : number = 1 }",
             )],
-            false,
+            RuntimeMode::Inline,
         );
+        let predeclare = out[0].find("local A = {}\n").expect("要先占住名字");
+        let declaration = out[0].find("local Z = {}\n").expect("Z 的类表");
         assert!(
-            out[0].starts_with("local A = {}\n"),
-            "要先占住名字，实得 {}",
+            predeclare < declaration,
+            "前置声明要在类体之前，实得 {}",
             out[0]
         );
         assert_eq!(
@@ -715,13 +781,11 @@ mod tests {
                 "main",
                 "class A : B { n : number = 1 }\nclass B { m : number = 2 }",
             )],
-            false,
+            RuntimeMode::Inline,
         );
-        assert!(
-            out[0].starts_with("local B = {}\n"),
-            "父类要先建表，实得 {}",
-            out[0]
-        );
+        let parent = out[0].find("local B = {}\n").expect("父类要先建表");
+        let child = out[0].find("local A = {}\n").expect("子类类表");
+        assert!(parent < child, "父类表要先建，实得 {}", out[0]);
         assert!(out[0].contains("__index = B,"), "实得 {}", out[0]);
     }
 
@@ -733,13 +797,16 @@ mod tests {
                 "main",
                 "class A { make(self) -> A return A{} end }\nlocal a = A{}",
             )],
-            false,
+            RuntimeMode::Inline,
         );
+        let table = out[0].find("local A = {}").expect("声明处要建表");
+        let enter = out[0].find("__typelua.enter").expect("文件头");
         assert!(
-            !out[0].starts_with("local A = {}\n"),
+            !out[0].starts_with("local A = {}"),
             "不该前置，实得 {}",
             out[0]
         );
+        assert!(table > enter, "类表只能在声明处，实得 {}", out[0]);
         assert_eq!(
             out[0].matches("local A = {}").count(),
             1,
@@ -759,7 +826,7 @@ mod tests {
                     "import {B} in \"pkg.b\"\nclass A { make(self) -> B return B{} end }\nlocal a = A{}",
                 ),
             ],
-            true,
+            RuntimeMode::Require,
         );
         assert!(!out[1].contains("return__typelua"), "实得 {}", out[1]);
         assert!(
